@@ -2,7 +2,7 @@
 
 > These guidelines must be followed by all LLM agents using btwin MCP tools.
 > Call `btwin_get_guidelines` at the start of every session to load these rules.
-> For orchestration (workflows, agents), use Skills (`/bt:*` commands) — see `global/orchestration-guidelines.md`.
+> For orchestration features, use the active runtime APIs and installed `bt-*` skills.
 
 ## Recommended Agent Bootstrap Order
 
@@ -43,7 +43,7 @@ Record autonomously even without explicit user request when:
 
 ### Agent registration
 - For workflow/orchestration sessions, register with `/bt:register` before using workflow commands.
-- See `global/orchestration-guidelines.md` for full registration rules and agent-workflow behavior.
+- Use the active runtime/API responses as the source of truth for current workflow behavior.
 
 ### Date format
 - Use absolute dates (e.g., 2026-03-12)

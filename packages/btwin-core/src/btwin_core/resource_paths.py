@@ -50,14 +50,6 @@ def resolve_workspace_root(start: Path | None = None) -> Path:
     return Path.cwd()
 
 
-def resolve_bundled_providers_path() -> Path | None:
-    """Return the bundled providers manifest if it exists in the package."""
-    candidate = Path(__file__).resolve().parent / "global" / "providers.json"
-    if candidate.exists():
-        return candidate
-    return None
-
-
 def resolve_bundled_protocols_dir() -> Path | None:
     """Return the bundled protocols directory if it exists in the package."""
     candidate = Path(__file__).resolve().parent / "global" / "protocols"

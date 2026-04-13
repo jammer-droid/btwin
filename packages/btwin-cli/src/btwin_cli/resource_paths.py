@@ -6,7 +6,6 @@ from pathlib import Path
 
 from btwin_core.resource_paths import (
     resolve_bundled_protocols_dir as _resolve_bundled_protocols_dir,
-    resolve_bundled_providers_path as _resolve_bundled_providers_path,
     resolve_workspace_root,
 )
 
@@ -47,8 +46,3 @@ def resolve_bundled_skills_dir(workspace_root: Path | None = None) -> Path | Non
 def resolve_bundled_protocols_dir() -> Path | None:
     """Return the bundled protocols directory if it exists in the core package."""
     return _resolve_bundled_protocols_dir()
-
-
-def resolve_bundled_providers_path() -> Path | None:
-    """Return the bundled providers manifest if it exists in the core package."""
-    return _resolve_bundled_providers_path()

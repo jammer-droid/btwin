@@ -32,7 +32,6 @@ from btwin_core.promotion_store import (
 )
 from btwin_core.promotion_worker import PromotionWorker
 from btwin_core.runtime_ports import AuditEvent
-from btwin_core.resource_paths import resolve_bundled_providers_path
 from btwin_core.storage import Storage
 from btwin_core.workflow_engine import WorkflowEngine
 from btwin_core.workflow_gate import (
@@ -1359,11 +1358,15 @@ def create_orchestration_router(
     def get_providers():
         config_path = storage.data_dir / "providers.json"
         if config_path.exists():
-            return json.loads(config_path.read_text(encoding="utf-8"))
-        bundled = resolve_bundled_providers_path()
-        if bundled is not None:
-            return json.loads(bundled.read_text(encoding="utf-8"))
-        return {"providers": [], "capabilities": []}
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            payload["configured"] = True
+            return payload
+        return {
+            "configured": False,
+            "providers": [],
+            "capabilities": [],
+            "setup_hint": "Run `btwin init --provider codex` to configure providers.",
+        }
 
     # -- pipeline templates -------------------------------------------------
 

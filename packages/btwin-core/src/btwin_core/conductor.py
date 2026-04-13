@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from btwin_core.resource_paths import resolve_bundled_providers_path
 
 if TYPE_CHECKING:
     from btwin_core.agent_store import AgentStore
@@ -232,10 +231,6 @@ class ConductorLoop:
 
         # Load providers config
         config_path = Path(data_dir) / "providers.json"
-        if not config_path.exists():
-            bundled = resolve_bundled_providers_path()
-            if bundled is not None:
-                config_path = bundled
 
         command = None
         args = []

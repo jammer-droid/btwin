@@ -61,16 +61,23 @@ Check the CLI entrypoint:
 uv run btwin --help
 ```
 
-At this point you can run individual CLI commands. This does not yet mean the
-shared runtime is running.
+Initialize the default Codex-based provider config:
+
+```bash
+uv run btwin init
+```
+
+This creates `~/.btwin/providers.json` and registers `btwin mcp-proxy` in your
+Codex MCP config. Today the init flow supports Codex only.
 
 ## Recommended Runtime Setup
 
 The normal local setup is:
 
-1. use the global `~/.btwin` data directory
-2. start `serve-api`
-3. connect clients through `mcp-proxy`
+1. run `btwin init`
+2. use the global `~/.btwin` data directory
+3. start `serve-api`
+4. connect clients through `mcp-proxy`
 
 Start the shared API:
 
@@ -97,7 +104,7 @@ This repository already contains the packaged runtime assets needed by:
 
 - `btwin serve-api`
 - `btwin mcp-proxy`
-- bundled runtime docs and defaults
+- bundled runtime docs
 - bundled protocol definitions
 - bundled skills
 
@@ -124,11 +131,10 @@ command = "btwin"
 args = ["mcp-proxy"]
 ```
 
-After global install, provider-specific bootstrap can be tested with commands
-such as:
+After global install, initialize the runtime first:
 
 ```bash
-btwin init --provider codex
+btwin init
 btwin install-skills --platform codex
 ```
 

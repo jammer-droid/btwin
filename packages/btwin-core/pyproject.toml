@@ -19,6 +19,5 @@ packages = ["src/btwin_core"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/btwin_core/global/providers.json",
     "src/btwin_core/global/protocols/**",
 ]

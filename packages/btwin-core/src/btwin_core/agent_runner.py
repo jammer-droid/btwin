@@ -19,7 +19,7 @@ from btwin_core.gateway_client import GatewayLaunchContext, build_gateway_client
 from btwin_core.message_router import MessageRouter
 from btwin_core.protocol_store import ProtocolStore
 from btwin_core.providers import CLIProvider, get_provider, get_provider_runtime_profile
-from btwin_core.resource_paths import resolve_bundled_providers_path, resolve_workspace_root
+from btwin_core.resource_paths import resolve_workspace_root
 from btwin_core.runtime_logging import RuntimeEventLogger
 from btwin_core.session_transcript import normalize_runtime_events
 from btwin_core.session_supervisor import (
@@ -1383,7 +1383,4 @@ class AgentRunner:
     def _load_providers(path: Path | None) -> list[dict]:
         if path and path.exists():
             return json.loads(path.read_text(encoding="utf-8")).get("providers", [])
-        global_path = resolve_bundled_providers_path()
-        if global_path is not None:
-            return json.loads(global_path.read_text(encoding="utf-8")).get("providers", [])
         return []

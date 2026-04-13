@@ -39,7 +39,7 @@ from btwin_core.event_bus import EventBus
 from btwin_core.indexer import CoreIndexer
 from btwin_core.promotion_store import PromotionStore
 from btwin_core.protocol_store import ProtocolStore
-from btwin_core.resource_paths import resolve_bundled_providers_path, resolve_bundled_protocols_dir
+from btwin_core.resource_paths import resolve_bundled_protocols_dir
 from btwin_core.sources import SourceRegistry
 from btwin_core.storage import Storage
 from btwin_core.thread_store import ThreadStore
@@ -165,14 +165,9 @@ def create_app(
 
             model_id = agent.get("model", "")
 
-            providers_path = storage.data_dir / "providers.json"
-            if not providers_path.exists():
-                bundled = resolve_bundled_providers_path()
-                if bundled is not None:
-                    providers_path = bundled
-
             command = None
             args: list[str] = []
+            providers_path = storage.data_dir / "providers.json"
             if providers_path.exists():
                 config_payload = _json.loads(providers_path.read_text(encoding="utf-8"))
                 for provider in config_payload.get("providers", []):

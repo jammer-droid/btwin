@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from btwin_core.agent_store import AgentStore
-from btwin_core.resource_paths import resolve_bundled_providers_path
 from btwin_core.terminal_manager import TerminalManager
 
 
@@ -27,10 +26,12 @@ def _load_providers(data_dir: Path) -> dict:
     config_path = data_dir / "providers.json"
     if config_path.exists():
         return _json.loads(config_path.read_text(encoding="utf-8"))
-    bundled = resolve_bundled_providers_path()
-    if bundled is not None:
-        return _json.loads(bundled.read_text(encoding="utf-8"))
-    return {"providers": [], "capabilities": []}
+    return {
+        "configured": False,
+        "providers": [],
+        "capabilities": [],
+        "setup_hint": "Run `btwin init --provider codex` to configure providers.",
+    }
 
 
 def create_terminal_router(terminal_manager: TerminalManager, storage=None) -> APIRouter:

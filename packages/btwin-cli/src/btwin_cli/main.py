@@ -30,6 +30,13 @@ from btwin_core.protocol_store import Protocol, ProtocolStore
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.sources import SourceRegistry
 from btwin_core.thread_store import ThreadStore
+from btwin_cli.provider_init import (
+    available_provider_names,
+    build_provider_config,
+    provider_display_name,
+    validate_provider_cli,
+    write_provider_config,
+)
 from btwin_cli.resource_paths import resolve_bundled_skills_dir
 from btwin_core.resource_paths import resolve_bundled_protocols_dir
 
@@ -670,12 +677,39 @@ def init(
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite existing config"),
 ):
-    """Register B-TWIN MCP proxy for one provider.
+    """Run initial B-TWIN provider setup.
 
     Today only Codex is supported. The provider flag remains explicit so future
     provider-specific initializers can plug into the same surface.
     """
     provider_name = _validate_init_provider(provider)
+    provider_label = provider_display_name(provider_name)
+    active_data_dir = _get_active_data_dir()
+    providers_config_path = _providers_config_path(active_data_dir)
+
+    console.print("[bold]B-TWIN Init[/bold]\n")
+    console.print(f"[bold]Provider:[/bold] {provider_label}")
+    console.print(f"[bold]Data dir:[/bold] {active_data_dir}\n")
+
+    try:
+        cli_path = validate_provider_cli(provider_name)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    if providers_config_path.exists() and not force:
+        provider_payload = json.loads(providers_config_path.read_text(encoding="utf-8"))
+        console.print(f"[yellow]Reusing existing provider config[/yellow]")
+        console.print(f"[dim]- Config: {providers_config_path}[/dim]\n")
+    else:
+        provider_payload = build_provider_config(provider_name)
+        write_provider_config(providers_config_path, provider_payload)
+        console.print(f"[green]Created provider config[/green] ({provider_label})")
+        console.print(f"[dim]- CLI: {cli_path}[/dim]")
+        console.print(f"[dim]- Config: {providers_config_path}[/dim]")
+        console.print(
+            f"[dim]- Models: {', '.join(model['id'] for model in provider_payload['providers'][0]['models'])}[/dim]\n"
+        )
 
     if local:
         if project_name is None:
@@ -687,23 +721,24 @@ def init(
         if existing_paths and not force:
             existing_list = "\n".join(f"- {path.name if path.parent == Path.cwd() else path.relative_to(Path.cwd())}" for path in existing_paths)
             console.print(
-                f"[yellow]Local {provider_name} config already exists[/yellow]\n"
+                f"[yellow]Local {provider_label} MCP config already exists[/yellow]\n"
                 f"{existing_list}\n"
                 "Use [bold]--force[/bold] to overwrite."
             )
             raise typer.Exit(1)
 
         _write_codex_project_config(codex_config_path, project_name)
-        console.print(f"[green]Created local {provider_name} config[/green] (project: {project_name})")
+        console.print(f"[green]Created local {provider_label} MCP config[/green] (project: {project_name})")
         console.print("[dim]- Codex: .codex/config.toml[/dim]")
     else:
-        console.print(f"[bold]Registering B-TWIN MCP for {provider_name}...[/bold]\n")
+        console.print(f"[bold]Registering B-TWIN MCP for {provider_label}...[/bold]\n")
         _register_codex_global(force=force)
 
     console.print(
-        "\n[bold]Ensure B-TWIN API server is running:[/bold]\n"
-        "  launchctl kickstart -k gui/$(id -u)/com.btwin.serve-api\n"
-        "  or: btwin serve-api\n"
+        "\n[bold]Next steps:[/bold]\n"
+        "  1. btwin serve-api\n"
+        "  2. Restart your MCP client session\n"
+        "  3. btwin install-skills --platform codex\n"
     )
 
 
@@ -755,8 +790,8 @@ def setup():
     console.print(f"[green]Config saved to {config_path}[/green]\n")
     console.print(
         "Next steps:\n"
-        "  1. [bold]btwin serve-api[/bold]                  — Start the HTTP API on http://127.0.0.1:8787\n"
-        "  2. [bold]btwin init[/bold]                       — Register btwin mcp-proxy for Codex / Claude\n"
+        "  1. [bold]btwin init[/bold]                       — Create provider config and register btwin mcp-proxy\n"
+        "  2. [bold]btwin serve-api[/bold]                  — Start the HTTP API on http://127.0.0.1:8787\n"
         "  3. [bold]btwin install-skills --platform codex[/bold] — Install B-TWIN Skills for your client\n"
         "  4. [bold]btwin search[/bold] <query>             — Search past entries\n"
         "  5. [bold]btwin serve[/bold]                      — Start the stdio MCP entrypoint via the shared HTTP proxy path\n"
@@ -1179,7 +1214,7 @@ _PLATFORMS = {
     "gemini": ("Gemini", (".gemini/commands/",), ()),
 }
 
-_INIT_PROVIDERS = {"codex"}
+_INIT_PROVIDERS = set(available_provider_names())
 
 _EXCLUDED_BUNDLED_SKILLS = {"bt-sync"}
 
@@ -1198,6 +1233,10 @@ def _validate_init_provider(provider: str) -> str:
         )
         raise typer.Exit(1)
     return normalized
+
+
+def _providers_config_path(data_dir: Path | None = None) -> Path:
+    return (data_dir or _get_active_data_dir()) / "providers.json"
 
 
 def _collect_skill_dirs(skills_dir: Path) -> list[Path]:
