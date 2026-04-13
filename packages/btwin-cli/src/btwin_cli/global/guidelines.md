@@ -269,6 +269,12 @@ If attached-mode `btwin search` or `btwin record` fails:
 - verify `BTWIN_API_URL` if you use a custom backend
 - use `runtime.mode: standalone` only if you intentionally want a local-only runtime path
 
+If MCP tools still fail after reinstalling or replacing the global `btwin`
+binary:
+- restart the MCP client session so it reconnects to a fresh `btwin mcp-proxy`
+- make sure stale proxy processes from an older install are gone
+- then retry `btwin_get_guidelines` or another simple MCP read call
+
 ### btwin command not found
 
 ```bash

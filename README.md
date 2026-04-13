@@ -98,6 +98,36 @@ For a quick API health check:
 curl -s http://localhost:8787/api/sessions/status
 ```
 
+## macOS Background Service
+
+On macOS, the normal pattern is to keep `serve-api` running as a LaunchAgent.
+
+If you already have the standard plist at `~/.btwin/com.btwin.serve-api.plist`,
+you can load it with:
+
+```bash
+mkdir -p ~/.btwin/logs
+launchctl bootstrap gui/$(id -u) ~/.btwin/com.btwin.serve-api.plist
+```
+
+Useful service commands:
+
+```bash
+launchctl print gui/$(id -u)/com.btwin.serve-api
+launchctl kickstart -k gui/$(id -u)/com.btwin.serve-api
+launchctl bootout gui/$(id -u)/com.btwin.serve-api
+tail -f ~/.btwin/logs/serve-api.stderr.log
+```
+
+The plist should point at the globally installed `btwin` executable:
+
+```xml
+<array>
+  <string>/Users/home/.local/bin/btwin</string>
+  <string>serve-api</string>
+</array>
+```
+
 ## Codex / MCP Setup
 
 This repository already contains the packaged runtime assets needed by:
@@ -137,6 +167,10 @@ After global install, initialize the runtime first:
 btwin init
 btwin install-skills --platform codex
 ```
+
+If you replaced an older global `btwin` install with this runtime split, restart
+your Codex/MCP client session after `btwin init`. Existing MCP proxy processes
+may keep using the older environment until the client reconnects.
 
 ## Isolated Testing Mode
 
