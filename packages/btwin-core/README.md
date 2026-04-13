@@ -21,6 +21,10 @@ It does **not** include:
 
 Those belong to separate layers such as `btwin-cli`, `btwin-mcp`, and repo-level skill assets.
 
+If you are working inside this repository, the closest companion package is
+[`../btwin-cli/README.md`](../btwin-cli/README.md), which documents the CLI,
+HTTP API, MCP proxy, and bundled skills layered on top of `btwin-core`.
+
 ## Install
 
 ```bash
@@ -129,6 +133,11 @@ use the higher-level B-TWIN repo/runtime layer that packages:
 - MCP server/proxy code
 - bundled skills
 - setup/install commands
+
+The “skills” in that higher layer are lightweight client-facing workflow guides
+such as `bt:save` and `bt:handoff`. They are distributed with `btwin-cli`, not
+with `btwin-core`, because they describe how a client should use the runtime
+surface rather than extending the core library API itself.
 
 ## Current Status
 

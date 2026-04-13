@@ -13,6 +13,14 @@ This repository keeps the runtime-facing packages together in one place:
 The Codex provider implementation currently stays inside `btwin-core`, so there
 is no separate provider package in this split.
 
+## Package Guides
+
+If you are working inside the repository, these package-level READMEs are the
+best short references:
+
+- [`packages/btwin-core/README.md`](packages/btwin-core/README.md) — core library APIs, data-dir expectations, and what the standalone package does not include
+- [`packages/btwin-cli/README.md`](packages/btwin-cli/README.md) — `btwin` CLI package, HTTP API, MCP proxy, provider bootstrap, and bundled skills
+
 ## Runtime Model
 
 The default B-TWIN operating model is:
@@ -117,15 +125,8 @@ You should not need to run `btwin serve-api` manually in a terminal for normal u
 
 ## Local Development Setup
 
-If you only want to try the runtime from this clone, start here:
-
-```bash
-git clone https://github.com/jammer-droid/btwin-runtime.git
-cd btwin-runtime
-uv sync
-```
-
-Check the CLI entrypoint:
+If you already have a repo clone with `uv sync` and only want a manual,
+foreground workflow for development or debugging, use this path:
 
 ```bash
 uv run btwin --help
@@ -155,12 +156,12 @@ repo clone. It does not make `btwin` globally available to your shell or MCP cli
 
 ## macOS Background Service
 
-On macOS, the normal pattern is to keep `serve-api` running as a LaunchAgent.
+This section is the detailed reference for the background service used in the
+recommended macOS setup.
 
-The CLI can install and manage the standard LaunchAgent for you:
+Once the service is installed, the main CLI controls are:
 
 ```bash
-btwin service install
 btwin service status
 btwin service restart
 btwin service stop
@@ -216,27 +217,19 @@ This repository already contains the packaged runtime assets needed by:
 
 For repo-local development, prefer `uv run btwin ...` first.
 
-If you have already installed `btwin` globally, your MCP client can run:
+If you have already installed `btwin` globally, other MCP clients can run:
 
 ```text
 command: btwin
 args: ["mcp-proxy"]
 ```
 
-For Codex, the equivalent config is:
+For Codex, `btwin init` writes the equivalent MCP entry automatically, and
+`btwin install-skills --platform codex` installs the bundled skills.
 
-```toml
-[mcp_servers.btwin]
-command = "btwin"
-args = ["mcp-proxy"]
-```
-
-After global install, initialize the runtime first:
-
-```bash
-btwin init
-btwin install-skills --platform codex
-```
+The bundled skills are short task-oriented guides installed into the client
+environment. They are not part of `btwin-core`; they ship with `btwin-cli` and
+cover common B-TWIN workflows such as save, handoff, sync, queue, and status.
 
 If you replaced an older global `btwin` install with this runtime split, restart
 your Codex/MCP client session after `btwin init`. Existing MCP proxy processes
