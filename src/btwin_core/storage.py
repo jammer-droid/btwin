@@ -8,11 +8,11 @@ from typing import Iterator
 
 import yaml
 
-from btwin.core.orchestration_models import OrchestrationRecord
 from btwin_core.common_record_models import CommonRecordMetadata
 from btwin_core.document_contracts import validate_document_contract
 from btwin_core.frontmatter import build_frontmatter
 from btwin_core.models import Entry
+from btwin_core.orchestration_models import OrchestrationRecord
 
 _PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$")
 _RESERVED_PROJECT_NAMES = {"global", "convo", "collab"}
