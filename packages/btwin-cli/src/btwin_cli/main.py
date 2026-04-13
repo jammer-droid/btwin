@@ -14,6 +14,7 @@ if _LEGACY_SRC.exists():
 
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -52,6 +53,7 @@ agent_app = typer.Typer(help="Manage B-TWIN agent definitions.")
 protocol_app = typer.Typer(help="Manage B-TWIN protocol definitions.")
 thread_app = typer.Typer(help="Manage B-TWIN protocol threads.")
 contribution_app = typer.Typer(help="Manage B-TWIN protocol contributions.")
+service_app = typer.Typer(help="Manage the macOS launchd service for B-TWIN API.")
 app.add_typer(sources_app, name="sources")
 app.add_typer(promotion_app, name="promotion")
 app.add_typer(indexer_app, name="indexer")
@@ -60,8 +62,10 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(protocol_app, name="protocol")
 app.add_typer(thread_app, name="thread")
 app.add_typer(contribution_app, name="contribution")
+app.add_typer(service_app, name="service")
 
 console = Console(soft_wrap=True)
+_SERVICE_LABEL = "com.btwin.serve-api"
 
 
 def _emit_payload(payload: object, as_json: bool) -> None:
@@ -232,6 +236,85 @@ def _atomic_write_yaml(path: Path, data: dict[str, object]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
     tmp_path.replace(path)
+
+
+def _require_macos_service_support() -> None:
+    if sys.platform != "darwin":
+        console.print("[red]`btwin service` is only supported on macOS.[/red]")
+        raise typer.Exit(1)
+
+
+def _service_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _service_target() -> str:
+    return f"{_service_domain()}/{_SERVICE_LABEL}"
+
+
+def _service_plist_path() -> Path:
+    return _btwin_data_dir() / f"{_SERVICE_LABEL}.plist"
+
+
+def _service_link_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_SERVICE_LABEL}.plist"
+
+
+def _service_logs_dir() -> Path:
+    return _btwin_data_dir() / "logs"
+
+
+def _resolve_btwin_executable() -> Path:
+    resolved = shutil.which("btwin")
+    if not resolved:
+        console.print("[red]Could not find `btwin` executable in PATH.[/red]")
+        raise typer.Exit(1)
+    return Path(resolved).expanduser()
+
+
+def _write_service_plist(btwin_executable: Path) -> Path:
+    _service_logs_dir().mkdir(parents=True, exist_ok=True)
+    plist_path = _service_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "Label": _SERVICE_LABEL,
+        "ProgramArguments": [str(btwin_executable), "serve-api"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(_service_logs_dir() / "serve-api.stdout.log"),
+        "StandardErrorPath": str(_service_logs_dir() / "serve-api.stderr.log"),
+        "EnvironmentVariables": {
+            "PATH": f"{Path.home() / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        },
+    }
+    plist_path.write_bytes(plistlib.dumps(payload, sort_keys=False))
+    return plist_path
+
+
+def _ensure_service_link(plist_path: Path) -> Path:
+    link_path = _service_link_path()
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if link_path.is_symlink() or link_path.exists():
+        if link_path.is_dir() and not link_path.is_symlink():
+            console.print(f"[red]LaunchAgent path is a directory:[/red] {link_path}")
+            raise typer.Exit(1)
+        link_path.unlink()
+
+    link_path.symlink_to(plist_path)
+    return link_path
+
+
+def _run_service_command(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, check=check)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            console.print(exc.stdout.rstrip())
+        if exc.stderr:
+            console.print(f"[red]{exc.stderr.rstrip()}[/red]")
+        raise typer.Exit(exc.returncode or 1)
 
 
 def _detect_project_name() -> str:
@@ -664,6 +747,57 @@ def contribution_submit(
         console.print(f"[red]Thread not found or closed:[/red] {thread_id}")
         raise typer.Exit(4)
     _emit_payload(contribution, as_json=as_json)
+
+
+@service_app.command("install")
+def service_install():
+    """Install or refresh the macOS LaunchAgent for btwin serve-api."""
+    _require_macos_service_support()
+
+    btwin_executable = _resolve_btwin_executable()
+    plist_path = _write_service_plist(btwin_executable)
+    link_path = _ensure_service_link(plist_path)
+
+    _run_service_command(["launchctl", "bootout", _service_target()], check=False)
+    _run_service_command(["launchctl", "bootstrap", _service_domain(), str(link_path)])
+
+    console.print("[green]B-TWIN service installed.[/green]")
+    console.print(f"Plist: {plist_path}")
+    console.print(f"LaunchAgent: {link_path}")
+    console.print(f"Logs: {_service_logs_dir()}")
+
+
+@service_app.command("status")
+def service_status():
+    """Show launchd status for the B-TWIN API service."""
+    _require_macos_service_support()
+    result = _run_service_command(["launchctl", "print", _service_target()])
+    output = (result.stdout or result.stderr).strip()
+    if output:
+        console.print(output)
+
+
+@service_app.command("restart")
+def service_restart():
+    """Restart the B-TWIN API service through launchd."""
+    _require_macos_service_support()
+    _run_service_command(["launchctl", "kickstart", "-k", _service_target()])
+    console.print("[green]B-TWIN service restarted.[/green]")
+
+
+@service_app.command("stop")
+def service_stop():
+    """Stop the B-TWIN API service through launchd."""
+    _require_macos_service_support()
+    result = _run_service_command(["launchctl", "bootout", _service_target()], check=False)
+    if result.returncode == 0:
+        console.print("[green]B-TWIN service stopped.[/green]")
+        return
+
+    output = (result.stderr or result.stdout).strip()
+    if output:
+        console.print(output)
+    console.print("[yellow]B-TWIN service was not running.[/yellow]")
 
 
 @app.command()
