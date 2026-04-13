@@ -33,6 +33,8 @@ from btwin_core.protocol_store import Protocol, ProtocolStore
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.sources import SourceRegistry
 from btwin_core.thread_store import ThreadStore
+from btwin_core.storage import Storage
+from btwin_core.workflow_engine import WorkflowEngine
 from btwin_cli.provider_init import (
     available_provider_names,
     build_provider_config,
@@ -253,6 +255,104 @@ def _get_protocol_store() -> ProtocolStore:
 
 def _get_thread_store() -> ThreadStore:
     return ThreadStore(_project_root() / ".btwin" / "threads")
+
+
+def _get_workflow_engine(config: BTwinConfig | None = None) -> WorkflowEngine:
+    return WorkflowEngine(Storage(_get_active_data_dir(config)))
+
+
+def _normalize_runtime_sessions(raw_sessions: object) -> list[dict[str, object]]:
+    if not isinstance(raw_sessions, list):
+        return []
+
+    sessions: list[dict[str, object]] = []
+    for session in raw_sessions:
+        if isinstance(session, dict):
+            sessions.append(dict(session))
+        elif isinstance(session, str):
+            sessions.append({"thread_id": session, "status": "active"})
+    return sessions
+
+
+def _get_attached_runtime_sessions(agent_name: str, config: BTwinConfig | None = None) -> list[dict[str, object]]:
+    current_config = config or _get_config()
+    if not _use_attached_api(current_config):
+        return []
+
+    try:
+        payload = _api_get("/api/agent-runtime-status")
+    except Exception:
+        logger.warning("Failed to fetch runtime sessions for %s", agent_name, exc_info=True)
+        return []
+
+    agents = payload.get("agents", {}) if isinstance(payload, dict) else {}
+    if not isinstance(agents, dict):
+        return []
+
+    raw_sessions = agents.get(agent_name, [])
+    return _normalize_runtime_sessions(raw_sessions)
+
+
+def _build_agent_queue_summary(agent_name: str, config: BTwinConfig | None = None) -> list[dict[str, object]]:
+    agent_store = _get_agent_store()
+    queue = agent_store.get_queue(agent_name)
+    if not queue:
+        return []
+
+    workflow_engine = _get_workflow_engine(config)
+    items: list[dict[str, object]] = []
+    for order, item in enumerate(queue):
+        workflow_id = str(item.get("workflow_id") or "")
+        task_id = str(item.get("task_id") or "")
+        workflow_entry = workflow_engine._find_entry(workflow_id) if workflow_id else None
+        task_entry = workflow_engine._find_entry(task_id) if task_id else None
+        items.append(
+            {
+                "workflow_id": workflow_id,
+                "workflow_name": workflow_entry.get("name", "") if workflow_entry else "",
+                "workflow_status": workflow_entry.get("status", "") if workflow_entry else "",
+                "task_id": task_id,
+                "task_name": task_entry.get("name", "") if task_entry else "",
+                "task_status": task_entry.get("status", "") if task_entry else "",
+                "assigned_agent": task_entry.get("assigned_agent") if task_entry else None,
+                "order": order,
+            }
+        )
+    return items
+
+
+def _build_agent_thread_summary(agent_name: str, thread_store: ThreadStore | None = None) -> list[dict[str, object]]:
+    store = thread_store or _get_thread_store()
+    threads = store.list_threads(status="active")
+
+    summaries: list[dict[str, object]] = []
+    for thread in threads:
+        participant_names = {
+            participant["name"]
+            for participant in thread.get("participants", [])
+            if isinstance(participant, dict) and isinstance(participant.get("name"), str)
+        }
+        if agent_name not in participant_names:
+            continue
+
+        pending_messages = store.list_inbox(thread["thread_id"], agent_name) or []
+        agent_status = store.get_agent_status(thread["thread_id"], agent_name) or {}
+        summaries.append(
+            {
+                "thread_id": thread.get("thread_id"),
+                "topic": thread.get("topic", ""),
+                "protocol": thread.get("protocol", ""),
+                "status": thread.get("status", ""),
+                "current_phase": agent_status.get("current_phase", thread.get("current_phase")),
+                "interaction_mode": agent_status.get("interaction_mode", thread.get("interaction_mode")),
+                "participant_status": agent_status.get("participant_status"),
+                "pending_message_count": len(pending_messages),
+                "pending_messages": pending_messages,
+                "created_at": thread.get("created_at"),
+            }
+        )
+
+    return summaries
 
 
 def _resolve_thread_protocol_context(thread_id: str) -> tuple[dict, Protocol, object, list[str], list[dict]]:
@@ -566,6 +666,39 @@ def agent_create(
         role=role,
     )
     _emit_payload(agent, as_json=as_json)
+
+
+@agent_app.command("inbox")
+def agent_inbox(
+    name: str = typer.Argument(..., help="Agent name"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Summarize what one agent should look at next."""
+    agent = _get_agent_store().get_agent(name)
+    if agent is None:
+        console.print(f"[red]Agent not found:[/red] {name}")
+        raise typer.Exit(4)
+
+    config = _get_config()
+    queue = _build_agent_queue_summary(name, config)
+    active_threads = _build_agent_thread_summary(name)
+    runtime_sessions = _get_attached_runtime_sessions(name, config)
+
+    pending_thread_count = sum(1 for thread in active_threads if thread["pending_message_count"] > 0)
+    pending_message_count = sum(thread["pending_message_count"] for thread in active_threads)
+
+    payload = {
+        "agent": agent,
+        "queue_count": len(queue),
+        "queue": queue,
+        "active_thread_count": len(active_threads),
+        "active_threads": active_threads,
+        "pending_thread_count": pending_thread_count,
+        "pending_message_count": pending_message_count,
+        "runtime_session_count": len(runtime_sessions),
+        "runtime_sessions": runtime_sessions,
+    }
+    _emit_payload(payload, as_json=as_json)
 
 
 @protocol_app.command("list")
