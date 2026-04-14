@@ -24,6 +24,7 @@ _TURN_COMPLETE_KINDS = {
     "turn_complete",
     "turn.completed",
     "turn/completed",
+    "item.completed",
     "complete",
     "done",
     "final",
@@ -58,7 +59,9 @@ def _normalize_runtime_event(
     content = _event_content(event)
 
     if kind in _SESSION_STARTED_KINDS:
-        session_id = _event_session_id(event) or content
+        session_id = _event_session_id(event)
+        if not session_id:
+            return []
         return [NormalizedRuntimeEvent(kind="session_started", content=session_id, metadata=metadata)]
 
     if kind in _TEXT_DELTA_KINDS:
@@ -88,45 +91,81 @@ def _event_kind(event: Any) -> str:
 
 def _event_content(event: Any) -> str | None:
     if isinstance(event, Mapping):
-        for key in ("content", "final_text", "text_delta"):
-            value = event.get(key)
-            if isinstance(value, str) and value:
-                return value
-        message = event.get("message")
-        if isinstance(message, Mapping):
-            content = message.get("content")
-            if isinstance(content, str) and content:
+        for key in ("content", "final_text", "text_delta", "delta", "result", "text"):
+            content = _extract_text_content(event.get(key))
+            if content:
                 return content
-            if isinstance(content, list):
-                delta = "".join(
-                    block.get("text", "")
-                    for block in content
-                    if isinstance(block, Mapping) and block.get("type") == "text"
-                )
-                if delta:
-                    return delta
+        for key in ("message", "item", "raw"):
+            nested = event.get(key)
+            if isinstance(nested, Mapping):
+                content = _event_content(nested)
+                if content:
+                    return content
         return None
-    value = getattr(event, "content", None)
-    if isinstance(value, str) and value:
-        return value
-    value = getattr(event, "final_text", None)
-    if isinstance(value, str) and value:
-        return value
-    value = getattr(event, "text_delta", None)
-    if isinstance(value, str) and value:
-        return value
+    for attr in ("content", "final_text", "text_delta", "delta", "result", "text"):
+        content = _extract_text_content(getattr(event, attr, None))
+        if content:
+            return content
+    raw = getattr(event, "raw", None)
+    if isinstance(raw, Mapping):
+        return _event_content(raw)
     return None
 
 
 def _event_session_id(event: Any) -> str | None:
     if isinstance(event, Mapping):
-        value = event.get("session_id")
-        if isinstance(value, str) and value:
-            return value
+        for key in ("session_id", "thread_id"):
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for key in ("session", "thread"):
+            value = event.get(key)
+            if isinstance(value, Mapping):
+                nested = value.get("id")
+                if isinstance(nested, str) and nested:
+                    return nested
+        raw = event.get("raw")
+        if isinstance(raw, Mapping):
+            nested = _event_session_id(raw)
+            if nested:
+                return nested
         return None
     value = getattr(event, "session_id", None)
     if isinstance(value, str) and value:
         return value
+    value = getattr(event, "thread_id", None)
+    if isinstance(value, str) and value:
+        return value
+    for attr in ("session", "thread"):
+        value = getattr(event, attr, None)
+        if isinstance(value, Mapping):
+            nested = value.get("id")
+            if isinstance(nested, str) and nested:
+                return nested
+    raw = getattr(event, "raw", None)
+    if isinstance(raw, Mapping):
+        nested = _event_session_id(raw)
+        if nested:
+            return nested
+    return None
+
+
+def _extract_text_content(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, list):
+        delta = "".join(
+            block.get("text", "")
+            for block in value
+            if isinstance(block, Mapping) and block.get("type") == "text"
+        )
+        if delta:
+            return delta
+    if isinstance(value, Mapping):
+        for key in ("text", "content"):
+            nested = _extract_text_content(value.get(key))
+            if nested:
+                return nested
     return None
 
 

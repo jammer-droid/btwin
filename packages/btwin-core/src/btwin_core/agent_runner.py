@@ -1045,9 +1045,10 @@ class AgentRunner:
                             ))
                         continue
                     if normalized.kind == "turn_complete":
-                        if session.provider == "codex" and active_turn_id is None:
-                            continue
-                        if (
+                        if session.provider == "codex":
+                            if active_turn_id is None:
+                                continue
+                        elif (
                             active_turn_id
                             and normalized.content
                             and normalized.content != active_turn_id
