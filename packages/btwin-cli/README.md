@@ -80,6 +80,7 @@ Examples include:
 
 - `bt:save`
 - `bt:handoff`
+- `bt:scenario-smoke`
 - `bt:sync`
 - `bt:list`
 - `bt:status`

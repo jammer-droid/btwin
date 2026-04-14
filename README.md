@@ -229,7 +229,8 @@ For Codex, `btwin init` writes the equivalent MCP entry automatically, and
 
 The bundled skills are short task-oriented guides installed into the client
 environment. They are not part of `btwin-core`; they ship with `btwin-cli` and
-cover common B-TWIN workflows such as save, handoff, sync, queue, and status.
+cover common B-TWIN workflows such as save, handoff, scenario smoke, sync,
+queue, and status.
 
 If you replaced an older global `btwin` install with this runtime split, restart
 your Codex/MCP client session after `btwin init`. Existing MCP proxy processes

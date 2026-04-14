@@ -31,6 +31,7 @@
 - **Skill shortcut**: Use `/bt:save` when the user wants "save this conversation/progress" and you need a consistent tool-selection workflow.
 - **Handoff shortcut**: Use `/bt:handoff` when the goal is to help the next worker resume in a fresh session with background, progress, and next steps.
 - **Skill refresh shortcut**: Use `/bt:sync-skills` when bundled bt skills changed in the repo and the current platform install needs to be updated.
+- **Scenario smoke shortcut**: Use `/bt:scenario-smoke` when a btwin CLI/helper workflow changed and needs real CLI user-scenario validation in isolated attached mode before completion.
 - **TLDR mandatory**: All record tools (`btwin_record`, `btwin_convo_record`, `btwin_end_session`) require the `tldr` parameter.
 
 ### Autonomous recording criteria
