@@ -12,6 +12,7 @@ runner = CliRunner()
 
 def test_service_install_creates_launchagent_files_and_bootstraps(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
     monkeypatch.setattr(main.os, "getuid", lambda: 501)
 
@@ -52,6 +53,7 @@ def test_service_install_creates_launchagent_files_and_bootstraps(tmp_path, monk
 
 def test_service_install_requires_btwin_executable(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
     monkeypatch.setattr(main.shutil, "which", lambda name: None)
 
@@ -63,6 +65,7 @@ def test_service_install_requires_btwin_executable(tmp_path, monkeypatch):
 
 def test_service_status_prints_launchctl_output(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
     monkeypatch.setattr(main.os, "getuid", lambda: 501)
 
@@ -83,6 +86,7 @@ def test_service_status_prints_launchctl_output(tmp_path, monkeypatch):
 
 def test_service_restart_runs_kickstart(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
     monkeypatch.setattr(main.os, "getuid", lambda: 501)
 
@@ -102,6 +106,7 @@ def test_service_restart_runs_kickstart(tmp_path, monkeypatch):
 
 def test_service_stop_runs_bootout(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
     monkeypatch.setattr(main.os, "getuid", lambda: 501)
 

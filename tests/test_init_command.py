@@ -10,6 +10,7 @@ runner = CliRunner()
 
 def test_init_global_creates_providers_config_and_codex_registration(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("btwin_cli.provider_init.shutil.which", lambda name: f"/usr/bin/{name}")
 
     result = runner.invoke(app, ["init"])
@@ -41,6 +42,7 @@ def test_init_local_creates_provider_config_and_project_codex_registration(tmp_p
 
 def test_init_requires_codex_cli_in_path(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("btwin_cli.provider_init.shutil.which", lambda name: None)
 
     result = runner.invoke(app, ["init"])
@@ -51,6 +53,7 @@ def test_init_requires_codex_cli_in_path(tmp_path, monkeypatch):
 
 def test_init_reuses_existing_provider_config_without_force(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("btwin_cli.provider_init.shutil.which", lambda name: f"/usr/bin/{name}")
     providers_path = tmp_path / ".btwin" / "providers.json"
     providers_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +69,7 @@ def test_init_reuses_existing_provider_config_without_force(tmp_path, monkeypatc
 
 def test_init_force_overwrites_existing_provider_config(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("btwin_cli.provider_init.shutil.which", lambda name: f"/usr/bin/{name}")
     providers_path = tmp_path / ".btwin" / "providers.json"
     providers_path.parent.mkdir(parents=True, exist_ok=True)

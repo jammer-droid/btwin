@@ -252,6 +252,19 @@ This is useful for:
 - temporary sandbox runs
 - experiments that should not touch `~/.btwin`
 
+For a repeatable attached-helper smoke that exercises the isolated bootstrap,
+attached API-backed helper commands, runtime binding, and `protocol apply-next`
+without touching your primary `~/.btwin`, run:
+
+```bash
+./scripts/attached_helper_smoke.sh
+```
+
+The script creates a fresh temp project root, starts the isolated attached API,
+binds a thread, advances the protocol through the shared API path, clears the
+runtime binding, and finishes by checking the attached `agent inbox --json`
+surface.
+
 ## Repository Layout
 
 ```text
