@@ -12,6 +12,35 @@ if TYPE_CHECKING:
     from typing import Any as ResolvedLaunchAuth
 
 
+def _extract_session_id(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    thread = payload.get("thread")
+    if isinstance(thread, dict):
+        thread_id = thread.get("id")
+        if isinstance(thread_id, str) and thread_id.strip():
+            return thread_id
+    return None
+
+
+def _extract_text_delta_from_message(payload: dict[str, Any]) -> str:
+    message = payload.get("message", {})
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return ""
+    delta = ""
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                delta += text
+    return delta
+
+
 @dataclass
 class StreamEvent:
     """A single streaming event emitted by a CLI provider."""
@@ -116,24 +145,22 @@ class ClaudeCodeProvider(CLIProvider):
         event_type = data.get("type", "")
 
         if event_type in ("system", "init"):
-            sid = data.get("session_id")
-            return StreamEvent(event_type=event_type, session_id=sid, raw=data)
+            sid = _extract_session_id(data, "session_id", "thread_id")
+            return StreamEvent(event_type="session_started", session_id=sid, raw=data)
 
         if event_type == "assistant":
-            content = data.get("message", {}).get("content", [])
-            delta = ""
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    delta += block.get("text", "")
-            return StreamEvent(event_type="assistant", text_delta=delta, raw=data)
+            delta = _extract_text_delta_from_message(data)
+            return StreamEvent(event_type="text_delta", text_delta=delta, raw=data)
 
         if event_type == "result":
             final_text = data.get("result", "")
+            if not isinstance(final_text, str):
+                final_text = ""
             return StreamEvent(
-                event_type="result",
+                event_type="turn_complete",
                 is_final=True,
                 final_text=final_text,
-                session_id=data.get("session_id"),
+                session_id=_extract_session_id(data, "session_id", "thread_id"),
                 raw=data,
             )
 
@@ -203,19 +230,22 @@ class CodexProvider(CLIProvider):
 
         if event_type == "thread.started":
             return StreamEvent(
-                event_type="thread.started",
-                session_id=data.get("thread_id"),
+                event_type="session_started",
+                session_id=_extract_session_id(data, "thread_id", "session_id"),
                 raw=data,
             )
 
         if event_type == "item.completed":
             item = data.get("item", {})
             if item.get("type") == "agent_message" and item.get("text"):
+                text = item["text"]
+                session_id = _extract_session_id(data, "thread_id", "session_id")
                 return StreamEvent(
-                    event_type="item.completed",
-                    text_delta=item["text"],
+                    event_type="turn_complete",
+                    text_delta=text,
                     is_final=True,
-                    final_text=item["text"],
+                    final_text=text,
+                    session_id=session_id,
                     raw=data,
                 )
             return StreamEvent(event_type="item.completed", raw=data)
