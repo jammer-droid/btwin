@@ -319,6 +319,13 @@ class ThreadStore:
             messages.append(parsed)
         return messages
 
+    def list_recent_messages(self, thread_id: str, limit: int = 5) -> list[dict]:
+        """Return the newest messages for quick interactive thread context."""
+        if limit <= 0:
+            return []
+        messages = self.list_messages(thread_id)
+        return messages[-limit:]
+
     def ack_message(self, thread_id: str, message_id: str, agent_name: str) -> bool:
         msg_dir = self._dir / thread_id / "messages"
         if not msg_dir.exists():

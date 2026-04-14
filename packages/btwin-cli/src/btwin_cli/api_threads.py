@@ -197,6 +197,7 @@ class AdvancePhaseRequest(BaseModel):
 class SpawnAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     agent_name: str = Field(alias="agentName")
+    bypass_permissions: bool | None = Field(default=None, alias="bypassPermissions")
 
 
 class InteractionModeRequest(BaseModel):
@@ -355,16 +356,6 @@ def create_threads_router(
                     status_code=422,
                     detail=f"unknown target agents: {', '.join(unknown_targets)}",
                 )
-            if agent_runner is not None:
-                active_threads = agent_runner.list_active_threads_by_agent()
-                inactive_targets = sorted(
-                    target for target in req.target_agents if thread_id not in active_threads.get(target, [])
-                )
-                if inactive_targets:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"target agents are not active in this thread: {', '.join(inactive_targets)}",
-                    )
 
         msg = thread_store.send_message(
             thread_id=thread_id,
@@ -514,7 +505,11 @@ def create_threads_router(
         if updated is None:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
 
-        success = await agent_runner.spawn_for_thread(thread_id, req.agent_name)
+        success = await agent_runner.spawn_for_thread(
+            thread_id,
+            req.agent_name,
+            bypass_permissions=req.bypass_permissions,
+        )
         if not success:
             raise HTTPException(status_code=400, detail=f"Failed to spawn agent '{req.agent_name}'")
 
