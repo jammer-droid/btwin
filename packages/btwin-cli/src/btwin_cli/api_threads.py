@@ -226,7 +226,7 @@ def create_threads_router(
         proto = protocol_store.get_protocol(name)
         if proto is None:
             raise HTTPException(status_code=404, detail=f"Protocol '{name}' not found")
-        return proto.model_dump()
+        return proto.model_dump(by_alias=True)
 
     @router.post("/api/threads")
     async def create_thread(req: ThreadCreateRequest):
@@ -317,12 +317,14 @@ def create_threads_router(
                         if len(parts) >= 3:
                             frontmatter = yaml.safe_load(parts[1])
                             if frontmatter:
-                                result_record_id = frontmatter.get("record_id")
-                                if result_record_id:
-                                    twin.update_entry(
-                                        record_id=result_record_id,
+                                candidate_record_id = frontmatter.get("record_id")
+                                if candidate_record_id:
+                                    update_result = twin.update_entry(
+                                        record_id=candidate_record_id,
                                         related_records=[f"thread:{thread_id}"],
                                     )
+                                    if isinstance(update_result, dict) and update_result.get("ok"):
+                                        result_record_id = candidate_record_id
             except Exception:
                 logger.warning("Failed to create thread result entry for %s", thread_id, exc_info=True)
 

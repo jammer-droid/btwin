@@ -330,7 +330,7 @@ def _resolve_runtime_thread_safely(
     current_config = config or _get_config()
     try:
         if _use_attached_api(current_config):
-            return _api_get(f"/api/threads/{thread_id}"), None
+            return _attached_api_get_or_exit(f"/api/threads/{thread_id}"), None
         return _get_thread_store().get_thread(thread_id), None
     except Exception as exc:
         return None, f"Failed to fetch thread details: {exc.__class__.__name__}: {exc}"
