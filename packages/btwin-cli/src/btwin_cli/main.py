@@ -16,9 +16,12 @@ if _LEGACY_SRC.exists():
 import json
 import os
 import plistlib
+import queue as queue_module
 import re
 import shutil
 import subprocess
+import threading
+import time
 
 import typer
 import yaml
@@ -34,6 +37,7 @@ from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolStore
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.sources import SourceRegistry
 from btwin_core.runtime_binding_store import RuntimeBindingState, RuntimeBindingStore
+from btwin_core.thread_chat import parse_thread_chat_input
 from btwin_core.thread_store import ThreadStore
 from btwin_core.storage import Storage
 from btwin_core.workflow_engine import WorkflowEngine
@@ -55,6 +59,7 @@ sources_app = typer.Typer(help="Manage B-TWIN data sources for dashboard workflo
 promotion_app = typer.Typer(help="Manage promotion queue operations.")
 indexer_app = typer.Typer(help="Manage core indexer workflows.")
 runtime_app = typer.Typer(help="Inspect runtime mode and integration settings.")
+live_app = typer.Typer(help="Use the attached live collaboration surface.")
 agent_app = typer.Typer(help="Manage B-TWIN agent definitions.")
 protocol_app = typer.Typer(help="Manage B-TWIN protocol definitions.")
 thread_app = typer.Typer(help="Manage B-TWIN protocol threads.")
@@ -69,6 +74,7 @@ app.add_typer(sources_app, name="sources")
 app.add_typer(promotion_app, name="promotion")
 app.add_typer(indexer_app, name="indexer")
 app.add_typer(runtime_app, name="runtime")
+app.add_typer(live_app, name="live")
 app.add_typer(agent_app, name="agent")
 app.add_typer(protocol_app, name="protocol")
 app.add_typer(thread_app, name="thread")
@@ -106,6 +112,18 @@ def _resolve_content(content: str | None) -> str:
     if not stdin_content.strip():
         raise typer.BadParameter("Content is required via --content or stdin.")
     return stdin_content
+
+
+def _thread_enter_command(thread_id: str, actor: str = "user") -> str:
+    return f"btwin thread enter --thread {thread_id} --as {actor}"
+
+
+def _thread_create_payload(thread: dict[str, object]) -> dict[str, object]:
+    payload = dict(thread)
+    thread_id = payload.get("thread_id")
+    if isinstance(thread_id, str) and thread_id:
+        payload["enter_command"] = _thread_enter_command(thread_id)
+    return payload
 
 
 def _api_base_url() -> str:
@@ -266,6 +284,17 @@ def _attached_api_get_or_exit(path: str, params: dict | None = None):
     except httpx.RequestError as exc:
         _render_attached_transport_error(exc)
         raise typer.Exit(1)
+
+
+def _require_attached_live(config: BTwinConfig) -> None:
+    if _use_attached_api(config):
+        return
+    console.print(
+        "[red]`btwin live` requires attached runtime mode.[/red]\n"
+        "- Switch the active config to [bold]runtime.mode: attached[/bold]\n"
+        "- Or set [bold]BTWIN_CONFIG_PATH[/bold] to an attached config before using `btwin live`"
+    )
+    raise typer.Exit(4)
 
 
 def _get_runtime_binding_store() -> RuntimeBindingStore:
@@ -506,6 +535,33 @@ def _get_attached_runtime_sessions(agent_name: str, config: BTwinConfig | None =
     return sessions, warning, None
 
 
+def _attached_runtime_sessions_payload() -> dict[str, object]:
+    payload = _api_get("/api/agent-runtime-status")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _attached_agents_by_thread() -> dict[str, list[str]]:
+    payload = _attached_runtime_sessions_payload()
+    agents_payload = payload.get("agents", {})
+    if not isinstance(agents_payload, dict):
+        return {}
+
+    attached_by_thread: dict[str, set[str]] = {}
+    for agent_name, raw_sessions in agents_payload.items():
+        if not isinstance(agent_name, str):
+            continue
+        sessions, _warning = _normalize_runtime_sessions(agent_name, raw_sessions)
+        for session in sessions:
+            thread_id = session.get("thread_id")
+            if not isinstance(thread_id, str) or not thread_id:
+                continue
+            attached_by_thread.setdefault(thread_id, set()).add(agent_name)
+    return {
+        thread_id: sorted(agent_names)
+        for thread_id, agent_names in attached_by_thread.items()
+    }
+
+
 def _build_agent_queue_summary(
     agent_name: str,
     queue_data_dir: Path | None = None,
@@ -724,6 +780,418 @@ def _load_protocol_flow_context(
     if not isinstance(phase_participants, list):
         phase_participants = []
     return thread, protocol, phase, [str(name) for name in phase_participants if isinstance(name, str)], contributions
+
+
+def _thread_chat_tldr(content: str, limit: int = 80) -> str:
+    text = " ".join(content.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _format_live_message(
+    sender: str,
+    content: str,
+    *,
+    actor: str,
+    targets: list[str] | None = None,
+) -> str:
+    clean_content = " ".join(content.split())
+    if sender == actor:
+        if targets:
+            return f"you -> @{', @'.join(targets)}: {clean_content}"
+        return f"you: {clean_content}"
+    return f"{sender}: {clean_content}"
+
+
+def _format_live_thread_entry(entry: dict[str, object]) -> str:
+    participants = ", ".join(str(name) for name in entry.get("participants", []))
+    attached_agents = entry.get("attached_agents", [])
+    attached_label = ", ".join(str(name) for name in attached_agents) if attached_agents else "-"
+    return (
+        f"{entry.get('thread_id')}  {entry.get('topic')}\n"
+        f"  protocol: {entry.get('protocol')}  phase: {entry.get('current_phase')}  status: {entry.get('status')}\n"
+        f"  participants: {participants}\n"
+        f"  attached_agents: {attached_label}"
+    )
+
+
+def _list_live_threads(config: BTwinConfig | None = None) -> list[dict[str, object]]:
+    current_config = config or _get_config()
+    _require_attached_live(current_config)
+    threads = _attached_api_get_or_exit("/api/threads", {"status": "active"})
+    attached_by_thread = _attached_agents_by_thread()
+    summaries: list[dict[str, object]] = []
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        thread_id = thread.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            continue
+        participants = thread.get("participants", [])
+        participant_names = [
+            participant.get("name")
+            for participant in participants
+            if isinstance(participant, dict) and isinstance(participant.get("name"), str)
+        ]
+        summaries.append(
+            {
+                "thread_id": thread_id,
+                "topic": thread.get("topic", ""),
+                "protocol": thread.get("protocol", ""),
+                "status": thread.get("status", ""),
+                "current_phase": thread.get("current_phase", ""),
+                "participants": participant_names,
+                "attached_agents": attached_by_thread.get(thread_id, []),
+            }
+        )
+    return summaries
+
+
+def _load_thread_enter_snapshot(
+    thread_id: str,
+    actor: str,
+    config: BTwinConfig | None = None,
+) -> dict[str, object]:
+    current_config = config or _get_config()
+    thread, protocol, phase, _phase_participants, _contributions = _load_protocol_flow_context(thread_id, current_config)
+    participant_names = sorted(_thread_participant_names(thread))
+    if actor not in participant_names:
+        console.print(f"[red]Agent is not a participant on this thread:[/red] {actor} not in {thread_id}")
+        raise typer.Exit(4)
+
+    if _use_attached_api(current_config):
+        inbox_payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/inbox", {"agent": actor})
+        pending_messages = inbox_payload.get("messages", []) if isinstance(inbox_payload, dict) else []
+        pending_count = inbox_payload.get("pending_count", len(pending_messages)) if isinstance(inbox_payload, dict) else 0
+        recent_messages: list[dict] = []
+    else:
+        store = _get_thread_store()
+        pending_messages = store.list_inbox(thread_id, actor) or []
+        pending_count = len(pending_messages)
+        recent_messages = store.list_recent_messages(thread_id, limit=5)
+
+    return {
+        "thread_id": thread_id,
+        "topic": thread.get("topic", ""),
+        "protocol": protocol.name,
+        "current_phase": phase.name,
+        "participants": participant_names,
+        "actor": actor,
+        "interaction_mode": protocol.interaction.mode,
+        "pending_count": pending_count,
+        "pending_messages": pending_messages,
+        "recent_messages": recent_messages,
+    }
+
+
+def _load_live_enter_snapshot(
+    thread_id: str,
+    actor: str,
+    config: BTwinConfig | None = None,
+) -> dict[str, object]:
+    current_config = config or _get_config()
+    _require_attached_live(current_config)
+    thread, protocol, phase, _phase_participants, _contributions = _load_protocol_flow_context(thread_id, current_config)
+    participant_names = sorted(_thread_participant_names(thread))
+    if actor not in participant_names:
+        console.print(f"[red]Actor is not a participant on this thread:[/red] {actor} not in {thread_id}")
+        raise typer.Exit(4)
+
+    inbox_payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/inbox", {"agent": actor})
+    pending_messages = inbox_payload.get("messages", []) if isinstance(inbox_payload, dict) else []
+    pending_count = inbox_payload.get("pending_count", len(pending_messages)) if isinstance(inbox_payload, dict) else 0
+    recent_payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/messages")
+    recent_messages = recent_payload[-5:] if isinstance(recent_payload, list) else []
+    attached_agents = _attached_agents_by_thread().get(thread_id, [])
+    return {
+        "thread_id": thread_id,
+        "topic": thread.get("topic", ""),
+        "protocol": protocol.name,
+        "current_phase": phase.name,
+        "participants": participant_names,
+        "actor": actor,
+        "interaction_mode": protocol.interaction.mode,
+        "pending_count": pending_count,
+        "pending_messages": pending_messages,
+        "recent_messages": recent_messages,
+        "attached_agents": attached_agents,
+    }
+
+
+def _render_thread_enter_snapshot(snapshot: dict[str, object]) -> str:
+    payload = {
+        "thread_id": snapshot.get("thread_id"),
+        "topic": snapshot.get("topic"),
+        "protocol": snapshot.get("protocol"),
+        "current_phase": snapshot.get("current_phase"),
+        "actor": snapshot.get("actor"),
+        "interaction_mode": snapshot.get("interaction_mode"),
+        "participants": snapshot.get("participants"),
+        "pending_count": snapshot.get("pending_count"),
+    }
+    return yaml.safe_dump(payload, sort_keys=False).strip()
+
+
+def _render_live_enter_snapshot(snapshot: dict[str, object]) -> str:
+    participants = ", ".join(str(name) for name in snapshot.get("participants", []))
+    attached_agents = ", ".join(str(name) for name in snapshot.get("attached_agents", [])) or "-"
+    lines = [
+        f"live thread {snapshot.get('thread_id')}\n"
+        f"topic: {snapshot.get('topic')}\n"
+        f"protocol: {snapshot.get('protocol')}  phase: {snapshot.get('current_phase')}\n"
+        f"actor: {snapshot.get('actor')}  interaction_mode: {snapshot.get('interaction_mode')}\n"
+        f"participants: {participants}\n"
+        f"attached_agents: {attached_agents}\n"
+        f"pending_count: {snapshot.get('pending_count', 0)}"
+    ]
+    recent_messages = snapshot.get("recent_messages", [])
+    if isinstance(recent_messages, list) and recent_messages:
+        lines.append("recent:")
+        actor = str(snapshot.get("actor") or "")
+        for message in recent_messages:
+            if not isinstance(message, dict):
+                continue
+            sender = message.get("from")
+            if not isinstance(sender, str) or not sender:
+                continue
+            content = message.get("_content") or message.get("content") or message.get("tldr") or ""
+            if not isinstance(content, str) or not content.strip():
+                continue
+            targets = message.get("target_agents") if isinstance(message.get("target_agents"), list) else []
+            lines.append(f"  {_format_live_message(sender, content, actor=actor, targets=targets)}")
+    return "\n".join(lines)
+
+
+def _print_thread_enter_help() -> None:
+    console.print("Commands: /help /status /inbox /exit")
+    console.print("Prefixes: !message -> broadcast, @agent message -> direct")
+
+
+def _print_live_enter_help() -> None:
+    console.print("Commands: /help /status /inbox /exit")
+    console.print("Prefixes: !message -> broadcast, @agent message -> direct")
+
+
+def _thread_enter_send_message(
+    thread_id: str,
+    actor: str,
+    decision,
+    config: BTwinConfig | None = None,
+) -> dict[str, object]:
+    current_config = config or _get_config()
+    content = decision.content.strip()
+    if not content:
+        raise typer.BadParameter("Message content is required.")
+
+    if _use_attached_api(current_config):
+        payload = {
+            "fromAgent": actor,
+            "content": content,
+            "tldr": _thread_chat_tldr(content),
+            "deliveryMode": decision.mode,
+            "targetAgents": decision.targets,
+        }
+        return _attached_api_call_or_exit(f"/api/threads/{thread_id}/messages", payload)
+
+    message = _get_thread_store().send_message(
+        thread_id=thread_id,
+        from_agent=actor,
+        content=content,
+        tldr=_thread_chat_tldr(content),
+        delivery_mode=decision.mode or "broadcast",
+        target_agents=decision.targets,
+    )
+    if message is None:
+        console.print(f"[red]Thread not found or closed:[/red] {thread_id}")
+        raise typer.Exit(4)
+    return message
+
+
+def _live_enter_send_message(
+    thread_id: str,
+    actor: str,
+    decision,
+    config: BTwinConfig | None = None,
+) -> dict[str, object]:
+    return _thread_enter_send_message(thread_id, actor, decision, config)
+
+
+def _render_live_inbox_messages(
+    thread_id: str,
+    actor: str,
+    *,
+    seen_message_ids: set[str],
+) -> int:
+    payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/inbox", {"agent": actor})
+    if not isinstance(payload, dict):
+        return 0
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return 0
+
+    shown = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        message_id = message.get("message_id")
+        if isinstance(message_id, str) and message_id in seen_message_ids:
+            continue
+        sender = message.get("from")
+        if not isinstance(sender, str) or not sender:
+            continue
+        content = message.get("_content") or message.get("content") or message.get("tldr") or ""
+        if not isinstance(content, str) or not content.strip():
+            continue
+        targets = message.get("target_agents") if isinstance(message.get("target_agents"), list) else []
+        console.print(_format_live_message(sender, content, actor=actor, targets=targets))
+        if isinstance(message_id, str) and message_id:
+            seen_message_ids.add(message_id)
+        shown += 1
+    return shown
+
+
+def _attached_event_stream():
+    import httpx
+
+    with httpx.Client(base_url=_api_base_url(), timeout=None) as client:
+        with client.stream("GET", "/api/events") as response:
+            response.raise_for_status()
+            event_name: str | None = None
+            data_lines: list[str] = []
+            for raw_line in response.iter_lines():
+                line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8")
+                if not line:
+                    if data_lines:
+                        payload = json.loads("".join(data_lines))
+                        if event_name and isinstance(payload, dict) and "type" not in payload:
+                            payload["type"] = event_name
+                        yield payload
+                    event_name = None
+                    data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_name = line.partition(":")[2].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line.partition(":")[2].lstrip())
+
+
+def _start_live_event_listener(thread_id: str) -> queue_module.Queue[dict[str, object]]:
+    events: queue_module.Queue[dict[str, object]] = queue_module.Queue()
+
+    def worker() -> None:
+        try:
+            for event in _attached_event_stream():
+                if not isinstance(event, dict):
+                    continue
+                resource_id = event.get("resource_id")
+                if resource_id not in {thread_id, "active"}:
+                    continue
+                events.put(event)
+        except Exception as exc:
+            events.put({"type": "listener_error", "resource_id": thread_id, "error": str(exc)})
+
+    thread = threading.Thread(target=worker, daemon=True, name=f"btwin-live-events-{thread_id}")
+    thread.start()
+    return events
+
+
+def _render_live_event(
+    event: dict[str, object],
+    *,
+    actor: str,
+    seen_message_ids: set[str],
+) -> int:
+    event_type = event.get("type")
+    if event_type == "listener_error":
+        error = event.get("error")
+        if isinstance(error, str) and error:
+            console.print(f"[yellow]live event stream ended:[/yellow] {error}")
+        return 1
+    if event_type == "agent_session_state":
+        agent_name = event.get("agent_name")
+        state = event.get("state")
+        if isinstance(agent_name, str) and isinstance(state, str) and state in {
+            "queued",
+            "thinking",
+            "working",
+            "received",
+            "responding",
+            "done",
+            "failed",
+            "fallback",
+        }:
+            console.print(f"{agent_name} is {state}")
+            return 1
+        return 0
+    if event_type == "message_sent":
+        sender = event.get("from_agent")
+        if not isinstance(sender, str) or sender == actor:
+            return 0
+        message_id = event.get("message_id")
+        if isinstance(message_id, str) and message_id in seen_message_ids:
+            return 0
+        content = event.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return 0
+        targets = event.get("target_agents") if isinstance(event.get("target_agents"), list) else []
+        console.print(_format_live_message(sender, content, actor=actor, targets=targets))
+        if isinstance(message_id, str) and message_id:
+            seen_message_ids.add(message_id)
+        return 1
+    return 0
+
+
+def _render_live_events(
+    events: queue_module.Queue[dict[str, object]],
+    *,
+    actor: str,
+    seen_message_ids: set[str],
+    wait_seconds: float = 0.0,
+) -> int:
+    rendered = 0
+
+    if wait_seconds > 0:
+        try:
+            first = events.get(timeout=wait_seconds)
+            rendered += _render_live_event(first, actor=actor, seen_message_ids=seen_message_ids)
+        except queue_module.Empty:
+            return 0
+
+    while True:
+        try:
+            rendered += _render_live_event(events.get_nowait(), actor=actor, seen_message_ids=seen_message_ids)
+        except queue_module.Empty:
+            break
+    return rendered
+
+
+def _start_live_event_printer(
+    events: queue_module.Queue[dict[str, object]],
+    *,
+    actor: str,
+    seen_message_ids: set[str],
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                event = events.get(timeout=0.2)
+            except queue_module.Empty:
+                continue
+            _render_live_event(event, actor=actor, seen_message_ids=seen_message_ids)
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+        name=f"btwin-live-printer-{actor}",
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def _project_root() -> Path:
@@ -1295,7 +1763,242 @@ def thread_create(
             initial_phase=proto.phases[0].name if proto.phases else None,
             locale=locale,
         )
-    _emit_payload(thread, as_json=as_json)
+    payload = _thread_create_payload(thread)
+    if as_json:
+        _emit_payload(payload, as_json=True)
+        return
+
+    enter_command = payload.pop("enter_command", None)
+    _emit_payload(payload, as_json=False)
+    if isinstance(enter_command, str):
+        console.print("")
+        console.print("Join this thread:")
+        console.print(f"  {enter_command}")
+
+
+@live_app.command("threads")
+def live_threads(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """List active threads in attached live mode."""
+    config = _get_config()
+    _require_attached_live(config)
+    threads = _list_live_threads(config)
+    if as_json:
+        _emit_payload(threads, as_json=True)
+        return
+    if not threads:
+        console.print("[dim]No live threads found.[/dim]")
+        return
+    for index, thread in enumerate(threads):
+        if index:
+            console.print("")
+        console.print(_format_live_thread_entry(thread))
+
+
+@live_app.command("status")
+def live_status(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Show attached live runtime status summary."""
+    config = _get_config()
+    _require_attached_live(config)
+    threads = _list_live_threads(config)
+    runtime_payload = _attached_runtime_sessions_payload()
+    agents_payload = runtime_payload.get("agents", {}) if isinstance(runtime_payload, dict) else {}
+    agent_names = sorted(name for name in agents_payload if isinstance(name, str))
+    payload = {
+        "url": _api_base_url(),
+        "thread_count": len(threads),
+        "attached_agent_count": len(agent_names),
+        "attached_agents": agent_names,
+        "threads": threads,
+    }
+    if as_json:
+        _emit_payload(payload, as_json=True)
+        return
+    console.print(f"live api: {_api_base_url()}")
+    console.print(f"thread_count: {len(threads)}")
+    console.print(f"attached_agent_count: {len(agent_names)}")
+    console.print(f"attached_agents: {', '.join(agent_names) if agent_names else '-'}")
+
+
+@live_app.command("attach")
+def live_attach(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    agent_name: str = typer.Option(..., "--agent", help="Agent name"),
+    full_auto: bool = typer.Option(
+        True,
+        "--full-auto/--no-full-auto",
+        help="Allow the attached helper agent to run without interactive approval prompts.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Attach one agent to a live thread."""
+    config = _get_config()
+    _require_attached_live(config)
+    payload = _attached_api_call_or_exit(
+        f"/api/threads/{thread_id}/spawn-agent",
+        {"agentName": agent_name, "bypassPermissions": full_auto},
+    )
+    if as_json:
+        _emit_payload(payload, as_json=True)
+        return
+    mode = "full-auto" if full_auto else "approval-required"
+    console.print(f"attached {agent_name} -> {thread_id} ({mode})")
+
+
+@live_app.command("close")
+def live_close(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    summary: str = typer.Option(..., "--summary", help="Thread summary"),
+    decision: str | None = typer.Option(None, "--decision", help="Thread decision"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Close one live thread."""
+    config = _get_config()
+    _require_attached_live(config)
+    payload: dict[str, object] = {"summary": summary}
+    if decision is not None:
+        payload["decision"] = decision
+    closed = _attached_api_call_or_exit(f"/api/threads/{thread_id}/close", payload)
+    _emit_payload(closed, as_json=as_json)
+
+
+@live_app.command("enter")
+def live_enter(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    actor: str = typer.Option(..., "--as", help="Actor name"),
+    attach_agents: list[str] = typer.Option([], "--attach", help="Attach an agent before entering"),
+    full_auto: bool = typer.Option(
+        True,
+        "--full-auto/--no-full-auto",
+        help="When using --attach, allow the attached helper agents to run without interactive approval prompts.",
+    ),
+):
+    """Enter an attached live thread with human-readable chat formatting."""
+    config = _get_config()
+    _require_attached_live(config)
+    for agent_name in attach_agents:
+        _attached_api_call_or_exit(
+            f"/api/threads/{thread_id}/spawn-agent",
+            {"agentName": agent_name, "bypassPermissions": full_auto},
+        )
+
+    snapshot = _load_live_enter_snapshot(thread_id, actor, config)
+    events = _start_live_event_listener(thread_id)
+    seen_message_ids: set[str] = set()
+    stdin = typer.get_text_stream("stdin")
+    interactive_stdin = bool(getattr(stdin, "isatty", lambda: False)())
+    stop_printer: threading.Event | None = None
+    printer_thread: threading.Thread | None = None
+    if interactive_stdin:
+        stop_printer, printer_thread = _start_live_event_printer(
+            events,
+            actor=actor,
+            seen_message_ids=seen_message_ids,
+        )
+
+    try:
+        console.print(_render_live_enter_snapshot(snapshot))
+        _print_live_enter_help()
+        _render_live_inbox_messages(thread_id, actor, seen_message_ids=seen_message_ids)
+
+        while True:
+            raw = stdin.readline()
+            if raw == "":
+                break
+
+            decision = parse_thread_chat_input(raw.rstrip("\n"))
+            if decision.kind == "empty":
+                continue
+
+            if decision.kind == "command":
+                command = decision.command or "help"
+                if command == "exit":
+                    break
+                if command == "help":
+                    _print_live_enter_help()
+                    continue
+                if command == "status":
+                    snapshot = _load_live_enter_snapshot(thread_id, actor, config)
+                    console.print(_render_live_enter_snapshot(snapshot))
+                    continue
+                if command == "inbox":
+                    if _render_live_inbox_messages(thread_id, actor, seen_message_ids=seen_message_ids) == 0:
+                        console.print("[dim]No new messages.[/dim]")
+                    continue
+                console.print(f"[yellow]Unknown command:[/yellow] /{command}")
+                continue
+
+            console.print(_format_live_message(actor, decision.content, actor=actor, targets=decision.targets))
+            message = _live_enter_send_message(thread_id, actor, decision, config)
+            message_id = message.get("message_id")
+            if isinstance(message_id, str) and message_id:
+                seen_message_ids.add(message_id)
+            if not interactive_stdin:
+                _render_live_events(events, actor=actor, seen_message_ids=seen_message_ids, wait_seconds=8.0)
+    finally:
+        if stop_printer is not None:
+            stop_printer.set()
+        if printer_thread is not None:
+            printer_thread.join(timeout=0.5)
+
+
+@thread_app.command("enter")
+def thread_enter(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    actor: str = typer.Option(..., "--as", help="Actor name"),
+):
+    """Enter a lightweight chat loop for one thread participant."""
+    config = _get_config()
+    snapshot = _load_thread_enter_snapshot(thread_id, actor, config)
+    console.print(_render_thread_enter_snapshot(snapshot))
+    _print_thread_enter_help()
+
+    stdin = typer.get_text_stream("stdin")
+    while True:
+        raw = stdin.readline()
+        if raw == "":
+            break
+
+        decision = parse_thread_chat_input(raw.rstrip("\n"))
+        if decision.kind == "empty":
+            continue
+
+        if decision.kind == "command":
+            command = decision.command or "help"
+            if command == "exit":
+                break
+            if command == "help":
+                _print_thread_enter_help()
+                continue
+            if command == "status":
+                snapshot = _load_thread_enter_snapshot(thread_id, actor, config)
+                console.print(_render_thread_enter_snapshot(snapshot))
+                continue
+            if command == "inbox":
+                snapshot = _load_thread_enter_snapshot(thread_id, actor, config)
+                inbox_payload = {
+                    "thread_id": thread_id,
+                    "agent": actor,
+                    "pending_count": snapshot.get("pending_count", 0),
+                    "messages": snapshot.get("pending_messages", []),
+                }
+                console.print(yaml.safe_dump(inbox_payload, sort_keys=False).strip())
+                continue
+            console.print(f"[yellow]Unknown command:[/yellow] /{command}")
+            continue
+
+        message = _thread_enter_send_message(thread_id, actor, decision, config)
+        route = message.get("delivery_mode", decision.mode)
+        console.print(f"route: {route}")
+        targets = message.get("target_agents", [])
+        if isinstance(targets, list) and targets:
+            console.print(f"targets: {', '.join(str(target) for target in targets)}")
+        message_id = message.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            console.print(f"message_id: {message_id}")
 
 
 @thread_app.command("list")

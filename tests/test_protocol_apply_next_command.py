@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 import btwin_cli.main as main
 from btwin_cli.main import app
 from btwin_core.config import BTwinConfig, RuntimeConfig
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
+from btwin_core.protocol_store import Protocol, ProtocolInteraction, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
 from btwin_core.runtime_binding_store import RuntimeBindingStore
 from btwin_core.thread_store import ThreadStore
 
@@ -100,6 +100,24 @@ def _transition_protocol() -> Protocol:
         transitions=[ProtocolTransition.model_validate({"from": "context", "to": "followup", "on": "yes"})],
         outcomes=["yes", "no"],
     )
+
+
+def test_protocol_apply_next_preserves_interaction_metadata(tmp_path):
+    project_root = tmp_path / "project"
+    protocol = _transition_protocol()
+    protocol.interaction = ProtocolInteraction(
+        mode="orchestrated_chat",
+        allow_user_chat=True,
+        default_actor="user",
+    )
+
+    store = _save_protocol(project_root, protocol)
+    loaded = store.get_protocol("transition-next")
+
+    assert loaded is not None
+    assert loaded.interaction.mode == "orchestrated_chat"
+    assert loaded.interaction.allow_user_chat is True
+    assert loaded.interaction.default_actor == "user"
 
 
 def test_protocol_next_reports_manual_outcome_needed(tmp_path, monkeypatch):

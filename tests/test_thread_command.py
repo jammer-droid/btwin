@@ -70,6 +70,39 @@ def test_thread_create_attached_uses_shared_api(monkeypatch):
     payload = _parse_json_output(result.output)
     assert payload["thread_id"] == "thread-20260413-abc123"
     assert payload["current_phase"] == "context"
+    assert payload["enter_command"] == "btwin thread enter --thread thread-20260413-abc123 --as user"
+
+
+def test_thread_create_non_json_prints_thread_enter_hint(monkeypatch):
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config())
+
+    def fake_attached_call(path: str, data: dict) -> dict:
+        return {
+            "thread_id": "thread-20260413-abc123",
+            "topic": data["topic"],
+            "protocol": data["protocol"],
+            "participants": [],
+            "status": "active",
+            "current_phase": "context",
+        }
+
+    monkeypatch.setattr(main, "_attached_api_call_or_exit", fake_attached_call)
+
+    result = runner.invoke(
+        app,
+        [
+            "thread",
+            "create",
+            "--topic",
+            "Orchestration",
+            "--protocol",
+            "debate",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Join this thread:" in result.output
+    assert "btwin thread enter --thread thread-20260413-abc123 --as user" in result.output
 
 
 def test_thread_list_attached_uses_shared_api(monkeypatch):

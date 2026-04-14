@@ -633,7 +633,13 @@ class AgentRunner:
 
     # --- Spawn ---
 
-    async def spawn_for_thread(self, thread_id: str, agent_name: str) -> bool:
+    async def spawn_for_thread(
+        self,
+        thread_id: str,
+        agent_name: str,
+        *,
+        bypass_permissions: bool | None = None,
+    ) -> bool:
         """Register agent immediately, invoke in background."""
         key = (thread_id, agent_name)
 
@@ -645,6 +651,8 @@ class AgentRunner:
         session = self._get_or_create_session(thread_id, agent_name)
         if session is None:
             return False
+        if bypass_permissions is not None:
+            session.bypass_permissions = bypass_permissions
 
         # Register BEFORE invoke — messages will be routed to this agent
         self._managed_sessions.add(key)
