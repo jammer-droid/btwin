@@ -1,5 +1,9 @@
 name: debate
 description: "Multiple agents submit structured opinions on a topic and reach consensus"
+interaction:
+  mode: orchestrated_chat
+  allow_user_chat: true
+  default_actor: user
 phases:
   - name: context
     description: "Each participant shares their relevant knowledge and position"

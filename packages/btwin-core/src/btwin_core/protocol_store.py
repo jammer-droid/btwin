@@ -22,6 +22,12 @@ class CycleConfig(BaseModel):
     until: Literal["decide"] = "decide"
 
 
+class ProtocolInteraction(BaseModel):
+    mode: Literal["passive", "chat", "orchestrated_chat"] = "passive"
+    allow_user_chat: bool = False
+    default_actor: str | None = None
+
+
 class ProtocolPhase(BaseModel):
     name: str
     description: str = ""
@@ -61,6 +67,7 @@ class Protocol(BaseModel):
     name: str
     description: str = ""
     phases: list[ProtocolPhase]
+    interaction: ProtocolInteraction = Field(default_factory=ProtocolInteraction)
     roles: list[str] = []
     transitions: list[ProtocolTransition] = []
     outcomes: list[str] = []
