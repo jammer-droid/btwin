@@ -293,6 +293,25 @@ binds a thread, advances the protocol through the shared API path, clears the
 runtime binding, and finishes by checking the attached `agent inbox --json`
 surface.
 
+For workflow-constraints validation, keep a second terminal open with either:
+
+```bash
+uv run btwin hud --thread <thread_id>
+```
+
+or:
+
+```bash
+uv run btwin thread watch <thread_id> --follow
+```
+
+Use `thread watch` when you want the canonical workflow event feed for one
+thread, and use `hud` when you want the thread feed alongside the broader
+runtime dashboard. `uv run btwin runtime current --json` is still the source of
+truth for binding state, especially because deterministic stale cleanup is
+currently triggered by command paths such as `runtime current` rather than by
+every observation surface.
+
 ## Repository Layout
 
 ```text
