@@ -23,6 +23,7 @@ class TransportLaunchContext:
     token_ref: str | None = None
     gateway_metadata: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    cwd: str | None = None
 
     def build_session_config(self, *, resume_session_id: str | None = None) -> SessionConfig:
         metadata = dict(self.gateway_metadata)
@@ -32,8 +33,13 @@ class TransportLaunchContext:
             metadata["token_ref"] = self.token_ref
         if resume_session_id:
             metadata["resume_session_id"] = resume_session_id
+        options: dict[str, object] = {}
+        if self.env:
+            options["env"] = dict(self.env)
+        if self.cwd:
+            options["cwd"] = self.cwd
         return SessionConfig(
-            options={"env": dict(self.env)} if self.env else {},
+            options=options,
             metadata=metadata,
         )
 

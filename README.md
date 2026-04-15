@@ -298,15 +298,57 @@ may keep using the older environment until the client reconnects.
 
 ## Isolated Testing Mode
 
-Use a repo-local data directory only when you explicitly want isolation from the
-normal global store:
+Use the isolated bootstrap when you explicitly want a disposable test
+environment separate from the normal global store. For the primary user path,
+prefer the `btwin test-env` CLI. `btwin test-env up` prepares the repo-scoped
+test project root at `.btwin-test-env/project` and prints the exact `cd`
+command to launch Codex there:
 
 ```bash
-export BTWIN_CONFIG_PATH="$(pwd)/.btwin/config.yaml"
-export BTWIN_DATA_DIR="$(pwd)/.btwin"
-mkdir -p "$BTWIN_DATA_DIR"
-uv run btwin serve-api
+btwin test-env up
+btwin test-env hud
 ```
+
+Run Codex from that test project root, not from this repository root. The
+repo's `AGENTS.md` is left unchanged.
+
+### Legacy Shell Helper Fallback
+
+If you still need the generated shell-scoped helpers, the older flow remains
+available for fallback use:
+
+```bash
+./scripts/bootstrap_isolated_attached_env.sh start --skip-server \
+  --root .btwin-attached-test \
+  --project-root /tmp/btwin-workflow-constraints-project \
+  --project btwin-workflow-constraints \
+  --port 8788
+
+source .btwin-attached-test/env.sh
+btwin_test_up
+btwin_test_hud
+```
+
+After you source `env.sh`, the generated test helpers stay scoped to that shell
+and use only the isolated attached environment:
+
+```bash
+btwin_test_status
+btwin_test_up
+btwin_test_hud --thread <thread_id>
+btwin_test_down
+```
+
+Plain `btwin` commands in that same sourced shell also use the isolated
+environment:
+
+```bash
+btwin hud
+btwin runtime current --json
+```
+
+When you need to launch Codex in this legacy flow, `cd` into the test project
+root first and then start `codex` from there.
 
 This is useful for:
 
@@ -314,10 +356,12 @@ This is useful for:
 - temporary sandbox runs
 - experiments that should not touch `~/.btwin`
 
-When you use this isolated mode, remember:
+The activation is shell-local only. When you use this isolated mode, remember:
 
 - `BTWIN_CONFIG_PATH` and `BTWIN_DATA_DIR` should usually point at the same local root
+- `btwin_test_up`, `btwin_test_hud`, `btwin_test_status`, and `btwin_test_down` only affect the sourced isolated env
 - many `btwin` commands will keep reading and writing that repo-local store while those paths stay active
+- shells that do not source `env.sh` continue to use the global `~/.btwin` default
 - the repo-local `.btwin/` directory is local runtime state and should be ignored by git
 
 For a repeatable attached-helper smoke that exercises the isolated bootstrap,
@@ -333,24 +377,26 @@ binds a thread, advances the protocol through the shared API path, clears the
 runtime binding, and finishes by checking the attached `agent inbox --json`
 surface.
 
-For workflow-constraints validation, keep a second terminal open with either:
+For workflow-constraints validation, keep a second terminal open after you
+have already sourced `env.sh` in that shell so it is pointed at the isolated
+attached environment, with either:
 
 ```bash
-uv run btwin hud --thread <thread_id>
+btwin hud --thread <thread_id>
 ```
 
 or:
 
 ```bash
-uv run btwin thread watch <thread_id> --follow
+btwin thread watch <thread_id> --follow
 ```
 
 Use `thread watch` when you want the canonical workflow event feed for one
 thread, and use `hud` when you want the thread feed alongside the broader
-runtime dashboard. `uv run btwin runtime current --json` is still the source of
-truth for binding state, especially because deterministic stale cleanup is
-currently triggered by command paths such as `runtime current` rather than by
-every observation surface.
+runtime dashboard. `btwin runtime current --json` is still the source of truth
+for binding state, especially because deterministic stale cleanup is currently
+triggered by command paths such as `runtime current` rather than by every
+observation surface.
 
 ## Repository Layout
 
