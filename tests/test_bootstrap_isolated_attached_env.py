@@ -47,9 +47,12 @@ def test_bootstrap_script_start_skip_server_creates_isolated_env(tmp_path):
 
     assert env_file.exists()
     env_text = env_file.read_text(encoding="utf-8")
+    repo_venv_bin = repo_root / ".venv" / "bin"
     assert f'export BTWIN_CONFIG_PATH="{config_path}"' in env_text
     assert f'export BTWIN_DATA_DIR="{data_dir}"' in env_text
     assert 'export BTWIN_API_URL="http://127.0.0.1:8788"' in env_text
+    assert f'if [[ -d "{repo_venv_bin}" ]]; then' in env_text
+    assert f'export PATH="{repo_venv_bin}:$PATH"' in env_text
 
     assert providers_path.exists()
     assert codex_config.exists()

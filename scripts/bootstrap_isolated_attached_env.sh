@@ -67,6 +67,9 @@ write_env_file() {
 export BTWIN_CONFIG_PATH="${CONFIG_PATH}"
 export BTWIN_DATA_DIR="${DATA_DIR}"
 export BTWIN_API_URL="${API_URL}"
+if [[ -d "${REPO_ROOT}/.venv/bin" ]]; then
+  export PATH="${REPO_ROOT}/.venv/bin:\$PATH"
+fi
 EOF
 }
 
