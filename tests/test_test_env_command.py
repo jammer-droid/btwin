@@ -1,7 +1,9 @@
 import json
 import os
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
@@ -155,6 +157,7 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
     repo_root.mkdir()
 
     monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(main, "_preferred_test_env_btwin", lambda: Path("/opt/btwin/bin/btwin"))
 
     root = main._test_env_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -165,6 +168,19 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
 
     killed: list[tuple[int, object]] = []
 
+    def fake_ps_run(args, capture_output, text, check):
+        assert args == ["ps", "-p", "4242", "-o", "command="]
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
     monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
 
@@ -172,6 +188,36 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert killed == [(4242, main.signal.SIGTERM)]
+    assert not pid_path.exists()
+    assert not owner_path.exists()
+
+
+@pytest.mark.parametrize("pid_text", ["0\n", "-1\n"])
+def test_test_env_down_rejects_non_positive_pid(tmp_path, monkeypatch, pid_text):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+
+    root = main._test_env_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pid_path = main._test_env_pid_path()
+    owner_path = main._test_env_owner_path()
+    pid_path.write_text(pid_text, encoding="utf-8")
+    owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+
+    killed: list[tuple[int, object]] = []
+
+    def fake_ps_run(*args, **kwargs):
+        raise AssertionError("ps should not be queried for non-positive pids")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    result = runner.invoke(app, ["test-env", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert killed == []
     assert not pid_path.exists()
     assert not owner_path.exists()
 
@@ -191,6 +237,43 @@ def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
 
     killed: list[tuple[int, object]] = []
 
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
+
+    result = runner.invoke(app, ["test-env", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert killed == []
+    assert not pid_path.exists()
+    assert not owner_path.exists()
+
+
+def test_test_env_down_requires_matching_command_line(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(main, "_preferred_test_env_btwin", lambda: Path("/opt/btwin/bin/btwin"))
+
+    root = main._test_env_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pid_path = main._test_env_pid_path()
+    owner_path = main._test_env_owner_path()
+    pid_path.write_text("4242\n", encoding="utf-8")
+    owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+
+    killed: list[tuple[int, object]] = []
+
+    def fake_ps_run(args, capture_output, text, check):
+        assert args == ["ps", "-p", "4242", "-o", "command="]
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="/usr/bin/python -m btwin_cli.main hud\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
     monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
 

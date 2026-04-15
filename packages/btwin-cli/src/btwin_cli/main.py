@@ -2208,9 +2208,12 @@ def _test_env_pid() -> int | None:
     if not pid_path.exists():
         return None
     try:
-        return int(pid_path.read_text(encoding="utf-8").strip())
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    if pid <= 0:
+        return None
+    return pid
 
 
 def _test_env_owner_matches() -> bool:
@@ -2221,13 +2224,31 @@ def _test_env_owner_matches() -> bool:
 
 
 def _test_env_pid_is_running(pid: int | None) -> bool:
-    if pid is None:
+    if pid is None or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def _test_env_server_command_matches(pid: int, port: int = 8792) -> bool:
+    btwin_bin = _preferred_test_env_btwin()
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    command_line = result.stdout.strip()
+    expected_command = f"{btwin_bin} serve-api --port {port}"
+    return expected_command in command_line
 
 
 def _cleanup_test_env_pid_files() -> None:
@@ -2242,6 +2263,9 @@ def _stop_owned_test_env_process() -> None:
         _cleanup_test_env_pid_files()
         return
     assert pid is not None
+    if not _test_env_server_command_matches(pid):
+        _cleanup_test_env_pid_files()
+        return
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
