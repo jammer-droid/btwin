@@ -258,14 +258,27 @@ may keep using the older environment until the client reconnects.
 
 ## Isolated Testing Mode
 
-Use a repo-local data directory only when you explicitly want isolation from the
-normal global store:
+Use the isolated bootstrap when you explicitly want a disposable test
+environment separate from the normal global store. The activation step is
+`source <env.sh>` in the current shell:
 
 ```bash
-export BTWIN_CONFIG_PATH="$(pwd)/.btwin/config.yaml"
-export BTWIN_DATA_DIR="$(pwd)/.btwin"
-mkdir -p "$BTWIN_DATA_DIR"
-uv run btwin serve-api
+./scripts/bootstrap_isolated_attached_env.sh start --skip-server \
+  --root .btwin-attached-test \
+  --project-root /tmp/btwin-workflow-constraints-project \
+  --project btwin-workflow-constraints \
+  --port 8788
+
+source .btwin-attached-test/env.sh
+btwin serve-api --port 8788
+```
+
+After you source `env.sh`, plain `btwin` commands in that shell use the
+isolated environment:
+
+```bash
+btwin hud
+btwin runtime current --json
 ```
 
 This is useful for:
@@ -274,10 +287,11 @@ This is useful for:
 - temporary sandbox runs
 - experiments that should not touch `~/.btwin`
 
-When you use this isolated mode, remember:
+The activation is shell-local only. When you use this isolated mode, remember:
 
 - `BTWIN_CONFIG_PATH` and `BTWIN_DATA_DIR` should usually point at the same local root
 - many `btwin` commands will keep reading and writing that repo-local store while those paths stay active
+- shells that do not source `env.sh` continue to use the global `~/.btwin` default
 - the repo-local `.btwin/` directory is local runtime state and should be ignored by git
 
 For a repeatable attached-helper smoke that exercises the isolated bootstrap,
