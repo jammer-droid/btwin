@@ -35,6 +35,15 @@ source "$TMP_ROOT/env.sh"
 
 Run all `btwin` commands from that sourced shell so `BTWIN_CONFIG_PATH`, `BTWIN_DATA_DIR`, and `BTWIN_API_URL` stay aligned.
 
+When the changed flow involves attached runtime, hooks, recovery, resume, or app-server behavior, also open a second terminal in the same repo and same sourced env for monitoring:
+
+```bash
+source "$TMP_ROOT/env.sh"
+uv run btwin hud
+```
+
+Use the HUD to select the target thread or run `uv run btwin hud --thread <thread_id>` when the thread is already known.
+
 ## Scenario Pattern
 
 Choose the smallest scenario that exercises the changed surface, but prefer real command sequences over one-off probes.
@@ -47,13 +56,15 @@ Common sequence:
 4. inspect `thread inbox` or `agent inbox`
 5. if runtime helpers changed, run `runtime bind/current/clear`
 6. if protocol helpers changed, run `protocol next` and `protocol apply-next`
-7. verify final thread/runtime state with JSON output
+7. if attached runtime behavior changed, monitor the same thread in `btwin hud`
+8. verify final thread/runtime state with JSON output
 
 ## Good Scenario Families
 
 - Thread lifecycle: `thread create -> show/list -> close`
 - Inbox flow: `thread send-message -> thread inbox -> agent inbox -> ack-message`
 - Runtime helper flow: `runtime bind -> runtime current -> protocol next/apply-next -> runtime clear`
+- Runtime recovery flow: `thread create -> live attach -> induce fallback/recovery -> hud verify runtime events -> final status check`
 
 If attached direct delivery is not the behavior under test, prefer `--delivery-mode broadcast`.
 In attached mode, direct delivery can require the target agent to already be active in that thread runtime.
@@ -62,6 +73,7 @@ In attached mode, direct delivery can require the target agent to already be act
 
 - Prefer `--json` and assert on returned fields, not just exit code
 - Verify the command that reflects the final user-visible state, not only intermediate commands
+- When HUD is part of the smoke, record the runtime/workflow event sequence you observed there, not only the final command output
 - Record any product constraint separately from real failures
 - Report the exact commands used and the scenario outcome
 
@@ -72,6 +84,7 @@ After the smoke, report:
 - scenario name in one line
 - commands exercised
 - key JSON facts verified
+- key HUD facts verified
 - any known constraints discovered
 
 Example:
@@ -80,5 +93,6 @@ Example:
 Scenario smoke passed: attached review handoff flow
 - Commands: agent create, thread create, thread send-message, agent inbox, runtime bind/current, protocol next/apply-next, runtime clear
 - Verified: pending_message_count=1, current_phase=discussion, runtime binding cleared
+- HUD: CODEX -> BTWIN Stop check requested, BTWIN -> CODEX Stop blocked, contribution recorded, Stop allowed
 - Constraint: attached direct delivery requires active target runtime in the thread
 ```
