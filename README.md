@@ -307,7 +307,9 @@ binds a thread, advances the protocol through the shared API path, clears the
 runtime binding, and finishes by checking the attached `agent inbox --json`
 surface.
 
-For workflow-constraints validation, keep a second terminal open with either:
+For workflow-constraints validation, keep a second terminal open after you
+have already sourced `env.sh` in that shell so it is pointed at the isolated
+attached environment, with either:
 
 ```bash
 btwin hud --thread <thread_id>
