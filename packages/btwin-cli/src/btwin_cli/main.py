@@ -2253,24 +2253,6 @@ def _test_env_process_start_time(pid: int) -> str | None:
     return start_time or None
 
 
-def _test_env_server_command_matches(pid: int, port: int = 8792) -> bool:
-    btwin_bin = _preferred_test_env_btwin()
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return False
-    if result.returncode != 0:
-        return False
-    command_line = result.stdout.strip()
-    expected_command = f"{btwin_bin} serve-api --port {port}"
-    return expected_command in command_line
-
-
 def _test_env_record_process_identity(pid: int) -> bool:
     start_time = _test_env_process_start_time(pid)
     if start_time is None:
@@ -2313,9 +2295,6 @@ def _stop_owned_test_env_process() -> None:
         _cleanup_test_env_pid_files()
         return
     if _test_env_process_start_time(pid) != recorded_start_time:
-        _cleanup_test_env_pid_files()
-        return
-    if not _test_env_server_command_matches(pid):
         _cleanup_test_env_pid_files()
         return
     try:

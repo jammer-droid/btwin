@@ -200,7 +200,6 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
     repo_root.mkdir()
 
     monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
-    monkeypatch.setattr(main, "_preferred_test_env_btwin", lambda: Path("/opt/btwin/bin/btwin"))
 
     root = main._test_env_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -222,16 +221,6 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
                 args=args,
                 returncode=0,
                 stdout="Mon Apr 15 12:34:56 2026\n",
-                stderr="",
-            )
-        if args == ["ps", "-p", "4242", "-o", "command="]:
-            assert capture_output is True
-            assert text is True
-            assert check is False
-            return subprocess.CompletedProcess(
-                args=args,
-                returncode=0,
-                stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
                 stderr="",
             )
         raise AssertionError(f"unexpected ps call: {args}")
@@ -317,57 +306,6 @@ def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
     assert not identity_path.exists()
 
 
-def test_test_env_down_requires_matching_command_line(tmp_path, monkeypatch):
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-
-    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
-    monkeypatch.setattr(main, "_preferred_test_env_btwin", lambda: Path("/opt/btwin/bin/btwin"))
-
-    root = main._test_env_root()
-    root.mkdir(parents=True, exist_ok=True)
-    pid_path = main._test_env_pid_path()
-    owner_path = main._test_env_owner_path()
-    identity_path = main._test_env_identity_path()
-    pid_path.write_text("4242\n", encoding="utf-8")
-    owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
-    identity_path.write_text(
-        json.dumps({"pid": 4242, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    killed: list[tuple[int, object]] = []
-
-    def fake_ps_run(args, capture_output, text, check):
-        if args == ["ps", "-p", "4242", "-o", "lstart="]:
-            return subprocess.CompletedProcess(
-                args=args,
-                returncode=0,
-                stdout="Mon Apr 15 12:34:56 2026\n",
-                stderr="",
-            )
-        if args == ["ps", "-p", "4242", "-o", "command="]:
-            return subprocess.CompletedProcess(
-                args=args,
-                returncode=0,
-                stdout="/usr/bin/python -m btwin_cli.main hud\n",
-                stderr="",
-            )
-        raise AssertionError(f"unexpected ps call: {args}")
-
-    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
-    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
-
-    result = runner.invoke(app, ["test-env", "down"])
-
-    assert result.exit_code == 0, result.output
-    assert killed == []
-    assert not pid_path.exists()
-    assert not owner_path.exists()
-    assert not identity_path.exists()
-
-
 def test_test_env_down_refuses_recycled_pid_with_new_start_time(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -395,13 +333,6 @@ def test_test_env_down_refuses_recycled_pid_with_new_start_time(tmp_path, monkey
                 args=args,
                 returncode=0,
                 stdout="Mon Apr 15 12:35:02 2026\n",
-                stderr="",
-            )
-        if args == ["ps", "-p", "4242", "-o", "command="]:
-            return subprocess.CompletedProcess(
-                args=args,
-                returncode=0,
-                stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
                 stderr="",
             )
         raise AssertionError(f"unexpected ps call: {args}")
