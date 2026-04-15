@@ -45,6 +45,7 @@ from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolStore
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.sources import SourceRegistry
 from btwin_core.runtime_binding_store import RuntimeBindingState, RuntimeBindingStore
+from btwin_core.runtime_logging import RuntimeEventLogger
 from btwin_core.thread_chat import parse_thread_chat_input
 from btwin_core.thread_store import ThreadStore
 from btwin_core.workflow_event_log import WorkflowEventLog
@@ -207,35 +208,22 @@ def _render_thread_watch(thread: dict[str, object], status_summary: dict[str, ob
     topic = thread.get("topic")
     if topic:
         lines.append(f"Topic   {topic}")
+    runtime_lines = _render_thread_runtime_diagnostics(str(thread.get("thread_id", "")), _get_config())
+    if runtime_lines:
+        lines.extend(["", "Runtime"])
+        lines.extend(runtime_lines)
     if events:
         lines.append("")
         for event in events:
             timestamp = str(event.get("timestamp", ""))
             time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-            event_type = str(event.get("event_type", "event"))
-            hook_name = str(event.get("hook_event_name") or "").strip()
-            decision = str(event.get("decision") or "").strip()
-            source = str(event.get("source") or "").strip()
-            lane = "BTWIN -> CODEX" if source.startswith("btwin.") or event_type == "hook_decision" else "CODEX -> BTWIN"
-            if event_type == "hook_received":
-                headline = f"{hook_name or 'Hook'} check requested"
-            elif event_type == "hook_decision":
-                if decision == "block":
-                    headline = f"{hook_name or 'Hook'} blocked"
-                elif decision == "allow":
-                    headline = f"{hook_name or 'Hook'} allowed"
-                elif decision == "noop":
-                    headline = f"{hook_name or 'Hook'} no-op"
-                else:
-                    headline = f"{hook_name or 'Hook'} decision"
-            else:
-                headline = event_type.replace("_", " ")
+            lane, headline, headline_style = _workflow_event_heading(event)
             agent = event.get("agent")
             phase = event.get("phase")
             reason = event.get("reason")
             session_id = event.get("session_id")
             turn_id = event.get("turn_id")
-            lines.append(f"{time_label}  {lane}  {headline}")
+            lines.append(_style_hud_line(f"{time_label}  {lane}  {headline}", headline_style))
             details = []
             if agent:
                 details.append(f"agent: {agent}")
@@ -256,6 +244,138 @@ def _render_thread_watch(thread: dict[str, object], status_summary: dict[str, ob
             if summary:
                 lines.append(f"          summary: {summary}")
     return "\n".join(lines)
+
+
+def _truncate_hud_text(value: str, limit: int = 120) -> str:
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _style_hud_line(text: str, style: str | None = None) -> str:
+    escaped_text = escape(text)
+    if not style:
+        return escaped_text
+    return f"[{style}]{escaped_text}[/{style}]"
+
+
+def _workflow_event_heading(event: dict[str, object]) -> tuple[str, str, str | None]:
+    event_type = str(event.get("event_type", "event"))
+    hook_name = str(event.get("hook_event_name") or "").strip()
+    decision = str(event.get("decision") or "").strip()
+    source = str(event.get("source") or "").strip()
+    lane = "BTWIN -> CODEX" if source.startswith("btwin.") or event_type == "hook_decision" else "CODEX -> BTWIN"
+    style = "cyan" if lane == "CODEX -> BTWIN" else None
+    if event_type == "hook_received":
+        return lane, f"{hook_name or 'Hook'} check requested", style
+    if event_type == "hook_decision":
+        if decision == "block":
+            return lane, f"{hook_name or 'Hook'} blocked", "red"
+        if decision == "allow":
+            return lane, f"{hook_name or 'Hook'} allowed", "green"
+        if decision == "noop":
+            return lane, f"{hook_name or 'Hook'} no-op", "yellow"
+        return lane, f"{hook_name or 'Hook'} decision", "yellow"
+    return lane, event_type.replace("_", " "), style
+
+
+def _runtime_session_style(session: dict[str, object]) -> str | None:
+    if session.get("fallback_transport_involved"):
+        return "yellow"
+    if str(session.get("status", "")) == "failed":
+        return "red"
+    if str(session.get("status", "")) == "done":
+        return "green"
+    return None
+
+
+def _runtime_event_style(event_type: str) -> str | None:
+    if event_type == "runtime_transport_fallback":
+        return "yellow"
+    if event_type == "runtime_session_failed":
+        return "red"
+    if event_type in {"runtime_session_started", "runtime_session_recovered"}:
+        return "green"
+    return None
+
+
+def _runtime_transport_surface_and_kind(transport_mode: object) -> tuple[str, str]:
+    mode = str(transport_mode or "")
+    if mode == "live_process_transport":
+        return "app-server", "long-term"
+    if mode == "resume_invocation_transport":
+        return "exec", "short-term"
+    return "unknown", "unknown"
+
+
+def _runtime_sessions_for_thread(thread_id: str, config: BTwinConfig) -> list[tuple[str, dict[str, object]]]:
+    if not thread_id:
+        return []
+    if _use_attached_api(config):
+        try:
+            payload = _attached_runtime_sessions_payload()
+        except Exception:
+            return []
+        agents_payload = payload.get("agents", {}) if isinstance(payload, dict) else {}
+        if not isinstance(agents_payload, dict):
+            return []
+        sessions: list[tuple[str, dict[str, object]]] = []
+        for agent_name, raw_sessions in agents_payload.items():
+            if not isinstance(agent_name, str):
+                continue
+            normalized, _warning = _normalize_runtime_sessions(agent_name, raw_sessions)
+            for session in normalized:
+                if session.get("thread_id") == thread_id:
+                    sessions.append((agent_name, dict(session)))
+        return sessions
+    return []
+
+
+def _runtime_events_for_thread(thread_id: str, config: BTwinConfig, limit: int = 3) -> list[dict[str, object]]:
+    if not thread_id:
+        return []
+    if _use_attached_api(config):
+        try:
+            payload = _api_get("/api/runtime/logs", params={"threadId": thread_id, "limit": limit})
+        except Exception:
+            return []
+        events = payload.get("events", []) if isinstance(payload, dict) else []
+        return [dict(event) for event in events if isinstance(event, dict)]
+    return RuntimeEventLogger(_btwin_data_dir()).tail(limit=limit, thread_id=thread_id)
+
+
+def _render_thread_runtime_diagnostics(thread_id: str, config: BTwinConfig) -> list[str]:
+    if not thread_id:
+        return []
+    lines: list[str] = []
+    sessions = _runtime_sessions_for_thread(thread_id, config)
+    for agent_name, session in sessions:
+        transport_mode = session.get("transport_mode", "-")
+        surface, kind = _runtime_transport_surface_and_kind(transport_mode)
+        status = session.get("status", "-")
+        fallback = "yes" if session.get("fallback_transport_involved") else "no"
+        lines.append(_style_hud_line(
+            f"{agent_name}  transport={transport_mode}  surface={surface}  kind={kind}  status={status}  fallback={fallback}",
+            _runtime_session_style(session),
+        ))
+        last_error = session.get("last_transport_error")
+        if isinstance(last_error, str) and last_error.strip():
+            lines.append(_style_hud_line(f"last_error: {_truncate_hud_text(last_error)}", "red"))
+    runtime_events = _runtime_events_for_thread(thread_id, config, limit=3)
+    for event in runtime_events:
+        timestamp = str(event.get("timestamp", ""))
+        time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
+        event_type = str(event.get("eventType", "runtime_event"))
+        transport_mode = event.get("transportMode")
+        head = f"{time_label}  {event_type}"
+        if transport_mode:
+            head += f"  transport={transport_mode}"
+        lines.append(_style_hud_line(head, _runtime_event_style(event_type)))
+        message = event.get("message")
+        if isinstance(message, str) and message.strip():
+            lines.append(f"message: {_truncate_hud_text(message)}")
+    return lines
 
 
 def _resolve_bound_thread_id() -> str | None:
@@ -310,6 +430,7 @@ class _HudNavigatorState:
     menu_index: int = 0
     thread_index: int = 0
     selected_thread_id: str | None = None
+    thread_log_offset: int = 0
 
 
 def _hud_is_interactive() -> bool:
@@ -339,6 +460,14 @@ def _hud_key_from_bytes(data: bytes) -> str | None:
         return "up"
     if text.startswith("\x1b[B"):
         return "down"
+    if text.startswith("\x1b[5~"):
+        return "page_up"
+    if text.startswith("\x1b[6~"):
+        return "page_down"
+    if text in {"\x1b[H", "\x1b[1~"}:
+        return "home"
+    if text in {"\x1b[F", "\x1b[4~"}:
+        return "end"
     if text in {"\r", "\n"}:
         return "enter"
     if text.lower() == "q":
@@ -347,6 +476,12 @@ def _hud_key_from_bytes(data: bytes) -> str | None:
         return "back"
     if text.lower() == "c":
         return "close"
+    if text.lower() == "j":
+        return "down"
+    if text.lower() == "k":
+        return "up"
+    if text.lower() == "f":
+        return "end"
     return None
 
 
@@ -424,13 +559,29 @@ def _render_hud_threads(state: _HudNavigatorState, config: BTwinConfig, limit: i
     return "\n".join(lines)
 
 
+def _hud_thread_view_window_size() -> int:
+    try:
+        return max(console.size.height - 8, 6)
+    except Exception:
+        return 12
+
+
 def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
     lines = ["B-TWIN HUD", ""]
     if state.selected_thread_id is None:
         lines.extend(["No thread selected.", "", "Controls  b back  q quit"])
         return "\n".join(lines)
-    lines.append(_render_hud(state.selected_thread_id, limit))
-    lines.extend(["", "Controls  c close  b back  q quit"])
+    body_lines = _render_hud(state.selected_thread_id, limit).splitlines()[1:]
+    window_size = _hud_thread_view_window_size()
+    max_offset = max(0, len(body_lines) - window_size)
+    state.thread_log_offset = _clamp_index(state.thread_log_offset, max_offset + 1 if max_offset else 1)
+    visible = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
+    lines.extend(visible)
+    if body_lines:
+        start = state.thread_log_offset + 1
+        end = min(state.thread_log_offset + len(visible), len(body_lines))
+        lines.extend(["", f"Scroll  {start}-{end} of {len(body_lines)}"])
+    lines.extend(["", "Controls  up/down scroll  pgup/pgdn page  home/end jump  c close  b back  q quit"])
     return "\n".join(lines)
 
 
@@ -477,6 +628,7 @@ def _apply_hud_key(
             selected = threads[state.thread_index].get("thread_id")
             if isinstance(selected, str) and selected:
                 state.selected_thread_id = selected
+                state.thread_log_offset = 0
                 state.screen = "thread"
         elif key == "close" and threads:
             state.thread_index = _clamp_index(state.thread_index, len(threads))
@@ -498,6 +650,22 @@ def _apply_hud_key(
             remaining = _list_hud_threads(config)
             state.thread_index = _clamp_index(state.thread_index, len(remaining))
             return False
+        if state.selected_thread_id is not None:
+            body_lines = _render_hud(state.selected_thread_id, 10).splitlines()[1:]
+            window_size = _hud_thread_view_window_size()
+            max_offset = max(0, len(body_lines) - window_size)
+            if key == "up":
+                state.thread_log_offset = max(0, state.thread_log_offset - 1)
+            elif key == "down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + 1)
+            elif key == "page_up":
+                state.thread_log_offset = max(0, state.thread_log_offset - window_size)
+            elif key == "page_down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + window_size)
+            elif key == "home":
+                state.thread_log_offset = 0
+            elif key == "end":
+                state.thread_log_offset = max_offset
 
     return False
 
@@ -601,21 +769,14 @@ def _run_live_view(render_once, interval: float) -> None:
 def _format_workflow_event_line(event: dict[str, object]) -> list[str]:
     timestamp = str(event.get("timestamp", ""))
     time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-    event_type = str(event.get("event_type", "event"))
-    hook_name = event.get("hook_event_name")
-    decision = event.get("decision")
     agent = event.get("agent")
     phase = event.get("phase")
-    label_parts = [event_type]
-    if hook_name:
-        label_parts.append(str(hook_name))
-    if decision:
-        label_parts.append(str(decision))
+    lane, headline, headline_style = _workflow_event_heading(event)
     suffix = " ".join(part for part in [str(agent) if agent else "", str(phase) if phase else ""] if part)
-    first_line = f"{time_label} {' '.join(label_parts)}"
+    first_line = f"{time_label}  {lane}  {headline}"
     if suffix:
         first_line += f" {suffix}"
-    lines = [first_line]
+    lines = [_style_hud_line(first_line, headline_style)]
     summary = event.get("summary")
     if summary:
         lines.append(f"  {summary}")

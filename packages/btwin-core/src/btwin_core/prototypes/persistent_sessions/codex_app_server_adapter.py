@@ -28,6 +28,7 @@ class CodexAppServerPersistentAdapter(PersistentSessionAdapter):
     capability = "live_persistent"
     continuity_mode = "thread_rpc_session"
     launch_strategy = "single_process_app_server"
+    _HOOKS_FEATURE_FLAG = ("--enable", "codex_hooks")
 
     def __init__(
         self,
@@ -82,6 +83,7 @@ class CodexAppServerPersistentAdapter(PersistentSessionAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._build_launch_env(config),
+                cwd=self._resolve_launch_cwd(config),
             )
         except FileNotFoundError as exc:
             return self._failure_start_result(
@@ -421,6 +423,7 @@ class CodexAppServerPersistentAdapter(PersistentSessionAdapter):
             "never",
             "-s",
             "danger-full-access",
+            *self._HOOKS_FEATURE_FLAG,
             "app-server",
             "--listen",
             "stdio://",
@@ -436,6 +439,13 @@ class CodexAppServerPersistentAdapter(PersistentSessionAdapter):
         if isinstance(extra_env, dict):
             env.update({str(key): str(value) for key, value in extra_env.items()})
         return env
+
+    def _resolve_launch_cwd(self, config: SessionConfig) -> str | None:
+        candidate = config.options.get("cwd")
+        if candidate is None:
+            return None
+        text = str(candidate).strip()
+        return text or None
 
     def _resolve_resume_session_id(self, config: SessionConfig) -> str | None:
         candidate = (

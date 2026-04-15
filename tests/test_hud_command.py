@@ -85,6 +85,105 @@ def test_hud_with_binding_shows_bound_thread_and_recent_events(tmp_path, monkeyp
     assert "Stop allowed." in result.output
 
 
+def test_hud_attached_thread_view_shows_runtime_diagnostics(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    def fake_api_get(path: str, params: dict | None = None):
+        if path == "/api/threads/thread-1":
+            return {
+                "thread_id": "thread-1",
+                "topic": "Attached HUD thread",
+                "protocol": "debate",
+                "current_phase": "context",
+            }
+        if path == "/api/threads/thread-1/status":
+            return {
+                "thread_id": "thread-1",
+                "current_phase": "context",
+                "agents": [{"name": "alice", "status": "joined"}],
+            }
+        if path == "/api/agent-runtime-status":
+            return {
+                "agents": {
+                    "alice": [
+                        {
+                            "thread_id": "thread-1",
+                            "transport_mode": "resume_invocation_transport",
+                            "status": "failed",
+                            "fallback_transport_involved": True,
+                            "last_transport_error": "live transport timed out after 6.00s of inactivity",
+                        }
+                    ]
+                }
+            }
+        if path == "/api/runtime/logs":
+            assert params == {"threadId": "thread-1", "limit": 3}
+            return {
+                "events": [
+                    {
+                        "timestamp": "2026-04-15T04:32:23+00:00",
+                        "eventType": "runtime_transport_fallback",
+                        "message": "runtime transport fell back",
+                        "transportMode": "resume_invocation_transport",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected path: {path} params={params}")
+
+    monkeypatch.setattr(main, "_api_get", fake_api_get)
+
+    rendered = main._render_hud("thread-1", limit=5)
+
+    assert "Runtime" in rendered
+    assert (
+        "[yellow]alice  transport=resume_invocation_transport  surface=exec  "
+        "kind=short-term  status=failed  fallback=yes[/yellow]"
+    ) in rendered
+    assert "[red]last_error: live transport timed out after 6.00s of inactivity[/red]" in rendered
+    assert "[yellow]04:32:23  runtime_transport_fallback  transport=resume_invocation_transport[/yellow]" in rendered
+    assert "runtime transport fell back" in rendered
+
+
+def test_render_thread_runtime_diagnostics_shows_long_term_app_server_sessions(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    def fake_api_get(path: str, params: dict | None = None):
+        if path == "/api/agent-runtime-status":
+            return {
+                "agents": {
+                    "alice": [
+                        {
+                            "thread_id": "thread-1",
+                            "transport_mode": "live_process_transport",
+                            "status": "done",
+                            "fallback_transport_involved": False,
+                        }
+                    ]
+                }
+            }
+        if path == "/api/runtime/logs":
+            return {"events": []}
+        raise AssertionError(f"unexpected path: {path} params={params}")
+
+    monkeypatch.setattr(main, "_api_get", fake_api_get)
+
+    lines = main._render_thread_runtime_diagnostics("thread-1", _attached_config(data_dir))
+
+    assert lines == [
+        "[green]alice  transport=live_process_transport  surface=app-server  kind=long-term  status=done  fallback=no[/green]"
+    ]
+
+
 def test_follow_render_loop_uses_live_updates_without_clearing(monkeypatch):
     updates: list[str] = []
 
@@ -203,14 +302,50 @@ def test_render_thread_watch_formats_codex_and_btwin_events_for_humans():
 
     rendered = main._render_thread_watch(thread, status_summary, events)
 
-    assert "04:04:50  CODEX -> BTWIN  Stop check requested" in rendered
-    assert "04:04:50  BTWIN -> CODEX  Stop blocked" in rendered
+    assert "[cyan]04:04:50  CODEX -> BTWIN  Stop check requested[/cyan]" in rendered
+    assert "[red]04:04:50  BTWIN -> CODEX  Stop blocked[/red]" in rendered
     assert "agent: alice" in rendered
     assert "phase: context" in rendered
     assert "reason: missing_contribution" in rendered
     assert "session: session-1" in rendered
     assert "turn: turn-1" in rendered
     assert "summary: Stop received." in rendered
+
+
+def test_render_thread_watch_colors_allow_and_noop_headlines():
+    thread = {
+        "thread_id": "thread-1",
+        "protocol": "debate",
+        "current_phase": "context",
+    }
+    status_summary = {"agents": [{"name": "alice", "status": "contributed"}]}
+    events = [
+        {
+            "timestamp": "2026-04-15T04:04:46+00:00",
+            "thread_id": "thread-1",
+            "event_type": "hook_decision",
+            "source": "btwin.workflow.hook",
+            "agent": "alice",
+            "hook_event_name": "UserPromptSubmit",
+            "decision": "noop",
+            "summary": "Current phase: context. Required result type: contribution.",
+        },
+        {
+            "timestamp": "2026-04-15T04:07:27+00:00",
+            "thread_id": "thread-1",
+            "event_type": "hook_decision",
+            "source": "btwin.workflow.hook",
+            "agent": "alice",
+            "hook_event_name": "Stop",
+            "decision": "allow",
+            "summary": "Stop allowed.",
+        },
+    ]
+
+    rendered = main._render_thread_watch(thread, status_summary, events)
+
+    assert "[yellow]04:04:46  BTWIN -> CODEX  UserPromptSubmit no-op[/yellow]" in rendered
+    assert "[green]04:07:27  BTWIN -> CODEX  Stop allowed[/green]" in rendered
 
 
 def test_hud_attached_mode_shows_thread_lookup_error_instead_of_exiting(tmp_path, monkeypatch):
@@ -238,9 +373,16 @@ def test_hud_attached_mode_shows_thread_lookup_error_instead_of_exiting(tmp_path
 def test_hud_key_parser_understands_arrow_and_control_keys():
     assert main._hud_key_from_bytes(b"\x1b[A") == "up"
     assert main._hud_key_from_bytes(b"\x1b[B") == "down"
+    assert main._hud_key_from_bytes(b"\x1b[5~") == "page_up"
+    assert main._hud_key_from_bytes(b"\x1b[6~") == "page_down"
+    assert main._hud_key_from_bytes(b"\x1b[H") == "home"
+    assert main._hud_key_from_bytes(b"\x1b[F") == "end"
     assert main._hud_key_from_bytes(b"\r") == "enter"
     assert main._hud_key_from_bytes(b"b") == "back"
     assert main._hud_key_from_bytes(b"c") == "close"
+    assert main._hud_key_from_bytes(b"j") == "down"
+    assert main._hud_key_from_bytes(b"k") == "up"
+    assert main._hud_key_from_bytes(b"f") == "end"
     assert main._hud_key_from_bytes(b"q") == "quit"
 
 
@@ -295,6 +437,34 @@ def test_hud_navigator_moves_from_menu_to_threads_to_thread_view(monkeypatch, tm
 
     assert main._apply_hud_key(state, "back", config) is False
     assert state.screen == "threads"
+
+
+def test_hud_thread_view_scrolls_logs(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(
+        main,
+        "_render_hud",
+        lambda thread_id, limit: "B-TWIN HUD\n" + "\n".join(f"line {i}" for i in range(12)),
+    )
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 4)
+
+    assert main._apply_hud_key(state, "down", config) is False
+    assert state.thread_log_offset == 1
+
+    assert main._apply_hud_key(state, "page_down", config) is False
+    assert state.thread_log_offset == 5
+
+    assert main._apply_hud_key(state, "end", config) is False
+    assert state.thread_log_offset == 8
+
+    assert main._apply_hud_key(state, "home", config) is False
+    assert state.thread_log_offset == 0
 
 
 def test_hud_close_key_closes_selected_standalone_thread_and_hides_it(tmp_path, monkeypatch):

@@ -1260,6 +1260,7 @@ class AgentRunner:
             token_ref=token_ref if isinstance(token_ref, str) and token_ref else None,
             gateway_metadata=gateway_metadata,
             env=dict(launch.env),
+            cwd=str(self._workspace_root(session.workspace_root)) if session.workspace_root is not None else None,
         )
 
     def _resolve_session_metadata(self, session: AgentSession) -> dict[str, str] | None:
