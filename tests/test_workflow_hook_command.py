@@ -167,6 +167,10 @@ def test_workflow_hook_reads_stdin_user_prompt_submit_and_emits_empty_success(tm
     assert result.exit_code == 0, result.output
     assert result.output.strip() == ""
 
+    events = WorkflowEventLog(_thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert [event["event_type"] for event in events] == ["phase_attempt_started"]
+    assert events[0]["hook_event_name"] == "UserPromptSubmit"
+
 
 def test_workflow_hook_reads_stdin_session_start_refreshes_binding_metadata(tmp_path, monkeypatch):
     project_root, data_dir, _thread_store, thread = _seed_context(tmp_path)
@@ -333,6 +337,14 @@ def test_workflow_hook_reads_stdin_stop_and_emits_block_reason(tmp_path, monkeyp
     assert output["decision"] == "block"
     assert "still needs a contribution" in output["reason"]
 
+    events = WorkflowEventLog(_thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert [event["event_type"] for event in events] == [
+        "phase_exit_check_requested",
+        "phase_exit_blocked",
+    ]
+    assert events[0]["hook_event_name"] == "Stop"
+    assert events[1]["hook_event_name"] == "Stop"
+
 
 def test_workflow_hook_reads_stdin_stop_and_emits_empty_success_when_allowed(tmp_path, monkeypatch):
     project_root, data_dir, thread_store, thread = _seed_context(tmp_path)
@@ -362,6 +374,10 @@ def test_workflow_hook_reads_stdin_stop_and_emits_empty_success_when_allowed(tmp
 
     assert result.exit_code == 0, result.output
     assert result.output.strip() == ""
+
+    events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert [event["event_type"] for event in events] == ["phase_exit_check_requested"]
+    assert events[0]["hook_event_name"] == "Stop"
 
 
 def test_workflow_hook_stdin_mode_fails_open_without_runtime_binding(tmp_path, monkeypatch):
@@ -407,7 +423,10 @@ def test_workflow_hook_stdin_mode_records_block_event(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
 
     events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
-    assert [event["event_type"] for event in events] == ["hook_received", "hook_decision"]
+    assert [event["event_type"] for event in events] == [
+        "phase_exit_check_requested",
+        "phase_exit_blocked",
+    ]
     assert events[-1]["decision"] == "block"
     assert events[-1]["hook_event_name"] == "Stop"
     assert events[-1]["agent"] == "alice"
@@ -443,7 +462,7 @@ def test_contribution_submit_records_workflow_event(tmp_path, monkeypatch):
 
     events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
     assert len(events) == 1
-    assert events[0]["event_type"] == "contribution_recorded"
+    assert events[0]["event_type"] == "required_result_recorded"
     assert events[0]["agent"] == "alice"
     assert events[0]["phase"] == "implementation"
     assert events[0]["summary"] == "implemented"

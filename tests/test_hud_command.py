@@ -336,25 +336,24 @@ def test_render_thread_watch_formats_codex_and_btwin_events_for_humans():
         {
             "timestamp": "2026-04-15T04:04:50+00:00",
             "thread_id": "thread-1",
-            "event_type": "hook_received",
+            "event_type": "phase_exit_check_requested",
             "source": "codex.hook",
             "agent": "alice",
             "session_id": "session-1",
             "turn_id": "turn-1",
             "hook_event_name": "Stop",
-            "summary": "Stop received.",
+            "summary": "Stop exit check requested.",
         },
         {
             "timestamp": "2026-04-15T04:04:50+00:00",
             "thread_id": "thread-1",
-            "event_type": "hook_decision",
+            "event_type": "phase_exit_blocked",
             "source": "btwin.workflow.hook",
             "agent": "alice",
             "phase": "context",
             "session_id": "session-1",
             "turn_id": "turn-1",
             "hook_event_name": "Stop",
-            "decision": "block",
             "reason": "missing_contribution",
             "summary": "Current phase context still needs a contribution from alice before stopping.",
         },
@@ -362,14 +361,14 @@ def test_render_thread_watch_formats_codex_and_btwin_events_for_humans():
 
     rendered = main._render_thread_watch(thread, status_summary, events)
 
-    assert "[cyan]04:04:50  CODEX -> BTWIN  Stop check requested[/cyan]" in rendered
-    assert "[red]04:04:50  BTWIN -> CODEX  Stop blocked[/red]" in rendered
+    assert "[cyan]04:04:50  CODEX -> BTWIN  Exit check requested[/cyan]" in rendered
+    assert "[red]04:04:50  BTWIN -> CODEX  Exit blocked[/red]" in rendered
     assert "agent: alice" in rendered
     assert "phase: context" in rendered
     assert "reason: missing_contribution" in rendered
     assert "session: session-1" in rendered
     assert "turn: turn-1" in rendered
-    assert "summary: Stop received." in rendered
+    assert "summary: Stop exit check requested." in rendered
 
 
 def test_render_thread_watch_colors_allow_and_noop_headlines():
@@ -383,29 +382,27 @@ def test_render_thread_watch_colors_allow_and_noop_headlines():
         {
             "timestamp": "2026-04-15T04:04:46+00:00",
             "thread_id": "thread-1",
-            "event_type": "hook_decision",
-            "source": "btwin.workflow.hook",
+            "event_type": "phase_attempt_started",
+            "source": "codex.hook",
             "agent": "alice",
             "hook_event_name": "UserPromptSubmit",
-            "decision": "noop",
             "summary": "Current phase: context. Required result type: contribution.",
         },
         {
             "timestamp": "2026-04-15T04:07:27+00:00",
             "thread_id": "thread-1",
-            "event_type": "hook_decision",
-            "source": "btwin.workflow.hook",
+            "event_type": "required_result_recorded",
+            "source": "btwin.contribution.submit",
             "agent": "alice",
-            "hook_event_name": "Stop",
-            "decision": "allow",
+            "phase": "context",
             "summary": "Stop allowed.",
         },
     ]
 
     rendered = main._render_thread_watch(thread, status_summary, events)
 
-    assert "[yellow]04:04:46  BTWIN -> CODEX  UserPromptSubmit no-op[/yellow]" in rendered
-    assert "[green]04:07:27  BTWIN -> CODEX  Stop allowed[/green]" in rendered
+    assert "[cyan]04:04:46  CODEX -> BTWIN  Phase attempt started[/cyan]" in rendered
+    assert "[green]04:07:27  BTWIN -> CODEX  Required result recorded[/green]" in rendered
 
 
 def test_render_thread_watch_adds_app_server_hint_to_agents_summary(monkeypatch, tmp_path):

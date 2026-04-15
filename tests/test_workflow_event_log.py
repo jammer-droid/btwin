@@ -29,9 +29,8 @@ def test_append_and_list_thread_workflow_events(tmp_path):
             "thread_id": "thread-20260415-demo",
             "agent": "alice",
             "phase": "context",
-            "event_type": "hook_decision",
-            "hook_event_name": "Stop",
-            "decision": "block",
+            "event_type": "phase_exit_blocked",
+            "source": "btwin.workflow.hook",
             "reason": "missing_contribution",
             "summary": "Stop blocked until alice contributes.",
         }
@@ -40,6 +39,5 @@ def test_append_and_list_thread_workflow_events(tmp_path):
     events = log.list_events()
 
     assert len(events) == 1
-    assert events[0]["event_type"] == "hook_decision"
-    assert events[0]["decision"] == "block"
+    assert events[0]["event_type"] == "phase_exit_blocked"
     assert events[0]["summary"] == "Stop blocked until alice contributes."

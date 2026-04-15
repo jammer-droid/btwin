@@ -288,6 +288,16 @@ def _workflow_event_heading(event: dict[str, object]) -> tuple[str, str, str | N
         if decision == "noop":
             return lane, f"{hook_name or 'Hook'} no-op", "yellow"
         return lane, f"{hook_name or 'Hook'} decision", "yellow"
+    if event_type == "phase_attempt_started":
+        return lane, "Phase attempt started", "cyan"
+    if event_type == "phase_exit_check_requested":
+        return lane, "Exit check requested", "cyan"
+    if event_type == "required_result_recorded":
+        return lane, "Required result recorded", "green"
+    if event_type == "phase_exit_blocked":
+        return lane, "Exit blocked", "red"
+    if event_type == "runtime_binding_closed":
+        return lane, "Runtime binding closed", "yellow"
     return lane, event_type.replace("_", " "), style
 
 
@@ -1097,6 +1107,31 @@ def _cleanup_stale_runtime_binding() -> RuntimeBinding | None:
     except Exception:
         logger.warning("Failed to cleanup stale runtime binding", exc_info=True)
         return None
+
+
+def _record_runtime_binding_closed(binding: RuntimeBinding, thread: dict[str, object] | None = None) -> None:
+    phase = None
+    if isinstance(thread, dict):
+        phase_value = thread.get("current_phase")
+        if isinstance(phase_value, str):
+            phase = phase_value
+    reason = binding.closed_reason or "closed"
+    try:
+        _append_workflow_event(
+            binding.thread_id,
+            event_type="runtime_binding_closed",
+            source="btwin.runtime.binding.cleanup",
+            agent=binding.agent_name,
+            phase=phase,
+            reason=reason,
+            summary=f"Runtime binding closed: {reason.replace('_', ' ')}.",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to record runtime binding closed event for thread %s",
+            binding.thread_id,
+            exc_info=True,
+        )
 
 
 def _resolve_runtime_thread(thread_id: str, config: BTwinConfig | None = None) -> dict | None:
@@ -3208,7 +3243,7 @@ def contribution_submit(
         raise typer.Exit(4)
     _append_workflow_event(
         thread_id,
-        event_type="contribution_recorded",
+        event_type="required_result_recorded",
         source="btwin.contribution.submit",
         agent=agent_name,
         phase=phase,
@@ -3255,19 +3290,6 @@ def workflow_hook(
 
     _observe_runtime_binding_on_hook_event(resolved_thread_id, agent_name, event)
 
-    if codex_payload is not None:
-        _append_workflow_event(
-            resolved_thread_id,
-            event_type="hook_received",
-            source="codex.hook",
-            agent=agent_name,
-            phase=None,
-            session_id=codex_payload.session_id,
-            turn_id=codex_payload.turn_id,
-            hook_event_name=event,
-            summary=f"{event} received.",
-        )
-
     thread, protocol, _phase, _phase_participants, contributions = _load_protocol_flow_context(
         resolved_thread_id,
         current_config,
@@ -3280,24 +3302,39 @@ def workflow_hook(
         contributions=contributions,
     )
     if codex_payload is not None:
-        summary = f"{event} allowed."
-        if result.decision == "block":
-            summary = result.overlay or "Hook blocked by workflow constraints."
-        elif result.decision == "noop":
-            summary = result.overlay or f"{event} evaluated."
-        _append_workflow_event(
-            resolved_thread_id,
-            event_type="hook_decision",
-            source="btwin.workflow.hook",
-            agent=agent_name,
-            phase=thread.get("current_phase"),
-            session_id=codex_payload.session_id,
-            turn_id=codex_payload.turn_id,
-            hook_event_name=event,
-            decision=result.decision,
-            reason=result.reason,
-            summary=summary,
-        )
+        canonical_extra: dict[str, object] = {
+            "agent": agent_name,
+            "phase": thread.get("current_phase"),
+            "session_id": codex_payload.session_id,
+            "turn_id": codex_payload.turn_id,
+            "hook_event_name": event,
+        }
+        if event == "UserPromptSubmit":
+            _append_workflow_event(
+                resolved_thread_id,
+                event_type="phase_attempt_started",
+                source="codex.hook",
+                summary=result.overlay or "Phase attempt started.",
+                **canonical_extra,
+            )
+        elif event == "Stop":
+            _append_workflow_event(
+                resolved_thread_id,
+                event_type="phase_exit_check_requested",
+                source="codex.hook",
+                summary="Stop exit check requested.",
+                **canonical_extra,
+            )
+            if result.decision == "block":
+                _append_workflow_event(
+                    resolved_thread_id,
+                    event_type="phase_exit_blocked",
+                    source="btwin.workflow.hook",
+                    decision=result.decision,
+                    reason=result.reason,
+                    summary=result.overlay or result.reason or "Stop blocked by workflow constraints.",
+                    **canonical_extra,
+                )
     if codex_payload is not None and not as_json:
         raw_response = build_codex_hook_response(codex_payload, result)
         if raw_response is not None:
@@ -4003,7 +4040,13 @@ def runtime_current(
 ):
     """Show the current project runtime binding."""
     config = _get_config()
-    _cleanup_stale_runtime_binding()
+    closed_binding = _cleanup_stale_runtime_binding()
+    if closed_binding is not None:
+        thread, lookup_error = _resolve_runtime_thread_safely(closed_binding.thread_id, config)
+        if lookup_error is None:
+            _record_runtime_binding_closed(closed_binding, thread=thread)
+        else:
+            _record_runtime_binding_closed(closed_binding)
     state = _get_runtime_binding_store().read_state()
     payload = _runtime_binding_payload(state, config=config, include_thread_lookup_error=True)
     _emit_payload(payload, as_json=as_json)

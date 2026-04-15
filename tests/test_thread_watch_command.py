@@ -55,11 +55,10 @@ def _seed_thread(tmp_path: Path):
             "thread_id": thread["thread_id"],
             "agent": "alice",
             "phase": "context",
-            "event_type": "hook_decision",
+            "event_type": "phase_exit_check_requested",
+            "source": "codex.hook",
             "hook_event_name": "Stop",
-            "decision": "block",
-            "reason": "missing_contribution",
-            "summary": "Stop blocked until alice contributes.",
+            "summary": "Stop exit check requested.",
         }
     )
     log.append(
@@ -68,8 +67,20 @@ def _seed_thread(tmp_path: Path):
             "thread_id": thread["thread_id"],
             "agent": "alice",
             "phase": "context",
-            "event_type": "contribution_recorded",
+            "event_type": "required_result_recorded",
+            "source": "btwin.contribution.submit",
             "summary": "shared context",
+        }
+    )
+    log.append(
+        {
+            "timestamp": "2026-04-15T01:09:45+00:00",
+            "thread_id": thread["thread_id"],
+            "agent": "alice",
+            "event_type": "runtime_binding_closed",
+            "source": "btwin.runtime.binding.cleanup",
+            "reason": "stale_last_seen",
+            "summary": "Runtime binding closed: stale last seen.",
         }
     )
     return project_root, data_dir, thread_store, thread
@@ -88,5 +99,7 @@ def test_thread_watch_renders_status_header_and_recent_events(tmp_path, monkeypa
     assert thread["thread_id"] in result.output
     assert "phase=context" in result.output
     assert "alice=contributed" in result.output
-    assert "Stop blocked until alice contributes." in result.output
+    assert "Stop exit check requested." in result.output
+    assert "Required result recorded" in result.output
+    assert "Runtime binding closed" in result.output
     assert "shared context" in result.output

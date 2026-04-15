@@ -9,6 +9,7 @@ from btwin_core.agent_store import AgentStore
 from btwin_core.config import BTwinConfig, RuntimeConfig
 from btwin_core.runtime_binding_store import RuntimeBindingStore
 from btwin_core.thread_store import ThreadStore
+from btwin_core.workflow_event_log import WorkflowEventLog
 import btwin_core.runtime_binding_store as runtime_binding_store
 
 
@@ -380,6 +381,55 @@ def test_runtime_current_cleans_up_stale_active_binding(tmp_path, monkeypatch):
     binding_payload = json.loads((project_root / ".btwin" / "runtime" / "binding.json").read_text(encoding="utf-8"))
     assert binding_payload["status"] == "closed"
     assert binding_payload["closed_reason"] == "stale_last_seen"
+
+    events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert len(events) == 1
+    assert events[0]["event_type"] == "runtime_binding_closed"
+    assert events[0]["agent"] == "alice"
+    assert events[0]["phase"] == thread["current_phase"]
+    assert events[0]["reason"] == "stale_last_seen"
+
+
+def test_runtime_current_keeps_closed_binding_even_if_audit_write_fails(tmp_path, monkeypatch):
+    project_root, agent_store, thread_store, thread = _seed_runtime_context(tmp_path)
+    data_dir = tmp_path / ".btwin"
+
+    binding_store = RuntimeBindingStore(project_root / ".btwin")
+    binding_store.write(
+        runtime_binding_store.RuntimeBinding(
+            thread_id=thread["thread_id"],
+            agent_name="alice",
+            bound_at="2026-04-13T00:00:00+00:00",
+            status="active",
+            opened_at="2026-04-13T00:00:00+00:00",
+            last_seen_at="2026-04-13T00:00:00+00:00",
+            closed_at=None,
+            closed_reason=None,
+        )
+    )
+
+    monkeypatch.setattr(runtime_binding_store, "_now_iso", lambda: "2026-04-15T00:30:00+00:00")
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+    monkeypatch.setattr(main, "_get_agent_store", lambda: agent_store)
+    monkeypatch.setattr(main, "_get_thread_store", lambda: thread_store)
+    monkeypatch.setattr(main, "_append_workflow_event", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("audit write failed")))
+
+    current_result = runner.invoke(app, ["runtime", "current", "--json"])
+    assert current_result.exit_code == 0, current_result.output
+    current_payload = _parse_json_output(current_result.output)
+    assert current_payload["bound"] is False
+    assert current_payload["binding"]["thread_id"] == thread["thread_id"]
+    assert current_payload["binding"]["status"] == "closed"
+    assert current_payload["binding"]["closed_reason"] == "stale_last_seen"
+
+    binding_payload = json.loads((project_root / ".btwin" / "runtime" / "binding.json").read_text(encoding="utf-8"))
+    assert binding_payload["status"] == "closed"
+    assert binding_payload["closed_reason"] == "stale_last_seen"
+
+    events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert events == []
+
 
 
 def test_runtime_current_reports_closed_binding_as_unbound(tmp_path, monkeypatch):
