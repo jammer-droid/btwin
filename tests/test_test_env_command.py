@@ -93,6 +93,49 @@ def test_test_env_up_prepares_workspace_and_status(tmp_path, monkeypatch):
     assert "API health: ok" in status_result.output
 
 
+def test_test_env_start_records_process_identity(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(main, "_test_env_project_name", lambda: "repo-test-env")
+    monkeypatch.setattr(main, "_test_env_api_is_healthy", lambda api_url: True, raising=False)
+    main._test_env_root().mkdir(parents=True, exist_ok=True)
+    main._test_env_data_dir().mkdir(parents=True, exist_ok=True)
+    main._test_env_log_dir().mkdir(parents=True, exist_ok=True)
+    main._test_env_project_root().mkdir(parents=True, exist_ok=True)
+
+    class FakeProcess:
+        pid = 4242
+
+        def terminate(self):
+            raise AssertionError("terminate should not be called")
+
+    def fake_popen(*args, **kwargs):
+        return FakeProcess()
+
+    def fake_ps_run(args, capture_output, text, check):
+        if args == ["ps", "-p", "4242", "-o", "lstart="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="Mon Apr 15 12:34:56 2026\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected ps call: {args}")
+
+    monkeypatch.setattr(main.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
+
+    pid = main._start_test_env_process(Path("/opt/btwin/bin/btwin"), 8792, "http://127.0.0.1:8792")
+
+    assert pid == 4242
+    identity_path = main._test_env_identity_path()
+    assert identity_path.exists()
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    assert identity == {"pid": 4242, "start_time": "Mon Apr 15 12:34:56 2026"}
+
+
 def test_test_env_hud_scopes_global_hud_to_test_env(tmp_path, monkeypatch):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -163,22 +206,35 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
     root.mkdir(parents=True, exist_ok=True)
     pid_path = main._test_env_pid_path()
     owner_path = main._test_env_owner_path()
+    identity_path = main._test_env_identity_path()
     pid_path.write_text("4242\n", encoding="utf-8")
     owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+    identity_path.write_text(
+        json.dumps({"pid": 4242, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     killed: list[tuple[int, object]] = []
 
     def fake_ps_run(args, capture_output, text, check):
-        assert args == ["ps", "-p", "4242", "-o", "command="]
-        assert capture_output is True
-        assert text is True
-        assert check is False
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
-            stderr="",
-        )
+        if args == ["ps", "-p", "4242", "-o", "lstart="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="Mon Apr 15 12:34:56 2026\n",
+                stderr="",
+            )
+        if args == ["ps", "-p", "4242", "-o", "command="]:
+            assert capture_output is True
+            assert text is True
+            assert check is False
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected ps call: {args}")
 
     monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
     monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -190,6 +246,7 @@ def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
     assert killed == [(4242, main.signal.SIGTERM)]
     assert not pid_path.exists()
     assert not owner_path.exists()
+    assert not identity_path.exists()
 
 
 @pytest.mark.parametrize("pid_text", ["0\n", "-1\n"])
@@ -203,8 +260,13 @@ def test_test_env_down_rejects_non_positive_pid(tmp_path, monkeypatch, pid_text)
     root.mkdir(parents=True, exist_ok=True)
     pid_path = main._test_env_pid_path()
     owner_path = main._test_env_owner_path()
+    identity_path = main._test_env_identity_path()
     pid_path.write_text(pid_text, encoding="utf-8")
     owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+    identity_path.write_text(
+        json.dumps({"pid": 1, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     killed: list[tuple[int, object]] = []
 
@@ -220,6 +282,7 @@ def test_test_env_down_rejects_non_positive_pid(tmp_path, monkeypatch, pid_text)
     assert killed == []
     assert not pid_path.exists()
     assert not owner_path.exists()
+    assert not identity_path.exists()
 
 
 def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
@@ -232,8 +295,13 @@ def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
     root.mkdir(parents=True, exist_ok=True)
     pid_path = main._test_env_pid_path()
     owner_path = main._test_env_owner_path()
+    identity_path = main._test_env_identity_path()
     pid_path.write_text("7777\n", encoding="utf-8")
     owner_path.write_text("someone-else\n", encoding="utf-8")
+    identity_path.write_text(
+        json.dumps({"pid": 7777, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     killed: list[tuple[int, object]] = []
 
@@ -246,6 +314,7 @@ def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
     assert killed == []
     assert not pid_path.exists()
     assert not owner_path.exists()
+    assert not identity_path.exists()
 
 
 def test_test_env_down_requires_matching_command_line(tmp_path, monkeypatch):
@@ -259,19 +328,32 @@ def test_test_env_down_requires_matching_command_line(tmp_path, monkeypatch):
     root.mkdir(parents=True, exist_ok=True)
     pid_path = main._test_env_pid_path()
     owner_path = main._test_env_owner_path()
+    identity_path = main._test_env_identity_path()
     pid_path.write_text("4242\n", encoding="utf-8")
     owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+    identity_path.write_text(
+        json.dumps({"pid": 4242, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     killed: list[tuple[int, object]] = []
 
     def fake_ps_run(args, capture_output, text, check):
-        assert args == ["ps", "-p", "4242", "-o", "command="]
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="/usr/bin/python -m btwin_cli.main hud\n",
-            stderr="",
-        )
+        if args == ["ps", "-p", "4242", "-o", "lstart="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="Mon Apr 15 12:34:56 2026\n",
+                stderr="",
+            )
+        if args == ["ps", "-p", "4242", "-o", "command="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="/usr/bin/python -m btwin_cli.main hud\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected ps call: {args}")
 
     monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
     monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -283,3 +365,55 @@ def test_test_env_down_requires_matching_command_line(tmp_path, monkeypatch):
     assert killed == []
     assert not pid_path.exists()
     assert not owner_path.exists()
+    assert not identity_path.exists()
+
+
+def test_test_env_down_refuses_recycled_pid_with_new_start_time(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(main, "_preferred_test_env_btwin", lambda: Path("/opt/btwin/bin/btwin"))
+
+    root = main._test_env_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pid_path = main._test_env_pid_path()
+    owner_path = main._test_env_owner_path()
+    identity_path = main._test_env_identity_path()
+    pid_path.write_text("4242\n", encoding="utf-8")
+    owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+    identity_path.write_text(
+        json.dumps({"pid": 4242, "start_time": "Mon Apr 15 12:34:56 2026"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    killed: list[tuple[int, object]] = []
+
+    def fake_ps_run(args, capture_output, text, check):
+        if args == ["ps", "-p", "4242", "-o", "lstart="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="Mon Apr 15 12:35:02 2026\n",
+                stderr="",
+            )
+        if args == ["ps", "-p", "4242", "-o", "command="]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="/opt/btwin/bin/btwin serve-api --port 8792\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected ps call: {args}")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_ps_run)
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
+
+    result = runner.invoke(app, ["test-env", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert killed == []
+    assert not pid_path.exists()
+    assert not owner_path.exists()
+    assert not identity_path.exists()

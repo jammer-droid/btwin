@@ -2172,6 +2172,10 @@ def _test_env_owner_path() -> Path:
     return _test_env_root() / "serve-api.pid.owner"
 
 
+def _test_env_identity_path() -> Path:
+    return _test_env_root() / "serve-api.pid.identity"
+
+
 def _test_env_log_dir() -> Path:
     return _test_env_root() / "logs"
 
@@ -2233,6 +2237,22 @@ def _test_env_pid_is_running(pid: int | None) -> bool:
     return True
 
 
+def _test_env_process_start_time(pid: int) -> str | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    start_time = result.stdout.strip()
+    return start_time or None
+
+
 def _test_env_server_command_matches(pid: int, port: int = 8792) -> bool:
     btwin_bin = _preferred_test_env_btwin()
     try:
@@ -2251,18 +2271,50 @@ def _test_env_server_command_matches(pid: int, port: int = 8792) -> bool:
     return expected_command in command_line
 
 
+def _test_env_record_process_identity(pid: int) -> bool:
+    start_time = _test_env_process_start_time(pid)
+    if start_time is None:
+        return False
+    _atomic_write_json(_test_env_identity_path(), {"pid": pid, "start_time": start_time})
+    return True
+
+
+def _test_env_read_process_identity() -> dict[str, object] | None:
+    identity_path = _test_env_identity_path()
+    if not identity_path.exists():
+        return None
+    try:
+        payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def _cleanup_test_env_pid_files() -> None:
-    for path in (_test_env_pid_path(), _test_env_owner_path()):
+    for path in (_test_env_pid_path(), _test_env_owner_path(), _test_env_identity_path()):
         if path.exists():
             path.unlink()
 
 
 def _stop_owned_test_env_process() -> None:
     pid = _test_env_pid()
-    if not (_test_env_owner_matches() and _test_env_pid_is_running(pid)):
+    identity = _test_env_read_process_identity()
+    if not (_test_env_owner_matches() and _test_env_pid_is_running(pid) and identity is not None):
         _cleanup_test_env_pid_files()
         return
     assert pid is not None
+    if identity.get("pid") != pid:
+        _cleanup_test_env_pid_files()
+        return
+    recorded_start_time = identity.get("start_time")
+    if not isinstance(recorded_start_time, str):
+        _cleanup_test_env_pid_files()
+        return
+    if _test_env_process_start_time(pid) != recorded_start_time:
+        _cleanup_test_env_pid_files()
+        return
     if not _test_env_server_command_matches(pid):
         _cleanup_test_env_pid_files()
         return
@@ -2337,6 +2389,14 @@ def _start_test_env_process(btwin_bin: Path, port: int, api_url: str) -> int:
         stderr_log.close()
     _test_env_pid_path().write_text(f"{process.pid}\n", encoding="utf-8")
     _test_env_owner_path().write_text(f"{_test_env_owner_id()}\n", encoding="utf-8")
+    if not _test_env_record_process_identity(process.pid):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        _cleanup_test_env_pid_files()
+        console.print("[red]Failed to record test env process identity.[/red]")
+        raise typer.Exit(1)
     return process.pid
 
 
@@ -2420,6 +2480,13 @@ def _atomic_write_yaml(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+    tmp_path.replace(path)
+
+
+def _atomic_write_json(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp_path.replace(path)
 
 
