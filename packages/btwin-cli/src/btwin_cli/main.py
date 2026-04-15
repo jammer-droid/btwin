@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -2364,6 +2365,25 @@ def _print_test_env_status(port: int = 8792) -> None:
     console.print(f"API health: {'ok' if _test_env_api_is_healthy(_test_env_api_url(port)) else 'unavailable'}")
 
 
+@contextmanager
+def _test_env_cli_scope():
+    previous_cwd = Path.cwd()
+    previous_env = {key: os.environ.get(key) for key in ("BTWIN_CONFIG_PATH", "BTWIN_DATA_DIR", "BTWIN_API_URL")}
+    os.environ["BTWIN_CONFIG_PATH"] = str(_test_env_config_path())
+    os.environ["BTWIN_DATA_DIR"] = str(_test_env_data_dir())
+    os.environ["BTWIN_API_URL"] = _test_env_api_url()
+    os.chdir(_test_env_project_root())
+    try:
+        yield
+    finally:
+        os.chdir(previous_cwd)
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _is_valid_cron_schedule(value: str) -> bool:
     parts = value.strip().split()
     if len(parts) != 5:
@@ -3789,6 +3809,34 @@ def test_env_up():
 def test_env_status():
     """Show status for the isolated btwin test environment."""
     _print_test_env_status()
+
+
+@test_env_app.command("hud")
+def test_env_hud(
+    thread_id: str | None = typer.Option(None, "--thread", help="Optional thread id to focus"),
+    threads: bool = typer.Option(False, "--threads", help="Choose an active thread from a simple HUD menu"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Number of recent workflow events to show"),
+    follow: bool = typer.Option(False, "--follow", help="Poll and redraw the HUD"),
+    stream: bool = typer.Option(False, "--stream", help="Show append-only workflow events in real time"),
+    interval: float = typer.Option(1.0, "--interval", min=0.2, help="Poll interval in seconds"),
+):
+    """Show the HUD against the isolated btwin test environment."""
+    _ensure_test_env_up()
+    with _test_env_cli_scope():
+        hud(
+            thread_id=thread_id,
+            threads=threads,
+            limit=limit,
+            follow=follow,
+            stream=stream,
+            interval=interval,
+        )
+
+
+@test_env_app.command("down")
+def test_env_down():
+    """Stop the owned isolated btwin test environment API if it is running."""
+    _stop_owned_test_env_process()
 
 
 @app.command()

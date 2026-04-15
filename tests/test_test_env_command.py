@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 
 import yaml
 from typer.testing import CliRunner
@@ -87,3 +89,114 @@ def test_test_env_up_prepares_workspace_and_status(tmp_path, monkeypatch):
     assert f"Project root: {project_root}" in status_result.output
     assert "API: http://127.0.0.1:8792" in status_result.output
     assert "API health: ok" in status_result.output
+
+
+def test_test_env_hud_scopes_global_hud_to_test_env(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(main, "_test_env_project_name", lambda: "repo-test-env")
+
+    def fake_ensure_test_env_up(port: int = 8792):
+        root = main._test_env_root()
+        root.mkdir(parents=True, exist_ok=True)
+        main._test_env_data_dir().mkdir(parents=True, exist_ok=True)
+        main._test_env_project_root().mkdir(parents=True, exist_ok=True)
+        main._test_env_config_path().write_text(
+            yaml.safe_dump({"data_dir": str(main._test_env_data_dir())}, sort_keys=False),
+            encoding="utf-8",
+        )
+        return 4242, True
+
+    monkeypatch.setattr(main, "_ensure_test_env_up", fake_ensure_test_env_up)
+
+    captured: dict[str, object] = {}
+
+    def fake_hud(
+        *,
+        thread_id: str | None = None,
+        threads: bool = False,
+        limit: int = 10,
+        follow: bool = False,
+        stream: bool = False,
+        interval: float = 1.0,
+    ) -> None:
+        captured["cwd"] = Path.cwd()
+        captured["config_path"] = main._config_path()
+        captured["data_dir"] = main._btwin_data_dir()
+        captured["api_url"] = os.environ.get("BTWIN_API_URL")
+        captured["thread_id"] = thread_id
+        captured["threads"] = threads
+        captured["limit"] = limit
+        captured["follow"] = follow
+        captured["stream"] = stream
+        captured["interval"] = interval
+
+    monkeypatch.setattr(main, "hud", fake_hud)
+
+    result = runner.invoke(app, ["test-env", "hud", "--thread", "thread-1", "--limit", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["cwd"] == main._test_env_project_root()
+    assert captured["config_path"] == main._test_env_config_path()
+    assert captured["data_dir"] == main._test_env_data_dir()
+    assert captured["api_url"] == main._test_env_api_url()
+    assert captured["thread_id"] == "thread-1"
+    assert captured["threads"] is False
+    assert captured["limit"] == 3
+    assert captured["follow"] is False
+    assert captured["stream"] is False
+    assert captured["interval"] == 1.0
+
+
+def test_test_env_down_stops_only_owned_process(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+
+    root = main._test_env_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pid_path = main._test_env_pid_path()
+    owner_path = main._test_env_owner_path()
+    pid_path.write_text("4242\n", encoding="utf-8")
+    owner_path.write_text(f"{main._test_env_owner_id()}\n", encoding="utf-8")
+
+    killed: list[tuple[int, object]] = []
+
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
+
+    result = runner.invoke(app, ["test-env", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert killed == [(4242, main.signal.SIGTERM)]
+    assert not pid_path.exists()
+    assert not owner_path.exists()
+
+
+def test_test_env_down_skips_unowned_process(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(main, "_REPO_ROOT", repo_root)
+
+    root = main._test_env_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pid_path = main._test_env_pid_path()
+    owner_path = main._test_env_owner_path()
+    pid_path.write_text("7777\n", encoding="utf-8")
+    owner_path.write_text("someone-else\n", encoding="utf-8")
+
+    killed: list[tuple[int, object]] = []
+
+    monkeypatch.setattr(main.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(main, "_test_env_pid_is_running", lambda pid: True)
+
+    result = runner.invoke(app, ["test-env", "down"])
+
+    assert result.exit_code == 0, result.output
+    assert killed == []
+    assert not pid_path.exists()
+    assert not owner_path.exists()
