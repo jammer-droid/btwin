@@ -430,7 +430,7 @@ def _render_thread_runtime_diagnostics(thread_id: str, config: BTwinConfig) -> l
 
 def _resolve_bound_thread_id() -> str | None:
     state = _get_runtime_binding_store().read_state()
-    if state.binding is None:
+    if not state.bound:
         return None
     return state.binding.thread_id
 
@@ -443,12 +443,12 @@ def _render_hud(thread_id: str | None, limit: int) -> str:
 
     binding_label = "none"
     if binding is not None:
-        binding_label = binding.agent_name
+        binding_label = binding.agent_name if binding.status == "active" else f"{binding.agent_name} ({binding.status})"
     lines.append(f"Runtime  mode={config.runtime.mode}  binding={binding_label}")
     if binding_state.binding_error:
         lines.append(f"Binding  error={binding_state.binding_error}")
 
-    target_thread_id = thread_id or (binding.thread_id if binding is not None else None)
+    target_thread_id = thread_id or (binding.thread_id if binding is not None and binding.status == "active" else None)
     if target_thread_id is None:
         return "\n".join(lines)
 
@@ -1062,22 +1062,40 @@ def _get_runtime_binding_store() -> RuntimeBindingStore:
     return RuntimeBindingStore(_project_root() / ".btwin")
 
 
-def _refresh_runtime_binding_on_session_start(thread_id: str, agent_name: str | None) -> RuntimeBinding | None:
+def _observe_runtime_binding_on_hook_event(
+    thread_id: str,
+    agent_name: str | None,
+    event_name: str,
+) -> RuntimeBinding | None:
     store = _get_runtime_binding_store()
     state = store.read_state()
     binding = state.binding
-    if binding is None or binding.thread_id != thread_id:
+    if binding is None or binding.thread_id != thread_id or binding.status != "active":
         return None
     if agent_name is not None and binding.agent_name != agent_name:
         return None
     try:
-        return store.observe_session_start(binding)
+        return store.observe_workflow_hook_event(binding, event_name)
     except Exception:
         logger.warning(
-            "Failed to refresh runtime binding on SessionStart for thread %s",
+            "Failed to refresh runtime binding on %s for thread %s",
+            event_name,
             thread_id,
             exc_info=True,
         )
+        return None
+
+
+def _refresh_runtime_binding_on_session_start(thread_id: str, agent_name: str | None) -> RuntimeBinding | None:
+    return _observe_runtime_binding_on_hook_event(thread_id, agent_name, "SessionStart")
+
+
+def _cleanup_stale_runtime_binding() -> RuntimeBinding | None:
+    store = _get_runtime_binding_store()
+    try:
+        return store.cleanup_stale_active_binding()
+    except Exception:
+        logger.warning("Failed to cleanup stale runtime binding", exc_info=True)
         return None
 
 
@@ -1121,8 +1139,15 @@ def _resolve_runtime_thread_id(thread_id: str | None, config: BTwinConfig | None
         return thread_id, "explicit"
 
     state = _get_runtime_binding_store().read_state()
-    if state.binding is None:
-        if state.binding_error:
+    binding = state.binding
+    if not state.bound:
+        if binding is not None and binding.status == "closed":
+            console.print(
+                "[red]No usable runtime binding found.[/red]\n"
+                f"- Current binding for thread {binding.thread_id} is closed.\n"
+                "- Pass [bold]--thread[/bold] explicitly or create a new runtime binding with [bold]btwin runtime bind[/bold]."
+            )
+        elif state.binding_error:
             console.print(
                 "[red]No usable runtime binding found.[/red]\n"
                 f"- Error: {state.binding_error}\n"
@@ -1135,7 +1160,7 @@ def _resolve_runtime_thread_id(thread_id: str | None, config: BTwinConfig | None
             )
         raise typer.Exit(4)
 
-    return state.binding.thread_id, "runtime_binding"
+    return binding.thread_id, "runtime_binding"
 
 
 def _runtime_binding_payload(
@@ -3212,7 +3237,7 @@ def workflow_hook(
         if event not in {"SessionStart", "UserPromptSubmit", "Stop"}:
             return
         binding_state = _get_runtime_binding_store().read_state()
-        if binding_state.binding is None:
+        if not binding_state.bound:
             return
         thread_id = binding_state.binding.thread_id
         if agent_name is None:
@@ -3225,11 +3250,10 @@ def workflow_hook(
     resolved_thread_id, _thread_source = _resolve_runtime_thread_id(thread_id, current_config)
     if agent_name is None:
         binding_state = _get_runtime_binding_store().read_state()
-        if binding_state.binding is not None and binding_state.binding.thread_id == resolved_thread_id:
+        if binding_state.bound and binding_state.binding.thread_id == resolved_thread_id:
             agent_name = binding_state.binding.agent_name
 
-    if event == "SessionStart":
-        _refresh_runtime_binding_on_session_start(resolved_thread_id, agent_name)
+    _observe_runtime_binding_on_hook_event(resolved_thread_id, agent_name, event)
 
     if codex_payload is not None:
         _append_workflow_event(
@@ -3979,6 +4003,7 @@ def runtime_current(
 ):
     """Show the current project runtime binding."""
     config = _get_config()
+    _cleanup_stale_runtime_binding()
     state = _get_runtime_binding_store().read_state()
     payload = _runtime_binding_payload(state, config=config, include_thread_lookup_error=True)
     _emit_payload(payload, as_json=as_json)

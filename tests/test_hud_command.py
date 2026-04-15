@@ -85,6 +85,24 @@ def test_hud_with_binding_shows_bound_thread_and_recent_events(tmp_path, monkeyp
     assert "Stop allowed." in result.output
 
 
+def test_hud_with_closed_binding_shows_closed_status_without_focusing_thread(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    binding_store = RuntimeBindingStore(project_root / ".btwin")
+    binding = binding_store.bind("thread-1", "alice")
+    binding_store.close_binding(binding, reason="stale_last_seen")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+
+    result = runner.invoke(app, ["hud"])
+
+    assert result.exit_code == 0, result.output
+    assert "binding=alice (closed)" in result.output
+    assert "thread-1" not in result.output
+
+
 def test_hud_attached_thread_view_shows_runtime_diagnostics(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
@@ -645,6 +663,7 @@ def test_hud_close_key_uses_attached_close_api(monkeypatch, tmp_path):
     calls: list[tuple[str, dict]] = []
 
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_list_hud_threads", lambda config: [{"thread_id": "thread-2"}])
 
     def fake_attached_call(path: str, data: dict) -> dict:
         calls.append((path, data))

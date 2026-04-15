@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class RuntimeBinding(BaseModel):
@@ -48,7 +55,7 @@ class RuntimeBindingState(BaseModel):
 
     @property
     def bound(self) -> bool:
-        return self.binding is not None
+        return self.binding is not None and self.binding.status == "active"
 
 
 class RuntimeBindingStore:
@@ -112,7 +119,11 @@ class RuntimeBindingStore:
         )
         return self.write(binding)
 
-    def observe_session_start(self, binding: RuntimeBinding) -> RuntimeBinding:
+    def observe_workflow_hook_event(self, binding: RuntimeBinding, event_name: str) -> RuntimeBinding:
+        if binding.status != "active":
+            return binding
+        if event_name not in {"SessionStart", "UserPromptSubmit", "Stop"}:
+            return binding
         observed_at = _now_iso()
         refreshed = binding.model_copy(
             update={
@@ -123,6 +134,44 @@ class RuntimeBindingStore:
             }
         )
         return self.write(refreshed)
+
+    def observe_session_start(self, binding: RuntimeBinding) -> RuntimeBinding:
+        return self.observe_workflow_hook_event(binding, "SessionStart")
+
+    def close_binding(self, binding: RuntimeBinding, *, reason: str, closed_at: str | None = None) -> RuntimeBinding:
+        if binding.status == "closed":
+            return binding
+        closed = binding.model_copy(
+            update={
+                "status": "closed",
+                "closed_at": closed_at or _now_iso(),
+                "closed_reason": reason,
+            }
+        )
+        return self.write(closed)
+
+    def cleanup_stale_active_binding(
+        self,
+        *,
+        max_age_seconds: int = 24 * 60 * 60,
+        closed_reason: str = "stale_last_seen",
+    ) -> RuntimeBinding | None:
+        state = self.read_state()
+        binding = state.binding
+        if binding is None or binding.status != "active":
+            return None
+
+        last_seen_at = binding.last_seen_at or binding.opened_at or binding.bound_at
+        try:
+            last_seen = _parse_iso_datetime(last_seen_at)
+        except ValueError:
+            return None
+
+        observed_at = _parse_iso_datetime(_now_iso())
+        if observed_at - last_seen < timedelta(seconds=max_age_seconds):
+            return None
+
+        return self.close_binding(binding, reason=closed_reason, closed_at=observed_at.isoformat())
 
     def clear(self) -> RuntimeBindingState:
         current = self.read_state()
