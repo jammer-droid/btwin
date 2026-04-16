@@ -17,6 +17,14 @@ from btwin_core.config import BTwinConfig, load_config
 from btwin_core.context_formatter import ContextFormatter
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.gateway_client import GatewayLaunchContext, build_gateway_client
+from btwin_core.helper_overlay import (
+    HelperOverlayBootstrapError,
+    HelperOverlayPaths,
+    derive_helper_overlay_paths,
+    discover_git_repo_root,
+    helper_overlay_agent_dirname,
+    materialize_helper_overlay,
+)
 from btwin_core.message_router import MessageRouter
 from btwin_core.protocol_store import ProtocolStore
 from btwin_core.providers import CLIProvider, get_provider, get_provider_runtime_profile
@@ -73,8 +81,6 @@ class LaunchResolution:
     auth: ResolvedLaunchAuth
     env: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
-
-
 @dataclass
 class TurnTypingState:
     started: bool = False
@@ -150,6 +156,40 @@ class AgentRunner:
     def _workspace_root(self, workspace_root: Path | None = None) -> Path:
         """Return the active workspace root for subprocess working directories."""
         return resolve_workspace_root(start=workspace_root)
+
+    def _discover_git_repo_root(self, workspace_root: Path) -> Path | None:
+        return discover_git_repo_root(workspace_root)
+
+    def _helper_overlay_agent_dirname(self, agent_name: str) -> str:
+        return helper_overlay_agent_dirname(agent_name)
+
+    def _derive_helper_overlay_paths(
+        self,
+        *,
+        agent_name: str,
+        workspace_root: Path | None,
+    ) -> HelperOverlayPaths:
+        requested_workspace = self._workspace_root(workspace_root).expanduser().resolve()
+        return derive_helper_overlay_paths(
+            agent_name=agent_name,
+            workspace_root=requested_workspace,
+        )
+
+    def _prepare_helper_workspace(
+        self,
+        *,
+        provider_name: str,
+        agent_name: str,
+        workspace_root: Path | None,
+    ) -> Path:
+        requested_workspace = self._workspace_root(workspace_root).expanduser().resolve()
+        if provider_name != "codex":
+            return requested_workspace
+        overlay_paths = self._derive_helper_overlay_paths(
+            agent_name=agent_name,
+            workspace_root=requested_workspace,
+        )
+        return materialize_helper_overlay(overlay_paths)
 
     def _resolve_runtime_config(self, config: BTwinConfig | None) -> BTwinConfig:
         if config is not None:
@@ -267,6 +307,21 @@ class AgentRunner:
     ) -> InvocationResult:
         """Execute CLI subprocess with streaming output parsing."""
         env = {**os.environ, **(launch_env or provider.env_overrides())}
+        try:
+            launch_cwd = self._prepare_helper_workspace(
+                provider_name=provider.name,
+                agent_name=agent_name,
+                workspace_root=workspace_root,
+            )
+        except HelperOverlayBootstrapError as exc:
+            self._emit_session_state(
+                thread_id,
+                agent_name,
+                "failed",
+                reason="helper_overlay_unavailable",
+                last_transport_error=str(exc),
+            )
+            return InvocationResult(ok=False, stderr_summary=str(exc))
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -274,7 +329,7 @@ class AgentRunner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._workspace_root(workspace_root)),
+                cwd=str(launch_cwd),
                 env=env,
                 limit=SUBPROCESS_STREAM_LIMIT,
             )
@@ -1056,6 +1111,7 @@ class AgentRunner:
     def list_runtime_sessions_by_agent(self) -> dict[str, list[dict[str, object]]]:
         result: dict[str, list[dict[str, object]]] = {}
         for session in self._sessions.values():
+            helper_launch_cwd = self._helper_launch_cwd_for_session(session)
             payload: dict[str, object] = {
                 "thread_id": session.thread_id,
                 "provider": session.provider,
@@ -1071,6 +1127,8 @@ class AgentRunner:
                 "recovery_attempts": session.recovery_attempts,
                 "recovery_pending": session.recovery_pending,
                 "recovery_target_transport_mode": session.recovery_target_transport_mode,
+                "workspace_root": str(session.workspace_root) if session.workspace_root is not None else None,
+                "helper_launch_cwd": helper_launch_cwd,
             }
             payload["fallback_transport_involved"] = (
                 isinstance(session.fallback_mode, str)
@@ -1242,6 +1300,8 @@ class AgentRunner:
         defer_typing_done: bool = False,
     ) -> InvocationResult:
         key = (thread_id, agent_name)
+        typing_started = False
+        typing_done_published = False
         try:
             adapter = await self._ensure_live_transport_connected(
                 session,
@@ -1267,8 +1327,6 @@ class AgentRunner:
             final_text = ""
             captured_session_id = session.provider_session_id
             seen_text_delta = False
-            typing_started = False
-            typing_done_published = False
             turn_complete_seen = False
             active_turn_id: str | None = None
             event_iterator = adapter.read_events().__aiter__()
@@ -1501,6 +1559,21 @@ class AgentRunner:
                 outputs=tuple(completed_outputs),
                 session_id_captured=captured_session_id,
             )
+        except HelperOverlayBootstrapError as exc:
+            session.last_transport_error = str(exc)
+            await self._close_live_transport_adapter_async(key)
+            self._emit_session_state(
+                thread_id,
+                agent_name,
+                "failed",
+                reason="helper_overlay_unavailable",
+                last_transport_error=session.last_transport_error,
+            )
+            return InvocationResult(
+                ok=False,
+                stderr_summary=str(exc),
+                session_id_captured=session.provider_session_id,
+            )
         except Exception as exc:  # noqa: BLE001
             session.last_transport_error = str(exc)
             await self._close_live_transport_adapter_async(key)
@@ -1646,6 +1719,22 @@ class AgentRunner:
                 previous_transport_mode=previous_transport_mode,
             )
             return True
+        except HelperOverlayBootstrapError as exc:
+            session.last_transport_error = str(exc)
+            await self._close_live_transport_adapter_async((thread_id, agent_name))
+            self._emit_session_state(
+                thread_id,
+                agent_name,
+                "failed",
+                reason="helper_overlay_unavailable",
+                last_transport_error=session.last_transport_error,
+            )
+            self._mark_recovery_failed(
+                session,
+                previous_transport_mode=previous_transport_mode,
+                next_transport_mode=session.transport_mode,
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
             session.last_transport_error = str(exc)
             await self._close_live_transport_adapter_async((thread_id, agent_name))
@@ -1746,7 +1835,11 @@ class AgentRunner:
             token_ref=token_ref if isinstance(token_ref, str) and token_ref else None,
             gateway_metadata=gateway_metadata,
             env=dict(launch.env),
-            cwd=str(self._workspace_root(session.workspace_root)) if session.workspace_root is not None else None,
+            cwd=str(self._prepare_helper_workspace(
+                provider_name=launch.provider.name,
+                agent_name=session.agent_name,
+                workspace_root=session.workspace_root,
+            )),
             config_overrides=self._build_codex_launch_config_overrides(
                 thread_id=session.thread_id,
                 agent_name=session.agent_name,
@@ -1815,8 +1908,11 @@ class AgentRunner:
             env=dict(gateway.env),
             metadata=metadata,
         )
-        launch_context = self._build_transport_launch_context(session, launch)
-        if not self._live_transport_requires_fresh_start(session, launch_context):
+        try:
+            launch_context = self._build_transport_launch_context(session, launch)
+        except HelperOverlayBootstrapError:
+            launch_context = None
+        if launch_context is None or not self._live_transport_requires_fresh_start(session, launch_context):
             self._populate_runtime_session_metadata(session, metadata)
         return launch
 
@@ -1994,6 +2090,7 @@ class AgentRunner:
         if session is None:
             return None
         self._refresh_session_recovery_state(session)
+        helper_launch_cwd = self._helper_launch_cwd_for_session(session)
         return {
             "thread_id": session.thread_id,
             "agent_name": session.agent_name,
@@ -2008,7 +2105,20 @@ class AgentRunner:
             "recovery_pending": session.recovery_pending,
             "recovery_target_transport_mode": session.recovery_target_transport_mode,
             "last_transport_error": session.last_transport_error,
+            "workspace_root": str(session.workspace_root) if session.workspace_root is not None else None,
+            "helper_launch_cwd": helper_launch_cwd,
         }
+
+    def _helper_launch_cwd_for_session(self, session: AgentSession) -> str | None:
+        if session.provider != "codex" or session.workspace_root is None:
+            return None
+        try:
+            return str(self._derive_helper_overlay_paths(
+                agent_name=session.agent_name,
+                workspace_root=session.workspace_root,
+            ).launch_cwd)
+        except RuntimeError:
+            return None
 
     async def recover_for_thread(
         self,

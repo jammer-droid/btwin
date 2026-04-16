@@ -134,6 +134,7 @@ For B-TWIN-managed helper sessions, the expected working model is:
 
 - the helper `cwd` stays inside the target git repository
 - Codex trusts that project, so project-scoped `.codex/` layers are active
+- B-TWIN lazily bootstraps a repo-local helper overlay under `.btwin/helpers/<agent>/workspace`
 - existing project `AGENTS.md` and `.codex/hooks.json` remain untouched
 - B-TWIN adds deeper helper-scoped layers on top instead of rewriting user files
 

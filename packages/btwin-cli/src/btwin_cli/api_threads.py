@@ -45,6 +45,8 @@ _RUNTIME_SESSION_FIELDS = (
     "recovery_attempts",
     "recovery_pending",
     "recovery_target_transport_mode",
+    "workspace_root",
+    "helper_launch_cwd",
 )
 
 
@@ -147,6 +149,8 @@ def _enrich_runtime_event(event: SSEEvent, agent_runner: Any | None) -> SSEEvent
         "degraded",
         "recoverable",
         "recovery_attempts",
+        "workspace_root",
+        "helper_launch_cwd",
     ):
         value = session.get(key)
         if value is not None:

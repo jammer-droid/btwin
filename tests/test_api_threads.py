@@ -15,9 +15,15 @@ class _FakeAgentRunner:
         self.recover_calls = []
         self.attach_or_resume_calls = []
         self.session_status = None
+        self.runtime_sessions_by_agent = None
 
     def list_active_threads_by_agent(self):
         return self._active_threads_by_agent
+
+    def list_runtime_sessions_by_agent(self):
+        if self.runtime_sessions_by_agent is None:
+            return {}
+        return self.runtime_sessions_by_agent
 
     def get_runtime_session_status(self, thread_id, agent_name):
         del thread_id, agent_name
@@ -106,6 +112,43 @@ def test_threads_router_exposes_agent_inbox_and_agent_status(tmp_path):
     assert status_response.status_code == 200
     assert status_response.json()["participant_status"] == "joined"
     assert status_response.json()["pending_message_count"] == 1
+
+
+def test_agent_runtime_status_includes_helper_overlay_fields(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    agent_runner = _FakeAgentRunner({})
+    agent_runner.runtime_sessions_by_agent = {
+        "alice": [
+            {
+                "thread_id": "thread-1",
+                "provider": "codex",
+                "transport_mode": "resume_invocation_transport",
+                "primary_transport_mode": "resume_invocation_transport",
+                "workspace_root": "/tmp/project",
+                "helper_launch_cwd": "/tmp/project/.btwin/helpers/alice/workspace",
+            }
+        ]
+    }
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(
+        thread_store,
+        protocol_store,
+        event_bus,
+        agent_runner=agent_runner,
+    ))
+    client = TestClient(app)
+
+    response = client.get("/api/agent-runtime-status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["agents"]["alice"][0]["workspace_root"] == "/tmp/project"
+    assert payload["agents"]["alice"][0]["helper_launch_cwd"] == "/tmp/project/.btwin/helpers/alice/workspace"
 
 
 def test_attached_api_allows_direct_message_to_thread_participant_when_target_is_inactive(tmp_path):

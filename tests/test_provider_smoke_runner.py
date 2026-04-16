@@ -18,7 +18,7 @@ pytestmark = pytest.mark.provider_smoke
 def _run_btwin_result(provider_smoke_env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [provider_smoke_env["BTWIN_TEST_BTWIN_BIN"], *args],
-        cwd=Path(provider_smoke_env["BTWIN_TEST_ROOT"]),
+        cwd=Path(provider_smoke_env["project_root"]),
         capture_output=True,
         text=True,
         env={

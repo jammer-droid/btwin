@@ -164,6 +164,15 @@ def _build_runner(tmp_path: Path) -> tuple[AgentRunner, EventBus]:
     return runner, event_bus
 
 
+def _write_codex_trust_config(home_dir: Path, project_path: Path, *, trust_level: str = "trusted") -> None:
+    codex_dir = home_dir / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(
+        f'[projects."{project_path}"]\ntrust_level = "{trust_level}"\n',
+        encoding="utf-8",
+    )
+
+
 def _install_runtime_event_enricher(
     tmp_path: Path,
     runner: AgentRunner,
@@ -352,6 +361,8 @@ async def test_recover_for_thread_starts_primary_transport_recovery(
         "recovery_pending": True,
         "recovery_target_transport_mode": "live_process_transport",
         "last_transport_error": "live transport timed out",
+        "workspace_root": None,
+        "helper_launch_cwd": None,
         "recovery_started": True,
     }
     assert ("thread-123", "agent-1") in runner._managed_sessions
@@ -360,6 +371,173 @@ async def test_recover_for_thread_starts_primary_transport_recovery(
     assert len(created_tasks) == 1
     await created_tasks[0]
     assert scheduled == [("thread-123", "agent-1")]
+
+
+def test_runtime_session_status_exposes_helper_overlay_launch_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _event_bus = _build_runner(tmp_path)
+    home_dir = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home_dir))
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    _write_codex_trust_config(home_dir, repo_root)
+    requested_workspace = repo_root / "src"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="live_process_transport",
+        workspace_root=requested_workspace,
+    )
+    runner._sessions[("thread-123", "agent-1")] = session
+
+    status = runner.get_runtime_session_status("thread-123", "agent-1")
+
+    assert status is not None
+    assert status["workspace_root"] == str(requested_workspace)
+    assert status["helper_launch_cwd"] == str(repo_root / ".btwin" / "helpers" / "agent-1" / "workspace")
+
+
+def test_list_runtime_sessions_by_agent_exposes_helper_overlay_launch_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _event_bus = _build_runner(tmp_path)
+    home_dir = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home_dir))
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    _write_codex_trust_config(home_dir, repo_root)
+    requested_workspace = repo_root / "src"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="live_process_transport",
+        workspace_root=requested_workspace,
+    )
+    runner._sessions[("thread-123", "agent-1")] = session
+
+    payload = runner.list_runtime_sessions_by_agent()
+
+    assert payload["agent-1"][0]["workspace_root"] == str(requested_workspace)
+    assert payload["agent-1"][0]["helper_launch_cwd"] == str(
+        repo_root / ".btwin" / "helpers" / "agent-1" / "workspace"
+    )
+
+
+def test_resolve_launch_resolution_does_not_raise_before_helper_overlay_failure_path(
+    tmp_path: Path,
+) -> None:
+    runner, _event_bus = _build_runner(tmp_path)
+    runner._agents.register("alice", model="gpt-5.4-mini", provider="codex", role="implementer")
+    requested_workspace = tmp_path / "plain-workspace"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="alice",
+        provider="codex",
+        transport_mode="resume_invocation_transport",
+        workspace_root=requested_workspace,
+    )
+
+    launch = runner._resolve_launch_resolution(session)
+
+    assert launch is not None
+    assert launch.provider.name == "codex"
+
+
+@pytest.mark.asyncio
+async def test_invoke_reports_helper_overlay_preflight_failure_before_subprocess_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, event_bus = _build_runner(tmp_path)
+    event_queue = event_bus.subscribe()
+    requested_workspace = tmp_path / "plain-workspace"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="resume_invocation_transport",
+        workspace_root=requested_workspace,
+    )
+    runner._sessions[("thread-123", "agent-1")] = session
+    monkeypatch.setattr(runner, "_get_or_create_session", lambda thread_id, agent_name: session)
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.AgentRunner._resolve_launch_resolution",
+        lambda self, runtime_session: LaunchResolution(
+            provider=_FakeStreamingProvider(),
+            auth=ResolvedLaunchAuth(provider_name="codex", mode="cli_environment"),
+            env={},
+            metadata={},
+        ),
+    )
+
+    called = False
+
+    async def fake_create_subprocess_exec(*args, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal called
+        called = True
+        raise AssertionError("subprocess should not start when helper overlay bootstrap fails")
+
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await runner.invoke("thread-123", "agent-1", "prompt text")
+
+    assert result.ok is False
+    assert "not inside a git repo" in result.stderr_summary
+    assert called is False
+    failed_events = [
+        event
+        for event in _drain_events(event_queue)
+        if event.type == "agent_session_state" and event.metadata.get("state") == "failed"
+    ]
+    assert failed_events
+    assert failed_events[-1].metadata["reason"] == "helper_overlay_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_live_transport_reports_helper_overlay_preflight_failure_without_unbound_cleanup_error(
+    tmp_path: Path,
+) -> None:
+    runner, _event_bus = _build_runner(tmp_path)
+    requested_workspace = tmp_path / "plain-workspace"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="live_process_transport",
+        workspace_root=requested_workspace,
+    )
+    launch = LaunchResolution(
+        provider=_FakeStreamingProvider(),
+        auth=ResolvedLaunchAuth(provider_name="codex", mode="cli_environment"),
+        env={},
+        metadata={},
+    )
+
+    result = await runner._run_live_transport(
+        session,
+        "prompt text",
+        launch,
+        thread_id="thread-123",
+        agent_name="agent-1",
+    )
+
+    assert result.ok is False
+    assert "not inside a git repo" in result.stderr_summary
 
 
 @pytest.mark.asyncio

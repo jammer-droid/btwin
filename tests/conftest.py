@@ -94,6 +94,14 @@ def provider_smoke_env(tmp_path: Path) -> dict[str, str]:
     root_dir = tmp_path / "provider-smoke-env"
     project_root = tmp_path / "project"
     project_root.mkdir(parents=True, exist_ok=True)
+    git_init = subprocess.run(
+        ["git", "init", "-q", str(project_root)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert git_init.returncode == 0, git_init.stderr or git_init.stdout
     port = str(_find_free_port())
     provider_auth_home = os.environ.get("BTWIN_PROVIDER_AUTH_HOME") or os.environ.get("HOME") or str(tmp_path)
 
@@ -138,6 +146,7 @@ def provider_smoke_env(tmp_path: Path) -> dict[str, str]:
     env_payload["provider_continuity"] = os.environ.get("BTWIN_PROVIDER_CONTINUITY", "long-term")
     env_payload["provider_model"] = os.environ.get("BTWIN_PROVIDER_MODEL", "gpt-5.4-mini")
     env_payload["provider_auth_home"] = provider_auth_home
+    env_payload["project_root"] = str(project_root)
     serve_stdout = root_dir / "logs" / "provider-smoke-serve-api.stdout.log"
     serve_stderr = root_dir / "logs" / "provider-smoke-serve-api.stderr.log"
     serve_stdout.parent.mkdir(parents=True, exist_ok=True)

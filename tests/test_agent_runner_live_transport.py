@@ -11,7 +11,7 @@ from btwin_core.auth_adapters import ResolvedLaunchAuth
 from btwin_core.config import BTwinConfig
 from btwin_core.event_bus import EventBus
 from btwin_core.protocol_store import ProtocolStore
-from btwin_core.providers import CodexProvider
+from btwin_core.providers import CLIProvider, CodexProvider
 from btwin_core.prototypes.persistent_sessions.types import (
     SessionCloseResult,
     SessionConfig,
@@ -22,6 +22,15 @@ from btwin_core.prototypes.persistent_sessions.types import (
 )
 from btwin_core.session_supervisor import RuntimeSession
 from btwin_core.thread_store import ThreadStore
+
+
+def _write_codex_trust_config(home_dir: Path, project_path: Path, *, trust_level: str = "trusted") -> None:
+    codex_dir = home_dir / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(
+        f'[projects."{project_path}"]\ntrust_level = "{trust_level}"\n',
+        encoding="utf-8",
+    )
 
 
 class _FakeLiveTransportAdapter:
@@ -72,6 +81,31 @@ class _FakeLiveTransport:
     def build_session_config(self, launch_context=None, *, resume_session_id=None) -> SessionConfig:
         del launch_context, resume_session_id
         return SessionConfig()
+
+
+class _FakeClaudeProvider(CLIProvider):
+    @property
+    def name(self) -> str:
+        return "claude-code"
+
+    def build_command(self, session_id: str | None, bypass_permissions: bool) -> list[str]:
+        del session_id, bypass_permissions
+        return ["fake-claude"]
+
+    def parse_stream_line(self, line: str):  # noqa: ANN201
+        del line
+        return None
+
+    def parse_final_response(self, output: str) -> str:
+        return output
+
+    def parse_session_id_from_output(self, output: str) -> str | None:
+        del output
+        return None
+
+    def env_overrides(self, launch_auth=None) -> dict[str, str]:
+        del launch_auth
+        return {}
 
 
 @pytest.mark.asyncio
@@ -336,6 +370,7 @@ async def test_live_transport_accepts_codex_final_message_that_arrives_after_tur
 
 def test_build_transport_launch_context_includes_managed_codex_developer_instructions(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = tmp_path / "data"
     threads_dir = data_dir / "threads"
@@ -354,12 +389,20 @@ def test_build_transport_launch_context_includes_managed_codex_developer_instruc
         participants=["alice", "user"],
         initial_phase="context",
     )
+    home_dir = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home_dir))
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    _write_codex_trust_config(home_dir, repo_root)
+    requested_workspace = repo_root / "workspace"
+    requested_workspace.mkdir()
     session = RuntimeSession(
         thread_id=thread["thread_id"],
         agent_name="alice",
         provider="codex",
         transport_mode="live_process_transport",
-        workspace_root=tmp_path,
+        workspace_root=requested_workspace,
     )
     launch = LaunchResolution(
         provider=CodexProvider(),
@@ -375,6 +418,90 @@ def test_build_transport_launch_context_includes_managed_codex_developer_instruc
     assert 'You are "alice".' in developer_instructions
     assert f"Thread ID: {thread['thread_id']}" in developer_instructions
     assert "Current ask:" not in developer_instructions
+
+
+def test_build_transport_launch_context_rewrites_cwd_to_repo_local_helper_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    threads_dir = data_dir / "threads"
+    threads_dir.mkdir(parents=True)
+
+    runner = AgentRunner(
+        ThreadStore(threads_dir),
+        ProtocolStore(data_dir / "protocols"),
+        AgentStore(data_dir),
+        EventBus(),
+        config=BTwinConfig(data_dir=data_dir),
+    )
+    thread = runner._threads.create_thread(
+        topic="Managed helper overlay",
+        protocol="debate",
+        participants=["alice", "user"],
+        initial_phase="context",
+    )
+    home_dir = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home_dir))
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    _write_codex_trust_config(home_dir, repo_root)
+    requested_workspace = repo_root / "src" / "feature"
+    requested_workspace.mkdir(parents=True)
+    session = RuntimeSession(
+        thread_id=thread["thread_id"],
+        agent_name="alice",
+        provider="codex",
+        transport_mode="live_process_transport",
+        workspace_root=requested_workspace,
+    )
+    launch = LaunchResolution(
+        provider=CodexProvider(),
+        auth=ResolvedLaunchAuth(provider_name="codex", mode="cli_environment"),
+        env={},
+        metadata={},
+    )
+
+    launch_context = runner._build_transport_launch_context(session, launch)
+
+    assert launch_context.cwd == str(repo_root / ".btwin" / "helpers" / "alice" / "workspace")
+    assert Path(launch_context.cwd).is_dir()
+    assert launch_context.cwd != str(requested_workspace)
+
+
+def test_build_transport_launch_context_keeps_raw_cwd_for_non_codex_provider(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    threads_dir = data_dir / "threads"
+    threads_dir.mkdir(parents=True)
+
+    runner = AgentRunner(
+        ThreadStore(threads_dir),
+        ProtocolStore(data_dir / "protocols"),
+        AgentStore(data_dir),
+        EventBus(),
+        config=BTwinConfig(data_dir=data_dir),
+    )
+    requested_workspace = tmp_path / "workspace"
+    requested_workspace.mkdir()
+    session = RuntimeSession(
+        thread_id="thread-123",
+        agent_name="agent-1",
+        provider="claude-code",
+        transport_mode="live_process_transport",
+        workspace_root=requested_workspace,
+    )
+    launch = LaunchResolution(
+        provider=_FakeClaudeProvider(),
+        auth=ResolvedLaunchAuth(provider_name="claude-code", mode="cli_environment"),
+        env={},
+        metadata={},
+    )
+
+    launch_context = runner._build_transport_launch_context(session, launch)
+
+    assert launch_context.cwd == str(requested_workspace)
+    assert not (requested_workspace / ".btwin").exists()
 
 
 def test_save_agent_message_does_not_publish_message_sent_for_non_state_affecting_output(tmp_path: Path) -> None:

@@ -138,6 +138,12 @@ class _FakeStreamingProvider(CLIProvider):
         return {}
 
 
+class _FakeNonCodexStreamingProvider(_FakeStreamingProvider):
+    @property
+    def name(self) -> str:
+        return "claude-code"
+
+
 def _drain_events(queue: asyncio.Queue[SSEEvent]) -> list[SSEEvent]:
     events: list[SSEEvent] = []
     while True:
@@ -309,7 +315,7 @@ async def test_run_subprocess_prefers_session_workspace_root(
     result = await runner._run_subprocess(
         ["fake-codex"],
         "prompt text",
-        _FakeStreamingProvider(),
+        _FakeNonCodexStreamingProvider(),
         thread_id="thread-123",
         agent_name="agent-1",
         workspace_root=workspace_root,
