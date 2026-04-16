@@ -54,25 +54,49 @@ def _provider_run_dir(provider_smoke_env: dict[str, str]) -> Path:
     return path
 
 
-def _write_protocol(provider_smoke_env: dict[str, str]) -> None:
+def _write_protocol(provider_smoke_env: dict[str, str], protocol_definition: dict[str, object]) -> None:
     protocols_dir = Path(provider_smoke_env["BTWIN_DATA_DIR"]) / "protocols"
     protocols_dir.mkdir(parents=True, exist_ok=True)
-    protocol_path = protocols_dir / "provider-smoke.yaml"
+    protocol_name = str(protocol_definition["name"])
+    protocol_path = protocols_dir / f"{protocol_name}.yaml"
     protocol_path.write_text(
-        yaml.safe_dump(
-            {
-                "name": "provider-smoke",
-                "phases": [
-                    {
-                        "name": "context",
-                        "actions": ["contribute", "discuss"],
-                    }
-                ],
-            },
-            sort_keys=False,
-        ),
+        yaml.safe_dump(protocol_definition, sort_keys=False),
         encoding="utf-8",
     )
+
+
+def _api_post(
+    provider_smoke_env: dict[str, str],
+    path: str,
+    payload: dict[str, object],
+    *,
+    expected_status: int = 200,
+) -> dict:
+    response = httpx.post(
+        f'{provider_smoke_env["BTWIN_API_URL"]}{path}',
+        json=payload,
+        timeout=5.0,
+    )
+    assert response.status_code == expected_status, response.text
+    return response.json()
+
+
+def _runtime_status(provider_smoke_env: dict[str, str], thread_id: str, *, agent_name: str = "alice"):
+    payload = httpx.get(
+        f'{provider_smoke_env["BTWIN_API_URL"]}/api/agent-runtime-status',
+        timeout=5.0,
+    ).json()
+    for session in payload.get("agents", {}).get(agent_name, []):
+        if session.get("thread_id") == thread_id:
+            return session
+    return None
+
+
+def _thread_messages(provider_smoke_env: dict[str, str], thread_id: str) -> list[dict]:
+    return httpx.get(
+        f'{provider_smoke_env["BTWIN_API_URL"]}/api/threads/{thread_id}/messages',
+        timeout=5.0,
+    ).json()
 
 
 def _provider_preflight(provider_smoke_env: dict[str, str]) -> dict[str, object]:
@@ -103,9 +127,15 @@ def _provider_preflight(provider_smoke_env: dict[str, str]) -> dict[str, object]
     return payload
 
 
-def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str, object]:
+def _setup_provider_smoke_thread(
+    provider_smoke_env: dict[str, str],
+    *,
+    protocol_name: str,
+    protocol_definition: dict[str, object],
+    participants: tuple[str, ...] = ("alice", "user"),
+) -> dict[str, object]:
     preflight = _provider_preflight(provider_smoke_env)
-    _write_protocol(provider_smoke_env)
+    _write_protocol(provider_smoke_env, protocol_definition)
 
     _run_btwin(
         provider_smoke_env,
@@ -120,21 +150,21 @@ def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str
         provider_smoke_env["provider_model"],
         "--json",
     )
-    thread = _run_btwin(
-        provider_smoke_env,
+
+    thread_args = [
         "thread",
         "create",
         "--topic",
-        "Provider smoke scripted",
+        f"{protocol_name} thread",
         "--protocol",
-        "provider-smoke",
-        "--participant",
-        "alice",
-        "--participant",
-        "user",
+        protocol_name,
         "--json",
-    )
+    ]
+    for participant in participants:
+        thread_args.extend(["--participant", participant])
+    thread = _run_btwin(provider_smoke_env, *thread_args)
     thread_id = thread["thread_id"]
+
     _run_btwin(
         provider_smoke_env,
         "live",
@@ -146,29 +176,38 @@ def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str
         "--json",
     )
 
-    def runtime_status():
-        payload = httpx.get(
-            f'{provider_smoke_env["BTWIN_API_URL"]}/api/agent-runtime-status',
-            timeout=5.0,
-        ).json()
-        for session in payload.get("agents", {}).get("alice", []):
-            if session.get("thread_id") == thread_id:
-                return session
-        return None
-
     attached_status = _wait_for(
-        runtime_status,
+        lambda: _runtime_status(provider_smoke_env, thread_id),
         timeout_seconds=60.0,
         step=1.0,
     )
     if attached_status is None:
         pytest.skip("Timed out waiting for attached Codex runtime session")
 
-    def thread_messages():
-        return httpx.get(
-            f'{provider_smoke_env["BTWIN_API_URL"]}/api/threads/{thread_id}/messages',
-            timeout=5.0,
-        ).json()
+    return {
+        "thread_id": thread_id,
+        "preflight": preflight,
+        "attached_status": attached_status,
+    }
+
+
+def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str, object]:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke",
+        protocol_definition={
+            "name": "provider-smoke",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute", "discuss"],
+                }
+            ],
+        },
+    )
+    preflight = state["preflight"]
+    thread_id = str(state["thread_id"])
+    attached_status = state["attached_status"]
 
     _run_btwin(
         provider_smoke_env,
@@ -192,7 +231,7 @@ def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str
     delivery_state = _wait_for(
         lambda: (
             status.get("status")
-            if (status := runtime_status()) and status.get("status") in {"received", "done"}
+            if (status := _runtime_status(provider_smoke_env, thread_id)) and status.get("status") in {"received", "done"}
             else None
         ),
         timeout_seconds=60.0,
@@ -204,7 +243,7 @@ def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str
         lambda: next(
             (
                 message
-                for message in thread_messages()
+                for message in _thread_messages(provider_smoke_env, thread_id)
                 if message.get("from") == "alice" and message.get("_content") == "PROVIDER_SMOKE_OK"
             ),
             None,
@@ -214,8 +253,8 @@ def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str
     )
     assert exact_reply is not None, "Timed out waiting for live provider session to persist the exact reply"
 
-    final_status = runtime_status() or attached_status
-    all_messages = thread_messages()
+    final_status = _runtime_status(provider_smoke_env, thread_id) or attached_status
+    all_messages = _thread_messages(provider_smoke_env, thread_id)
     runtime_events_path = Path(provider_smoke_env["BTWIN_DATA_DIR"]) / "logs" / "runtime-events.jsonl"
     runtime_events = []
     if runtime_events_path.exists():
@@ -293,3 +332,117 @@ def test_provider_smoke_runs_scripted_thread_flow(provider_smoke_env) -> None:
         for message in result["messages"]
     )
     assert any(event["eventType"] == "runtime_session_started" for event in result["runtime_events"])
+
+
+def test_provider_smoke_apply_next_reports_missing_contribution_hint(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-hint",
+        protocol_definition={
+            "name": "provider-smoke-hint",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                }
+            ],
+        },
+    )
+
+    payload = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "apply-next",
+        "--thread",
+        state["thread_id"],
+        "--json",
+    )
+
+    assert payload["applied"] is False
+    assert payload["suggested_action"] == "submit_contribution"
+    assert "btwin contribution submit" in payload["hint"]
+
+
+def test_provider_smoke_close_gate_blocks_before_phase_advance(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-close-gate",
+        protocol_definition={
+            "name": "provider-smoke-close-gate",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                },
+                {
+                    "name": "discussion",
+                    "actions": ["discuss"],
+                },
+            ],
+        },
+        participants=("alice",),
+    )
+
+    _run_btwin(
+        provider_smoke_env,
+        "contribution",
+        "submit",
+        "--thread",
+        state["thread_id"],
+        "--agent",
+        "alice",
+        "--phase",
+        "context",
+        "--content",
+        "## background\nReady for discussion.\n",
+        "--tldr",
+        "context ready",
+        "--json",
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/close",
+        {"summary": "done", "decision": "merge"},
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "thread_not_closable_from_phase"
+    assert "protocol apply-next" in detail["hint"]
+
+
+def test_provider_smoke_contribution_gate_blocks_non_user_decision_actor(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-decision-gate",
+        protocol_definition={
+            "name": "provider-smoke-decision-gate",
+            "phases": [
+                {
+                    "name": "decision",
+                    "actions": ["decide"],
+                    "decided_by": "user",
+                    "template": [{"section": "agreed_points", "required": True}],
+                }
+            ],
+        },
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/contributions",
+        {
+            "agentName": "alice",
+            "phase": "decision",
+            "content": "## agreed_points\nShip it.\n",
+            "tldr": "decision from alice",
+        },
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "actor_not_allowed_for_phase"
+    assert "user" in detail["hint"]
