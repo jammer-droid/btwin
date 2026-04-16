@@ -15,7 +15,7 @@ from btwin_core.prototypes.persistent_sessions.harness import run_provider_scena
 pytestmark = pytest.mark.provider_smoke
 
 
-def _run_btwin(provider_smoke_env: dict[str, str], *args: str) -> dict:
+def _run_btwin_result(provider_smoke_env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [provider_smoke_env["BTWIN_TEST_BTWIN_BIN"], *args],
         cwd=Path(provider_smoke_env["BTWIN_TEST_ROOT"]),
@@ -29,7 +29,16 @@ def _run_btwin(provider_smoke_env: dict[str, str], *args: str) -> dict:
         },
         check=False,
     )
-    assert result.returncode == 0, result.stderr or result.stdout
+    return result
+
+
+def _run_btwin(
+    provider_smoke_env: dict[str, str],
+    *args: str,
+    expected_returncode: int = 0,
+) -> dict:
+    result = _run_btwin_result(provider_smoke_env, *args)
+    assert result.returncode == expected_returncode, result.stderr or result.stdout
     return json.loads(result.stdout)
 
 
@@ -446,3 +455,243 @@ def test_provider_smoke_contribution_gate_blocks_non_user_decision_actor(provide
     detail = response["detail"]
     assert detail["error"] == "actor_not_allowed_for_phase"
     assert "user" in detail["hint"]
+
+
+def test_provider_smoke_contribution_gate_blocks_phase_mismatch(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-phase-mismatch",
+        protocol_definition={
+            "name": "provider-smoke-phase-mismatch",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                },
+                {
+                    "name": "decision",
+                    "actions": ["decide"],
+                    "decided_by": "user",
+                    "template": [{"section": "agreed_points", "required": True}],
+                },
+            ],
+        },
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/contributions",
+        {
+            "agentName": "alice",
+            "phase": "decision",
+            "content": "## agreed_points\nShip it.\n",
+            "tldr": "decision too early",
+        },
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "phase_mismatch"
+    assert detail["details"]["current_phase"] == "context"
+    assert "btwin contribution submit" in detail["hint"]
+
+
+def test_provider_smoke_contribution_gate_blocks_non_contribution_phase(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-phase-action-gate",
+        protocol_definition={
+            "name": "provider-smoke-phase-action-gate",
+            "phases": [
+                {
+                    "name": "discussion",
+                    "actions": ["discuss"],
+                }
+            ],
+        },
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/contributions",
+        {
+            "agentName": "alice",
+            "phase": "discussion",
+            "content": "## notes\nNeed another pass.\n",
+            "tldr": "not a contribution phase",
+        },
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "phase_action_not_allowed"
+    assert "send-message" in detail["hint"]
+
+
+def test_provider_smoke_direct_message_gate_blocks_non_discussion_phase(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-direct-phase-gate",
+        protocol_definition={
+            "name": "provider-smoke-direct-phase-gate",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                }
+            ],
+        },
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/messages",
+        {
+            "fromAgent": "user",
+            "content": "Please respond directly.",
+            "tldr": "direct chat not allowed yet",
+            "deliveryMode": "direct",
+            "targetAgents": ["alice"],
+        },
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "direct_message_not_allowed_in_phase"
+    assert "btwin contribution submit" in detail["hint"]
+
+
+def test_provider_smoke_direct_message_gate_blocks_ineligible_target(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-direct-target-gate",
+        protocol_definition={
+            "name": "provider-smoke-direct-target-gate",
+            "phases": [
+                {
+                    "name": "discussion",
+                    "actions": ["discuss"],
+                }
+            ],
+        },
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/messages",
+        {
+            "fromAgent": "alice",
+            "content": "Looping this back to myself.",
+            "tldr": "invalid direct target",
+            "deliveryMode": "direct",
+            "targetAgents": ["alice"],
+        },
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "target_not_eligible_for_phase"
+    assert "user" in detail["hint"]
+
+
+def test_provider_smoke_close_gate_blocks_when_required_contributions_missing(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-close-missing",
+        protocol_definition={
+            "name": "provider-smoke-close-missing",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                }
+            ],
+        },
+        participants=("alice",),
+    )
+
+    response = _api_post(
+        provider_smoke_env,
+        f"/api/threads/{state['thread_id']}/close",
+        {"summary": "done", "decision": "merge"},
+        expected_status=409,
+    )
+
+    detail = response["detail"]
+    assert detail["error"] == "phase_requirements_not_met"
+    assert "btwin contribution submit" in detail["hint"]
+
+
+def test_provider_smoke_workflow_hook_blocks_stop_without_required_contribution(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-stop-block",
+        protocol_definition={
+            "name": "provider-smoke-stop-block",
+            "phases": [
+                {
+                    "name": "context",
+                    "actions": ["contribute"],
+                    "template": [{"section": "background", "required": True}],
+                }
+            ],
+        },
+        participants=("alice",),
+    )
+
+    payload = _run_btwin(
+        provider_smoke_env,
+        "workflow",
+        "hook",
+        "--event",
+        "Stop",
+        "--thread",
+        state["thread_id"],
+        "--agent",
+        "alice",
+        "--json",
+        expected_returncode=2,
+    )
+
+    assert payload["event"] == "Stop"
+    assert payload["decision"] == "block"
+    assert payload["reason"] == "missing_contribution"
+    assert payload["required_result_recorded"] is False
+
+
+def test_provider_smoke_workflow_hook_allows_non_required_actor_in_user_decision_phase(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-stop-allow-nonrequired",
+        protocol_definition={
+            "name": "provider-smoke-stop-allow-nonrequired",
+            "phases": [
+                {
+                    "name": "decision",
+                    "actions": ["decide"],
+                    "decided_by": "user",
+                    "template": [{"section": "agreed_points", "required": True}],
+                }
+            ],
+        },
+    )
+
+    payload = _run_btwin(
+        provider_smoke_env,
+        "workflow",
+        "hook",
+        "--event",
+        "Stop",
+        "--thread",
+        state["thread_id"],
+        "--agent",
+        "alice",
+        "--json",
+    )
+
+    assert payload["event"] == "Stop"
+    assert payload["decision"] == "allow"
+    assert payload["required_result_recorded"] is False
