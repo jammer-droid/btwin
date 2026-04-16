@@ -430,6 +430,22 @@ binds a thread, advances the protocol through the shared API path, clears the
 runtime binding, and finishes by checking the attached `agent inbox --json`
 surface.
 
+For unified local test execution with per-run HTML reports and retained
+artifacts, use:
+
+```bash
+uv run python scripts/run_tests.py unit
+uv run python scripts/run_tests.py integration
+uv run python scripts/run_tests.py cli-smoke
+uv run python scripts/run_tests.py provider-smoke
+```
+
+The runner writes each execution under `.test-artifacts/<timestamp-group>/`,
+updates `.test-artifacts/latest` to the newest run, and keeps the most recent
+30 runs by default. Each run directory includes `report.html`, `metadata.json`,
+and captured pytest stdout/stderr. Provider smoke is intentionally opt-in and
+uses the default profile `app-server` long-term with `gpt-5.4-mini`.
+
 For workflow-constraints validation in the preferred `btwin test-env` flow,
 keep a second terminal open with:
 
