@@ -710,13 +710,14 @@ def test_attached_scenario_repeats_same_phase_across_multiple_cycles(provider_sm
                     "actions": ["contribute"],
                     "template": [{"section": "completed", "required": True}],
                     "procedure": [
-                        {"role": "reviewer", "action": "review"},
-                        {"role": "implementer", "action": "revise"},
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise"},
                     ],
                 }
             ],
             "transitions": [
-                {"from": "review", "to": "review", "on": "retry"},
+                {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate"},
+                {"from": "review", "to": "review", "on": "accept", "alias": "Accept Gate"},
             ],
         },
         participants=("alice",),
@@ -787,4 +788,43 @@ def test_attached_scenario_repeats_same_phase_across_multiple_cycles(provider_sm
     assert len(reports) == 2
     assert all(report["report_type"] == "cycle_result" for report in reports)
     assert all(report["cycle_finished"] is True for report in reports)
+    assert [report["cycle_index"] for report in reports] == [2, 1]
+    assert [report["next_cycle_index"] for report in reports] == [3, 2]
     assert all(report["next_phase"] == "review" for report in reports)
+
+    phase_cycle_response = httpx.get(
+        f'{provider_smoke_env["BTWIN_API_URL"]}/api/threads/{thread_id}/phase-cycle',
+        timeout=5.0,
+    )
+    phase_cycle_response.raise_for_status()
+    phase_cycle_payload = phase_cycle_response.json()
+    assert phase_cycle_payload["state"]["cycle_index"] == 3
+    assert phase_cycle_payload["state"]["phase_name"] == "review"
+    assert phase_cycle_payload["context_core"]["current_cycle_index"] == 3
+    assert phase_cycle_payload["context_core"]["next_expected_action"] == "review"
+    assert phase_cycle_payload["visual"]["procedure"][0] == {"key": "review", "label": "Review", "status": "active"}
+    assert phase_cycle_payload["visual"]["procedure"][1] == {"key": "revise", "label": "Revise", "status": "pending"}
+    assert phase_cycle_payload["visual"]["gates"][0] == {
+        "key": "retry",
+        "label": "Retry Gate",
+        "status": "completed",
+        "target_phase": "review",
+    }
+    assert phase_cycle_payload["visual"]["gates"][1] == {
+        "key": "accept",
+        "label": "Accept Gate",
+        "status": "pending",
+        "target_phase": "review",
+    }
+
+    hud_result = _run_btwin_result(provider_smoke_env, "hud", "--thread", thread_id, "--limit", "5")
+    assert hud_result.returncode == 0, hud_result.stderr or hud_result.stdout
+    assert "Protocol Progress" in hud_result.stdout
+    assert "Active cycle: 3" in hud_result.stdout
+    assert "Completed cycles: 2" in hud_result.stdout
+    assert "Procedure" in hud_result.stdout
+    assert "Review" in hud_result.stdout
+    assert "Revise" in hud_result.stdout
+    assert "Gates" in hud_result.stdout
+    assert "Retry Gate" in hud_result.stdout
+    assert "Accept Gate" in hud_result.stdout

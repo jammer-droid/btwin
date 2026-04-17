@@ -93,27 +93,96 @@ run_python() {
   HOME="${HOME_DIR}" uv run --project "${REPO_ROOT}" python "$@"
 }
 
-mkdir -p "${BTWIN_DATA_DIR}/protocols"
-cat > "${BTWIN_DATA_DIR}/protocols/attached-helper-smoke.yaml" <<'YAML'
-name: attached-helper-smoke
-description: Minimal protocol for attached helper smoke
-phases:
-  - name: context
-    actions: [contribute, discuss]
-    template: []
-  - name: discussion
-    actions: [discuss]
-YAML
+DATA_PROTOCOLS_DIR="${BTWIN_DATA_DIR}/protocols"
+PROJECT_PROTOCOLS_DIR="${PROJECT_ROOT}/.btwin/protocols"
+mkdir -p "${DATA_PROTOCOLS_DIR}" "${PROJECT_PROTOCOLS_DIR}"
+BTWIN_ATTACHED_SMOKE_DATA_PROTOCOLS_DIR="${DATA_PROTOCOLS_DIR}" \
+BTWIN_ATTACHED_SMOKE_PROJECT_PROTOCOLS_DIR="${PROJECT_PROTOCOLS_DIR}" \
+run_python - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+protocol = {
+    "name": "attached-helper-smoke",
+    "description": "Minimal protocol for attached helper smoke",
+    "outcomes": ["retry", "accept"],
+    "phases": [
+        {
+            "name": "review",
+            "actions": ["contribute", "discuss"],
+            "template": [{"section": "completed", "required": True}],
+            "procedure": [
+                {"role": "reviewer", "action": "review", "alias": "Review"},
+                {"role": "implementer", "action": "revise", "alias": "Revise"},
+            ],
+        },
+        {
+            "name": "decision",
+            "actions": ["discuss"],
+        },
+    ],
+    "transitions": [
+        {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate"},
+        {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate"},
+    ],
+}
+
+for env_var in ("BTWIN_ATTACHED_SMOKE_DATA_PROTOCOLS_DIR", "BTWIN_ATTACHED_SMOKE_PROJECT_PROTOCOLS_DIR"):
+    path = Path(os.environ[env_var]) / "attached-helper-smoke.yaml"
+    path.write_text(yaml.safe_dump(protocol, sort_keys=False), encoding="utf-8")
+PY
 
 echo "Running attached helper flow..."
 run_btwin agent create alice --provider codex --role implementer --model gpt-5 >/dev/null
-THREAD_JSON="$(run_btwin thread create --topic "Attached helper smoke" --protocol attached-helper-smoke --participant alice --participant bob --json)"
+THREAD_JSON="$(run_btwin thread create --topic "Attached helper smoke" --protocol attached-helper-smoke --participant alice --json)"
 THREAD_ID="$(JSON_PAYLOAD="${THREAD_JSON}" run_python -c 'import json, os; print(json.loads(os.environ["JSON_PAYLOAD"])["thread_id"])')"
-run_btwin thread send-message --thread "${THREAD_ID}" --from bob --content "Attached smoke ping." --tldr "smoke ping" --delivery-mode broadcast --json >/dev/null
 RUN_BIND_JSON="$(run_btwin runtime bind --thread "${THREAD_ID}" --agent alice --json)"
+run_btwin live attach --thread "${THREAD_ID}" --agent alice --json >/dev/null
+ATTACHED_READY=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if BTWIN_ATTACHED_SMOKE_THREAD_ID="${THREAD_ID}" run_python - <<'PY'
+import json
+import os
+import urllib.request
+
+base = os.environ["BTWIN_API_URL"]
+thread_id = os.environ["BTWIN_ATTACHED_SMOKE_THREAD_ID"]
+with urllib.request.urlopen(f"{base}/api/agent-runtime-status") as response:
+    payload = json.loads(response.read().decode("utf-8"))
+agents = payload.get("agents", {})
+for session in agents.get("alice", []):
+    if session.get("thread_id") == thread_id:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    ATTACHED_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${ATTACHED_READY}" != "1" ]]; then
+  echo "Timed out waiting for attached runtime session." >&2
+  exit 1
+fi
 CURRENT_JSON="$(run_btwin runtime current --json)"
-NEXT_JSON="$(run_btwin protocol next --thread "${THREAD_ID}" --json)"
-APPLY_JSON="$(run_btwin protocol apply-next --json)"
+run_btwin contribution submit --thread "${THREAD_ID}" --agent alice --phase review --content $'## completed\nCycle 1 ready for another pass.\n' --tldr "review cycle 1" --json >/dev/null
+APPLY_ONE_JSON="$(run_btwin protocol apply-next --thread "${THREAD_ID}" --outcome retry --json)"
+run_btwin contribution submit --thread "${THREAD_ID}" --agent alice --phase review --content $'## completed\nCycle 2 ready for another pass.\n' --tldr "review cycle 2" --json >/dev/null
+APPLY_TWO_JSON="$(run_btwin protocol apply-next --thread "${THREAD_ID}" --outcome retry --json)"
+PHASE_CYCLE_JSON="$(BTWIN_ATTACHED_SMOKE_THREAD_ID="${THREAD_ID}" run_python - <<'PY'
+import json
+import os
+import urllib.request
+
+base = os.environ["BTWIN_API_URL"]
+thread_id = os.environ["BTWIN_ATTACHED_SMOKE_THREAD_ID"]
+with urllib.request.urlopen(f"{base}/api/threads/{thread_id}/phase-cycle") as response:
+    print(response.read().decode("utf-8"))
+PY
+)"
 MAILBOX_JSON="$(BTWIN_ATTACHED_SMOKE_THREAD_ID="${THREAD_ID}" run_python - <<'PY'
 import json
 import os
@@ -128,16 +197,29 @@ PY
 HUD_OUTPUT="$(run_btwin hud --thread "${THREAD_ID}" --limit 5)"
 CLEARED_JSON="$(run_btwin runtime clear --json)"
 CURRENT_AFTER_CLEAR_JSON="$(run_btwin runtime current --json)"
+MAILBOX_AFTER_CLEAR_JSON="$(BTWIN_ATTACHED_SMOKE_THREAD_ID="${THREAD_ID}" run_python - <<'PY'
+import json
+import os
+import urllib.request
+
+base = os.environ["BTWIN_API_URL"]
+thread_id = os.environ["BTWIN_ATTACHED_SMOKE_THREAD_ID"]
+with urllib.request.urlopen(f"{base}/api/system-mailbox?threadId={thread_id}&limit=5") as response:
+    print(response.read().decode("utf-8"))
+PY
+)"
 INBOX_JSON="$(run_btwin agent inbox alice --json)"
 
 JSON_PAYLOAD_THREAD="${THREAD_JSON}" \
 JSON_PAYLOAD_BIND="${RUN_BIND_JSON}" \
 JSON_PAYLOAD_CURRENT="${CURRENT_JSON}" \
-JSON_PAYLOAD_NEXT="${NEXT_JSON}" \
-JSON_PAYLOAD_APPLY="${APPLY_JSON}" \
+JSON_PAYLOAD_APPLY_ONE="${APPLY_ONE_JSON}" \
+JSON_PAYLOAD_APPLY_TWO="${APPLY_TWO_JSON}" \
+JSON_PAYLOAD_PHASE_CYCLE="${PHASE_CYCLE_JSON}" \
 JSON_PAYLOAD_MAILBOX="${MAILBOX_JSON}" \
 JSON_PAYLOAD_CLEARED="${CLEARED_JSON}" \
 JSON_PAYLOAD_CURRENT_AFTER_CLEAR="${CURRENT_AFTER_CLEAR_JSON}" \
+JSON_PAYLOAD_MAILBOX_AFTER_CLEAR="${MAILBOX_AFTER_CLEAR_JSON}" \
 JSON_PAYLOAD_INBOX="${INBOX_JSON}" \
 JSON_PAYLOAD_HUD="${HUD_OUTPUT}" \
 BTWIN_ATTACHED_SMOKE_ROOT="${ROOT_DIR}" \
@@ -150,11 +232,13 @@ import os
 thread = json.loads(os.environ["JSON_PAYLOAD_THREAD"])
 bind = json.loads(os.environ["JSON_PAYLOAD_BIND"])
 current = json.loads(os.environ["JSON_PAYLOAD_CURRENT"])
-next_payload = json.loads(os.environ["JSON_PAYLOAD_NEXT"])
-apply_payload = json.loads(os.environ["JSON_PAYLOAD_APPLY"])
+apply_one = json.loads(os.environ["JSON_PAYLOAD_APPLY_ONE"])
+apply_two = json.loads(os.environ["JSON_PAYLOAD_APPLY_TWO"])
+phase_cycle = json.loads(os.environ["JSON_PAYLOAD_PHASE_CYCLE"])
 mailbox = json.loads(os.environ["JSON_PAYLOAD_MAILBOX"])
 cleared = json.loads(os.environ["JSON_PAYLOAD_CLEARED"])
 current_after_clear = json.loads(os.environ["JSON_PAYLOAD_CURRENT_AFTER_CLEAR"])
+mailbox_after_clear = json.loads(os.environ["JSON_PAYLOAD_MAILBOX_AFTER_CLEAR"])
 inbox = json.loads(os.environ["JSON_PAYLOAD_INBOX"])
 hud = os.environ["JSON_PAYLOAD_HUD"]
 
@@ -163,33 +247,63 @@ assert bind["binding"]["agent_name"] == "alice", bind
 assert bind["binding"]["thread_id"] == thread["thread_id"], bind
 assert current["bound"] is True, current
 assert current["binding"]["thread_id"] == thread["thread_id"], current
-assert next_payload["suggested_action"] == "advance_phase", next_payload
-assert next_payload["next_phase"] == "discussion", next_payload
-assert apply_payload["applied"] is True, apply_payload
-assert apply_payload["thread"]["current_phase"] == "discussion", apply_payload
-assert apply_payload["thread_source"] == "runtime_binding", apply_payload
-assert mailbox["count"] == 1, mailbox
+assert apply_one["applied"] is True, apply_one
+assert apply_one["cycle"]["cycle_index"] == 2, apply_one
+assert apply_one["thread"]["current_phase"] == "review", apply_one
+assert apply_one["thread_source"] == "explicit", apply_one
+assert apply_two["applied"] is True, apply_two
+assert apply_two["cycle"]["cycle_index"] == 3, apply_two
+assert apply_two["thread"]["current_phase"] == "review", apply_two
+assert apply_two["thread_source"] == "explicit", apply_two
+assert phase_cycle["state"]["cycle_index"] == 3, phase_cycle
+assert phase_cycle["state"]["phase_name"] == "review", phase_cycle
+assert phase_cycle["visual"]["procedure"][0]["key"] == "review", phase_cycle
+assert phase_cycle["visual"]["procedure"][0]["label"] == "Review", phase_cycle
+assert phase_cycle["visual"]["procedure"][1]["key"] == "revise", phase_cycle
+assert phase_cycle["visual"]["procedure"][1]["label"] == "Revise", phase_cycle
+assert phase_cycle["visual"]["gates"][0]["key"] == "retry", phase_cycle
+assert phase_cycle["visual"]["gates"][0]["label"] == "Retry Gate", phase_cycle
+assert phase_cycle["visual"]["gates"][0]["target_phase"] == "review", phase_cycle
+assert phase_cycle["visual"]["gates"][1]["key"] == "accept", phase_cycle
+assert phase_cycle["visual"]["gates"][1]["label"] == "Accept Gate", phase_cycle
+assert phase_cycle["visual"]["gates"][1]["target_phase"] == "decision", phase_cycle
+assert mailbox["count"] == 2, mailbox
+assert [report["cycle_index"] for report in mailbox["reports"]] == [2, 1], mailbox
+assert [report["next_cycle_index"] for report in mailbox["reports"]] == [3, 2], mailbox
 assert mailbox["reports"][0]["report_type"] == "cycle_result", mailbox
 assert "Cycle Feed" in hud, hud
 assert "cycle report" in hud, hud
+assert "Protocol Progress" in hud, hud
+assert "Procedure" in hud, hud
+assert "Gates" in hud, hud
+assert "Review" in hud, hud
+assert "Revise" in hud, hud
+assert "Retry Gate" in hud, hud
+assert "Accept Gate" in hud, hud
 assert cleared["cleared"] is True, cleared
 assert current_after_clear["bound"] is False, current_after_clear
 assert current_after_clear["binding"] is None, current_after_clear
+assert mailbox_after_clear["count"] == 2, mailbox_after_clear
 assert inbox["context"]["runtime_mode"] == "attached", inbox
 assert inbox["runtime_session_error"] is None, inbox
 assert inbox["attached_runtime_diagnostics"]["url"] == os.environ["BTWIN_API_URL"], inbox
 assert inbox["attached_runtime_diagnostics"], inbox
-assert inbox["pending_message_count"] == 1, inbox
+assert inbox["pending_message_count"] == 0, inbox
 
 print("Attached helper smoke passed")
 print(f"- root: {os.environ['BTWIN_ATTACHED_SMOKE_ROOT']}")
 print(f"- project: {os.environ['BTWIN_ATTACHED_SMOKE_ROOT']}/project")
 print(f"- thread_id: {thread['thread_id']}")
 print(f"- runtime binding: {bind['binding']['agent_name']} -> {bind['binding']['thread_id']}")
-print(f"- protocol next: {next_payload['suggested_action']} -> {next_payload['next_phase']}")
-print(f"- protocol apply-next: {apply_payload['thread']['current_phase']}")
+print(f"- protocol apply-next cycle 1: {apply_one['thread']['current_phase']}")
+print(f"- protocol apply-next cycle 2: {apply_two['thread']['current_phase']}")
+print(f"- phase-cycle api visible: {phase_cycle['state']['cycle_index'] == 3 and phase_cycle['visual']['procedure'][0]['label'] == 'Review'}")
 print(f"- mailbox reports: {mailbox['count']}")
 print(f"- hud cycle feed visible: {'Cycle Feed' in hud and 'cycle report' in hud}")
+print(f"- hud protocol progress visible: {'Protocol Progress' in hud}")
+print(f"- hud procedure visible: {'Procedure' in hud}")
+print(f"- hud gate visuals visible: {'Gates' in hud and 'Retry Gate' in hud and 'Accept Gate' in hud}")
 print(f"- runtime clear: {current_after_clear['bound']}")
+print(f"- mailbox reports after clear: {mailbox_after_clear['count']}")
 print(f"- agent inbox: pending={inbox['pending_message_count']} diagnostics={bool(inbox.get('attached_runtime_diagnostics'))}")
 PY
