@@ -216,8 +216,8 @@ def _build_phase_cycle_visual(
                 status = "completed"
             procedure_nodes.append(
                 {
-                    "key": step.action,
-                    "label": step.alias or step.action,
+                    "key": step.visual_key(),
+                    "label": step.visual_label(),
                     "status": status,
                 }
             )
@@ -242,8 +242,8 @@ def _build_phase_cycle_visual(
                 continue
             gate_nodes.append(
                 {
-                    "key": transition.on or transition.to,
-                    "label": transition.alias or transition.on or transition.to,
+                    "key": transition.visual_key(),
+                    "label": transition.visual_label(),
                     "status": "completed" if transition.on and state.last_gate_outcome == transition.on else "pending",
                     "target_phase": transition.to,
                 }

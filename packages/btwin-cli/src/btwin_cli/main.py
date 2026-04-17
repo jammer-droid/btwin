@@ -603,7 +603,6 @@ def _phase_cycle_visual_payload(
     if raw_steps:
         step_labels = [step.action for step in raw_steps]
         for index, step in enumerate(raw_steps):
-            label = step.alias or step.action
             status = "pending"
             if state.current_step_label == step.action:
                 status = "active"
@@ -611,7 +610,7 @@ def _phase_cycle_visual_payload(
                 status = "completed"
             elif state.status == "completed":
                 status = "completed"
-            procedure_nodes.append({"key": step.action, "label": label, "status": status})
+            procedure_nodes.append({"key": step.visual_key(), "label": step.visual_label(), "status": status})
     else:
         step_labels = [step for step in state.procedure_steps if isinstance(step, str)]
         for index, step in enumerate(step_labels):
@@ -631,12 +630,11 @@ def _phase_cycle_visual_payload(
         for transition in protocol.transitions:
             if transition.from_phase != state.phase_name:
                 continue
-            label = transition.alias or transition.on or transition.to
             status = "completed" if transition.on and state.last_gate_outcome == transition.on else "pending"
             gate_nodes.append(
                 {
-                    "key": transition.on or transition.to,
-                    "label": label,
+                    "key": transition.visual_key(),
+                    "label": transition.visual_label(),
                     "status": status,
                     "target_phase": transition.to,
                 }

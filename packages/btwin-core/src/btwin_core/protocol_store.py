@@ -27,6 +27,13 @@ class ProtocolProcedureStep(BaseModel):
     action: str
     guidance: str | None = None
     alias: str | None = None
+    key: str | None = None
+
+    def visual_key(self) -> str:
+        return self.key or self.action
+
+    def visual_label(self) -> str:
+        return self.alias or self.action
 
 
 class ProtocolInteraction(BaseModel):
@@ -70,6 +77,13 @@ class ProtocolTransition(BaseModel):
     to: str
     on: str | None = None
     alias: str | None = None
+    key: str | None = None
+
+    def visual_key(self) -> str:
+        return self.key or self.on or self.to
+
+    def visual_label(self) -> str:
+        return self.alias or self.on or self.to
 
 
 class Protocol(BaseModel):

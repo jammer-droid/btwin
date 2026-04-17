@@ -196,6 +196,80 @@ def test_hud_renders_current_protocol_cycle_and_step(tmp_path, monkeypatch):
     assert "Last gate:" not in result.output
 
 
+def test_standalone_phase_cycle_payload_prefers_protocol_keys_in_visuals(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store = ThreadStore(project_root / ".btwin" / "threads")
+    protocol_store = ProtocolStore(project_root / ".btwin" / "protocols")
+    protocol_store.save_protocol(
+        Protocol(
+            name="review-loop",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review", "key": "step-review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise", "key": "step-revise"},
+                    ],
+                ),
+                ProtocolPhase(name="decision", actions=["decide"]),
+            ],
+            transitions=[
+                ProtocolTransition.model_validate(
+                    {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate", "key": "gate-retry"}
+                ),
+                ProtocolTransition.model_validate(
+                    {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate", "key": "gate-accept"}
+                ),
+            ],
+            outcomes=["retry", "accept"],
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="HUD progress thread",
+        protocol="review-loop",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(project_root / ".btwin").write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+    monkeypatch.setattr(main, "_get_thread_store", lambda: thread_store)
+
+    payload = main._phase_cycle_payload_for_thread(thread["thread_id"], thread=thread, config=_standalone_config(data_dir))
+
+    assert payload is not None
+    assert payload["visual"]["procedure"][0] == {"key": "step-review", "label": "Review", "status": "active"}
+    assert payload["visual"]["procedure"][1] == {"key": "step-revise", "label": "Revise", "status": "pending"}
+    assert payload["visual"]["gates"][0] == {
+        "key": "gate-retry",
+        "label": "Retry Gate",
+        "status": "completed",
+        "target_phase": "review",
+    }
+    assert payload["visual"]["gates"][1] == {
+        "key": "gate-accept",
+        "label": "Accept Gate",
+        "status": "pending",
+        "target_phase": "decision",
+    }
+
+
 def test_hud_with_closed_binding_shows_closed_status_without_focusing_thread(tmp_path, monkeypatch):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
