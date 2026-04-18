@@ -4,7 +4,10 @@ from btwin_core.phase_cycle_engine import phase_cycle_procedure_actions
 from btwin_core.protocol_flow import describe_next
 from btwin_core.protocol_store import (
     Protocol,
+    ProtocolAuthoringGate,
+    ProtocolAuthoringGateRoute,
     ProtocolGuardSet,
+    ProtocolOutcomePolicy,
     ProtocolPhase,
     ProtocolProcedureStep,
     ProtocolSection,
@@ -178,6 +181,70 @@ def test_protocol_guard_sets_and_phase_guard_set_round_trip_through_store(tmp_pa
     assert proto.guard_sets[0].description == "Guard set for the review phase."
     assert proto.guard_sets[0].guards == ["contribution_required", "phase_actor_eligibility"]
     assert proto.phases[0].guard_set == "review-guards"
+
+
+def test_protocol_authoring_gate_and_outcome_policy_round_trip_through_store(tmp_path):
+    store = ProtocolStore(tmp_path / "protocols")
+    store.save_protocol(
+        Protocol(
+            name="review-loop",
+            gates=[
+                ProtocolAuthoringGate(
+                    name="review-gate",
+                    description="Authoring-only gate definition for the review phase.",
+                    routes=[
+                        ProtocolAuthoringGateRoute(
+                            outcome="retry",
+                            target_phase="review",
+                            alias="Retry Loop",
+                            key="retry-loop",
+                        ),
+                        ProtocolAuthoringGateRoute(
+                            outcome="accept",
+                            target_phase="decision",
+                            alias="Accept Gate",
+                            key="accept-gate",
+                        ),
+                    ],
+                )
+            ],
+            outcome_policies=[
+                ProtocolOutcomePolicy(
+                    name="review-outcomes",
+                    description="Authoring-only outcome emission policy for review.",
+                    emitters=["reviewer", "user"],
+                    actions=["decide"],
+                    outcomes=["retry", "accept"],
+                )
+            ],
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    gate="review-gate",
+                    outcome_policy="review-outcomes",
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise"},
+                    ],
+                )
+            ],
+            transitions=[ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"})],
+            outcomes=["retry", "accept"],
+        )
+    )
+
+    proto = store.get_protocol("review-loop")
+
+    assert proto is not None
+    assert proto.gates[0].authoring_only is True
+    assert proto.gates[0].routes[0].outcome == "retry"
+    assert proto.gates[0].routes[0].target_phase == "review"
+    assert proto.outcome_policies[0].authoring_only is True
+    assert proto.outcome_policies[0].emitters == ["reviewer", "user"]
+    assert proto.phases[0].gate == "review-gate"
+    assert proto.phases[0].outcome_policy == "review-outcomes"
 
 
 def test_api_phase_cycle_visual_prefers_protocol_keys_and_aliases():

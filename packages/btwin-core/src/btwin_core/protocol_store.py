@@ -89,6 +89,29 @@ class ProtocolGuardSet(BaseModel):
         return self
 
 
+class ProtocolAuthoringGateRoute(BaseModel):
+    outcome: str
+    target_phase: str
+    alias: str | None = None
+    key: str | None = None
+
+
+class ProtocolAuthoringGate(BaseModel):
+    name: str
+    description: str | None = None
+    authoring_only: Literal[True] = True
+    routes: list[ProtocolAuthoringGateRoute] = []
+
+
+class ProtocolOutcomePolicy(BaseModel):
+    name: str
+    description: str | None = None
+    authoring_only: Literal[True] = True
+    emitters: list[str] = []
+    actions: list[str] = []
+    outcomes: list[str] = []
+
+
 class ProtocolPhase(BaseModel):
     name: str
     description: str = ""
@@ -96,6 +119,8 @@ class ProtocolPhase(BaseModel):
     template: list[ProtocolSection] | None = None
     procedure: list[ProtocolProcedureStep] | None = None
     guard_set: str | None = None
+    gate: str | None = None
+    outcome_policy: str | None = None
     mode: Literal["realtime_messages"] | None = None
     guidance: str | None = None
     decided_by: Literal["user", "consensus", "vote"] | None = None
@@ -141,18 +166,39 @@ class Protocol(BaseModel):
     interaction: ProtocolInteraction = Field(default_factory=ProtocolInteraction)
     roles: list[str] = []
     guard_sets: list[ProtocolGuardSet] = []
+    gates: list[ProtocolAuthoringGate] = []
+    outcome_policies: list[ProtocolOutcomePolicy] = []
     transitions: list[ProtocolTransition] = []
     outcomes: list[str] = []
 
     @model_validator(mode="after")
-    def validate_guard_sets(self) -> "Protocol":
+    def validate_authoring_references(self) -> "Protocol":
         guard_set_names = {guard_set.name for guard_set in self.guard_sets}
         if len(guard_set_names) != len(self.guard_sets):
             raise ValueError("duplicate guard_set name values are not allowed")
+        gate_names = {gate.name for gate in self.gates}
+        if len(gate_names) != len(self.gates):
+            raise ValueError("duplicate gate name values are not allowed")
+        outcome_policy_names = {
+            outcome_policy.name for outcome_policy in self.outcome_policies
+        }
+        if len(outcome_policy_names) != len(self.outcome_policies):
+            raise ValueError("duplicate outcome_policy name values are not allowed")
         for phase in self.phases:
             if phase.guard_set is not None and phase.guard_set not in guard_set_names:
                 raise ValueError(
                     f"Phase '{phase.name}' references unknown guard_set '{phase.guard_set}'"
+                )
+            if phase.gate is not None and phase.gate not in gate_names:
+                raise ValueError(
+                    f"Phase '{phase.name}' references unknown authoring gate '{phase.gate}'"
+                )
+            if (
+                phase.outcome_policy is not None
+                and phase.outcome_policy not in outcome_policy_names
+            ):
+                raise ValueError(
+                    f"Phase '{phase.name}' references unknown outcome_policy '{phase.outcome_policy}'"
                 )
         return self
 
@@ -162,6 +208,22 @@ class Protocol(BaseModel):
         for guard_set in self.guard_sets:
             if guard_set.name == name:
                 return guard_set
+        return None
+
+    def get_gate(self, name: str | None) -> ProtocolAuthoringGate | None:
+        if name is None:
+            return None
+        for gate in self.gates:
+            if gate.name == name:
+                return gate
+        return None
+
+    def get_outcome_policy(self, name: str | None) -> ProtocolOutcomePolicy | None:
+        if name is None:
+            return None
+        for outcome_policy in self.outcome_policies:
+            if outcome_policy.name == name:
+                return outcome_policy
         return None
 
 class ProtocolStore:
@@ -199,6 +261,9 @@ class ProtocolStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         path = self._dir / f"{protocol.name}.yaml"
         data = protocol.model_dump(exclude_none=True, by_alias=True)
+        for key in ("gates", "outcome_policies"):
+            if not data.get(key):
+                data.pop(key, None)
         for phase in data.get("phases", []):
             phase.pop("mode", None)
         path.write_text(yaml.dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")

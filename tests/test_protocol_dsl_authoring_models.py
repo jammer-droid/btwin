@@ -1,0 +1,101 @@
+import pytest
+
+from btwin_core.protocol_store import Protocol
+
+
+def test_protocol_accepts_authoring_only_gate_and_outcome_policy_objects():
+    proto = Protocol.model_validate(
+        {
+            "name": "review-loop",
+            "phases": [
+                {
+                    "name": "review",
+                    "actions": ["contribute"],
+                    "gate": "review-gate",
+                    "outcome_policy": "review-outcomes",
+                }
+            ],
+            "gates": [
+                {
+                    "name": "review-gate",
+                    "description": "Authoring-only gate declaration.",
+                    "routes": [
+                        {
+                            "outcome": "retry",
+                            "target_phase": "review",
+                            "alias": "Retry Loop",
+                            "key": "retry-loop",
+                        },
+                        {
+                            "outcome": "accept",
+                            "target_phase": "decision",
+                            "alias": "Accept Gate",
+                            "key": "accept-gate",
+                        },
+                    ],
+                }
+            ],
+            "outcome_policies": [
+                {
+                    "name": "review-outcomes",
+                    "description": "Authoring-only outcome policy.",
+                    "emitters": ["reviewer", "user"],
+                    "actions": ["decide"],
+                    "outcomes": ["retry", "accept"],
+                }
+            ],
+            "transitions": [
+                {"from": "review", "to": "review", "on": "retry"},
+                {"from": "review", "to": "decision", "on": "accept"},
+            ],
+            "outcomes": ["retry", "accept"],
+        }
+    )
+
+    assert proto.gates[0].name == "review-gate"
+    assert proto.gates[0].authoring_only is True
+    assert proto.gates[0].routes[0].outcome == "retry"
+    assert proto.gates[0].routes[0].target_phase == "review"
+    assert proto.outcome_policies[0].name == "review-outcomes"
+    assert proto.outcome_policies[0].authoring_only is True
+    assert proto.outcome_policies[0].emitters == ["reviewer", "user"]
+    assert proto.phases[0].gate == "review-gate"
+    assert proto.phases[0].outcome_policy == "review-outcomes"
+
+
+def test_protocol_rejects_unknown_authoring_gate_reference():
+    with pytest.raises(ValueError, match="unknown authoring gate"):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [{"name": "review", "gate": "missing-gate"}],
+                "gates": [{"name": "review-gate", "routes": []}],
+            }
+        )
+
+
+def test_protocol_rejects_unknown_outcome_policy_reference():
+    with pytest.raises(ValueError, match="unknown outcome_policy"):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [{"name": "review", "outcome_policy": "missing-policy"}],
+                "outcome_policies": [{"name": "review-outcomes"}],
+            }
+        )
+
+
+def test_protocol_keeps_existing_transition_only_yaml_compatible():
+    proto = Protocol.model_validate(
+        {
+            "name": "review-loop",
+            "phases": [{"name": "review", "actions": ["contribute"]}],
+            "transitions": [{"from": "review", "to": "review", "on": "retry"}],
+            "outcomes": ["retry", "accept"],
+        }
+    )
+
+    assert proto.gates == []
+    assert proto.outcome_policies == []
+    assert proto.phases[0].gate is None
+    assert proto.phases[0].outcome_policy is None
