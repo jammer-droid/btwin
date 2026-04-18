@@ -125,6 +125,10 @@ class ProtocolPhase(BaseModel):
     guidance: str | None = None
     decided_by: Literal["user", "consensus", "vote"] | None = None
     cycle: CycleConfig | None = None
+    declared_guards: list[str] = Field(default_factory=list, exclude=True)
+    outcome_emitters: list[str] = Field(default_factory=list, exclude=True)
+    outcome_actions: list[str] = Field(default_factory=list, exclude=True)
+    policy_outcomes: list[str] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="after")
     def normalize_actions(self) -> "ProtocolPhase":
@@ -284,6 +288,279 @@ class Protocol(BaseModel):
                 return outcome_policy
         return None
 
+
+class ProtocolAuthoringDocument(BaseModel):
+    name: str
+    description: str = ""
+    phases: list[ProtocolPhase]
+    interaction: ProtocolInteraction = Field(default_factory=ProtocolInteraction)
+    roles: list[str] = []
+    guard_sets: list[ProtocolGuardSet] = []
+    gates: list[ProtocolAuthoringGate] = []
+    outcome_policies: list[ProtocolOutcomePolicy] = []
+    transitions: list[ProtocolTransition] = []
+    outcomes: list[str] = []
+
+
+class ProtocolValidationLayerError(ValueError):
+    """Human-readable protocol validation error with layer context."""
+
+    def __init__(
+        self,
+        layer: Literal["schema", "semantic", "normalization"],
+        detail: str,
+    ) -> None:
+        self.layer = layer
+        self.detail = detail
+        super().__init__(f"{layer} validation failed: {detail}")
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    parts = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg", "invalid value"))
+        parts.append(f"{location}: {message}" if location else message)
+    return "; ".join(parts) or str(exc)
+
+
+def _phase_map(phases: list[ProtocolPhase]) -> dict[str, ProtocolPhase]:
+    return {phase.name: phase for phase in phases}
+
+
+def _validate_protocol_semantics(protocol: ProtocolAuthoringDocument) -> None:
+    phase_names = {phase.name for phase in protocol.phases}
+    declared_outcomes = set(protocol.outcomes)
+    guard_set_names = {guard_set.name for guard_set in protocol.guard_sets}
+    if len(guard_set_names) != len(protocol.guard_sets):
+        raise ProtocolValidationLayerError(
+            "semantic",
+            "duplicate guard_set name values are not allowed",
+        )
+    gate_names = {gate.name for gate in protocol.gates}
+    if len(gate_names) != len(protocol.gates):
+        raise ProtocolValidationLayerError(
+            "semantic",
+            "duplicate gate name values are not allowed",
+        )
+    outcome_policy_names = {
+        outcome_policy.name for outcome_policy in protocol.outcome_policies
+    }
+    if len(outcome_policy_names) != len(protocol.outcome_policies):
+        raise ProtocolValidationLayerError(
+            "semantic",
+            "duplicate outcome_policy name values are not allowed",
+        )
+
+    explicit_transitions: dict[tuple[str, str], list[ProtocolTransition]] = {}
+    for transition in protocol.transitions:
+        if transition.on is None:
+            continue
+        explicit_transitions.setdefault((transition.from_phase, transition.on), []).append(
+            transition
+        )
+
+    for gate in protocol.gates:
+        route_outcomes: set[str] = set()
+        for route in gate.routes:
+            if route.outcome in route_outcomes:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    f"gate '{gate.name}' defines duplicate routes for outcome '{route.outcome}'",
+                )
+            route_outcomes.add(route.outcome)
+            if route.target_phase not in phase_names:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    f"gate '{gate.name}' references unknown target_phase '{route.target_phase}'",
+                )
+            if declared_outcomes and route.outcome not in declared_outcomes:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    f"gate '{gate.name}' uses undeclared outcome '{route.outcome}'",
+                )
+
+    for outcome_policy in protocol.outcome_policies:
+        for outcome in outcome_policy.outcomes:
+            if declared_outcomes and outcome not in declared_outcomes:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    f"outcome_policy '{outcome_policy.name}' uses undeclared outcome '{outcome}'",
+                )
+
+    gate_map = {gate.name: gate for gate in protocol.gates}
+    for phase in protocol.phases:
+        if phase.guard_set is not None and phase.guard_set not in guard_set_names:
+            raise ProtocolValidationLayerError(
+                "semantic",
+                f"Phase '{phase.name}' references unknown guard_set '{phase.guard_set}'",
+            )
+        if phase.gate is not None and phase.gate not in gate_names:
+            raise ProtocolValidationLayerError(
+                "semantic",
+                f"Phase '{phase.name}' references unknown authoring gate '{phase.gate}'",
+            )
+        if (
+            phase.outcome_policy is not None
+            and phase.outcome_policy not in outcome_policy_names
+        ):
+            raise ProtocolValidationLayerError(
+                "semantic",
+                f"Phase '{phase.name}' references unknown outcome_policy '{phase.outcome_policy}'",
+            )
+        if phase.gate is None:
+            continue
+        gate = gate_map.get(phase.gate)
+        if gate is None:
+            continue
+        for route in gate.routes:
+            matching_transitions = explicit_transitions.get((phase.name, route.outcome), [])
+            if len(matching_transitions) > 1:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    "gate "
+                    f"'{gate.name}' route for phase '{phase.name}' and outcome "
+                    f"'{route.outcome}' has ambiguous canonical transitions",
+                )
+            if not matching_transitions:
+                continue
+            canonical_target = matching_transitions[0].to
+            if route.target_phase != canonical_target:
+                raise ProtocolValidationLayerError(
+                    "semantic",
+                    "gate "
+                    f"'{gate.name}' route for phase '{phase.name}' and outcome "
+                    f"'{route.outcome}' contradicts canonical transition target "
+                    f"'{canonical_target}'",
+                )
+
+
+def _append_unique(items: list[str], value: str | None) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _compile_protocol(protocol: ProtocolAuthoringDocument) -> Protocol:
+    guard_sets = {guard_set.name: guard_set for guard_set in protocol.guard_sets}
+    outcome_policies = {
+        outcome_policy.name: outcome_policy
+        for outcome_policy in protocol.outcome_policies
+    }
+
+    compiled_phases: list[ProtocolPhase] = []
+    for phase in protocol.phases:
+        compiled_phase = phase.model_copy(deep=True)
+        declared_guard_set = guard_sets.get(phase.guard_set or "")
+        compiled_phase.declared_guards = (
+            list(declared_guard_set.guards) if declared_guard_set is not None else []
+        )
+        declared_outcome_policy = outcome_policies.get(phase.outcome_policy or "")
+        if declared_outcome_policy is None:
+            compiled_phase.outcome_emitters = []
+            compiled_phase.outcome_actions = []
+            compiled_phase.policy_outcomes = []
+        else:
+            compiled_phase.outcome_emitters = list(declared_outcome_policy.emitters)
+            compiled_phase.outcome_actions = list(declared_outcome_policy.actions)
+            compiled_phase.policy_outcomes = list(declared_outcome_policy.outcomes)
+        compiled_phases.append(compiled_phase)
+
+    compiled_transitions = [transition.model_copy(deep=True) for transition in protocol.transitions]
+    transition_indexes: dict[tuple[str, str], list[int]] = {}
+    for index, transition in enumerate(compiled_transitions):
+        if transition.on is None:
+            continue
+        transition_indexes.setdefault((transition.from_phase, transition.on), []).append(index)
+
+    phase_lookup = _phase_map(protocol.phases)
+    for phase_name, phase in phase_lookup.items():
+        if phase.gate is None:
+            continue
+        gate = next((item for item in protocol.gates if item.name == phase.gate), None)
+        if gate is None:
+            continue
+        for route in gate.routes:
+            indexes = transition_indexes.get((phase_name, route.outcome), [])
+            if indexes:
+                index = indexes[0]
+                transition = compiled_transitions[index]
+                compiled_transitions[index] = transition.model_copy(
+                    update={
+                        "alias": transition.alias or route.alias,
+                        "key": transition.key or route.key,
+                    }
+                )
+                continue
+            compiled_transitions.append(
+                ProtocolTransition.model_validate(
+                    {
+                        "from": phase_name,
+                        "to": route.target_phase,
+                        "on": route.outcome,
+                        "alias": route.alias,
+                        "key": route.key,
+                    }
+                )
+            )
+
+    compiled_outcomes: list[str] = []
+    for outcome in protocol.outcomes:
+        _append_unique(compiled_outcomes, outcome)
+    for transition in compiled_transitions:
+        _append_unique(compiled_outcomes, transition.on)
+    for outcome_policy in protocol.outcome_policies:
+        for outcome in outcome_policy.outcomes:
+            _append_unique(compiled_outcomes, outcome)
+
+    compiled_payload = protocol.model_dump(exclude_none=True, by_alias=True)
+    compiled_payload["phases"] = [
+        phase.model_dump(exclude_none=True, by_alias=True) for phase in compiled_phases
+    ]
+    compiled_payload["transitions"] = [
+        transition.model_dump(exclude_none=True, by_alias=True)
+        for transition in compiled_transitions
+    ]
+    compiled_payload["outcomes"] = compiled_outcomes
+
+    try:
+        compiled_protocol = Protocol.model_validate(compiled_payload)
+    except ValidationError as exc:
+        raise ProtocolValidationLayerError(
+            "normalization",
+            _format_validation_error(exc),
+        ) from exc
+    compiled_phase_metadata = {
+        phase.name: phase for phase in compiled_phases
+    }
+    for phase in compiled_protocol.phases:
+        compiled_phase = compiled_phase_metadata.get(phase.name)
+        if compiled_phase is None:
+            continue
+        phase.declared_guards = list(compiled_phase.declared_guards)
+        phase.outcome_emitters = list(compiled_phase.outcome_emitters)
+        phase.outcome_actions = list(compiled_phase.outcome_actions)
+        phase.policy_outcomes = list(compiled_phase.policy_outcomes)
+    return compiled_protocol
+
+
+def compile_protocol_definition(data: Any) -> Protocol:
+    authoring_payload = (
+        data.model_dump(exclude_none=True, by_alias=True)
+        if isinstance(data, (Protocol, ProtocolAuthoringDocument))
+        else data
+    )
+    try:
+        authoring = ProtocolAuthoringDocument.model_validate(authoring_payload)
+    except ValidationError as exc:
+        raise ProtocolValidationLayerError("schema", _format_validation_error(exc)) from exc
+    _validate_protocol_semantics(authoring)
+    return _compile_protocol(authoring)
+
+
+def ensure_protocol_compiled(protocol: Protocol) -> Protocol:
+    return compile_protocol_definition(protocol)
+
+
 class ProtocolStore:
     """Read-only store for protocol YAML definitions."""
 
@@ -344,7 +621,7 @@ class ProtocolStore:
     def _load_file(self, path: Path) -> Protocol | None:
         try:
             data = load_protocol_yaml(path)
-            return Protocol.model_validate(data)
-        except (OSError, yaml.YAMLError, ValidationError):
-            logger.warning("Failed to load protocol: %s", path)
+            return compile_protocol_definition(data)
+        except (OSError, yaml.YAMLError, ValidationError, ProtocolValidationLayerError) as exc:
+            logger.warning("Failed to load protocol %s: %s", path, exc)
             return None
