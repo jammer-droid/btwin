@@ -186,13 +186,13 @@ class Protocol(BaseModel):
         }
         if len(outcome_policy_names) != len(self.outcome_policies):
             raise ValueError("duplicate outcome_policy name values are not allowed")
-        canonical_transitions: dict[tuple[str, str], set[str]] = {}
+        canonical_transitions: dict[tuple[str, str], list[ProtocolTransition]] = {}
         for transition in self.transitions:
             if transition.on is None:
                 continue
             canonical_transitions.setdefault(
-                (transition.from_phase, transition.on), set()
-            ).add(transition.to)
+                (transition.from_phase, transition.on), []
+            ).append(transition)
         for gate in self.gates:
             for route in gate.routes:
                 if route.target_phase not in phase_names:
@@ -231,21 +231,21 @@ class Protocol(BaseModel):
             if gate is None:
                 continue
             for route in gate.routes:
-                transition_targets = canonical_transitions.get((phase.name, route.outcome))
-                if not transition_targets:
+                matching_transitions = canonical_transitions.get((phase.name, route.outcome))
+                if not matching_transitions:
                     raise ValueError(
                         "gate "
                         f"'{gate.name}' route for phase '{phase.name}' and outcome "
                         f"'{route.outcome}' has no canonical transition"
                     )
-                if transition_targets and len(transition_targets) > 1:
+                if len(matching_transitions) > 1:
                     raise ValueError(
                         "gate "
                         f"'{gate.name}' route for phase '{phase.name}' and outcome "
                         f"'{route.outcome}' has ambiguous canonical transitions"
                     )
-                if transition_targets and route.target_phase not in transition_targets:
-                    canonical_target = sorted(transition_targets)[0]
+                canonical_target = matching_transitions[0].to
+                if route.target_phase != canonical_target:
                     raise ValueError(
                         "gate "
                         f"'{gate.name}' route for phase '{phase.name}' and outcome "
