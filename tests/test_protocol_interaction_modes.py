@@ -123,6 +123,33 @@ outcomes: [accept]
     assert proto.transitions[0].on == "accept"
 
 
+def test_protocol_store_does_not_treat_true_transition_key_as_on(tmp_path: Path):
+    path = tmp_path / "protocols"
+    path.mkdir()
+    (path / "custom-review.yaml").write_text(
+        """
+name: custom-review
+phases:
+  - name: review
+    actions: [contribute]
+  - name: decision
+    actions: [decide]
+transitions:
+  - from: review
+    to: decision
+    true: accept
+outcomes: [accept]
+""",
+        encoding="utf-8",
+    )
+
+    store = ProtocolStore(path)
+    proto = store.get_protocol("custom-review")
+
+    assert proto is not None
+    assert proto.transitions[0].on is None
+
+
 def test_protocol_rejects_unknown_guard_set_reference():
     with pytest.raises(ValidationError, match="guard_set"):
         Protocol.model_validate(

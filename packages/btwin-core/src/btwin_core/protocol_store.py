@@ -18,37 +18,30 @@ SUPPORTED_PROTOCOL_GUARDS = {
 }
 
 
-def _normalize_protocol_yaml_data(data: Any) -> Any:
-    if not isinstance(data, dict):
-        return data
+def _build_protocol_yaml_loader() -> type[yaml.SafeLoader]:
+    class ProtocolYamlLoader(yaml.SafeLoader):
+        pass
 
-    transitions = data.get("transitions")
-    if not isinstance(transitions, list):
-        return data
+    ProtocolYamlLoader.yaml_implicit_resolvers = {
+        key: list(resolvers)
+        for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    for key in ("o", "O"):
+        ProtocolYamlLoader.yaml_implicit_resolvers[key] = [
+            resolver
+            for resolver in ProtocolYamlLoader.yaml_implicit_resolvers.get(key, [])
+            if resolver[0] != "tag:yaml.org,2002:bool"
+        ]
+    return ProtocolYamlLoader
 
-    normalized_transitions: list[Any] = []
-    changed = False
-    for transition in transitions:
-        if isinstance(transition, dict) and True in transition and "on" not in transition:
-            normalized_transition = dict(transition)
-            normalized_transition["on"] = normalized_transition.pop(True)
-            normalized_transitions.append(normalized_transition)
-            changed = True
-        else:
-            normalized_transitions.append(transition)
 
-    if not changed:
-        return data
-
-    normalized = dict(data)
-    normalized["transitions"] = normalized_transitions
-    return normalized
+ProtocolYamlLoader = _build_protocol_yaml_loader()
 
 
 def load_protocol_yaml(path: Path) -> Any:
     """Load protocol YAML while preserving bare `on:` transition keys."""
     raw = path.read_text(encoding="utf-8")
-    return _normalize_protocol_yaml_data(yaml.safe_load(raw))
+    return yaml.load(raw, Loader=ProtocolYamlLoader)
 
 
 class ProtocolSection(BaseModel):
