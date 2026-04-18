@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,17 +16,39 @@ SUPPORTED_PROTOCOL_GUARDS = {
     "direct_target_eligibility",
     "transition_precondition",
 }
-_PROTOCOL_ON_KEY_PATTERN = re.compile(
-    r'^(?P<prefix>\s*(?:-\s+)?)on(?P<suffix>\s*:)',
-    re.MULTILINE,
-)
+
+
+def _normalize_protocol_yaml_data(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+
+    transitions = data.get("transitions")
+    if not isinstance(transitions, list):
+        return data
+
+    normalized_transitions: list[Any] = []
+    changed = False
+    for transition in transitions:
+        if isinstance(transition, dict) and True in transition and "on" not in transition:
+            normalized_transition = dict(transition)
+            normalized_transition["on"] = normalized_transition.pop(True)
+            normalized_transitions.append(normalized_transition)
+            changed = True
+        else:
+            normalized_transitions.append(transition)
+
+    if not changed:
+        return data
+
+    normalized = dict(data)
+    normalized["transitions"] = normalized_transitions
+    return normalized
 
 
 def load_protocol_yaml(path: Path) -> Any:
     """Load protocol YAML while preserving bare `on:` transition keys."""
     raw = path.read_text(encoding="utf-8")
-    normalized = _PROTOCOL_ON_KEY_PATTERN.sub(r'\g<prefix>"on"\g<suffix>', raw)
-    return yaml.safe_load(normalized)
+    return _normalize_protocol_yaml_data(yaml.safe_load(raw))
 
 
 class ProtocolSection(BaseModel):

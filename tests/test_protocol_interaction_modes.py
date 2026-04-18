@@ -33,7 +33,7 @@ interaction:
     assert proto.interaction.default_actor == "user"
 
 
-def test_protocol_store_preserves_unquoted_on_transition_keys(tmp_path: Path):
+def test_protocol_store_preserves_unquoted_on_transition_keys_in_block_mappings(tmp_path: Path):
     path = tmp_path / "protocols"
     path.mkdir()
     (path / "custom-review.yaml").write_text(
@@ -61,6 +61,66 @@ outcomes: [retry, accept]
 
     assert proto is not None
     assert [transition.on for transition in proto.transitions] == ["retry", "accept"]
+
+
+def test_protocol_store_preserves_unquoted_on_transition_keys_in_flow_mappings(tmp_path: Path):
+    path = tmp_path / "protocols"
+    path.mkdir()
+    (path / "custom-review.yaml").write_text(
+        """
+name: custom-review
+phases:
+  - name: review
+    actions: [contribute]
+  - name: decision
+    actions: [decide]
+transitions:
+  - {from: review, to: review, on: retry}
+  - {from: review, to: decision, on: accept}
+outcomes: [retry, accept]
+""",
+        encoding="utf-8",
+    )
+
+    store = ProtocolStore(path)
+    proto = store.get_protocol("custom-review")
+
+    assert proto is not None
+    assert [transition.on for transition in proto.transitions] == ["retry", "accept"]
+
+
+def test_protocol_store_does_not_mutate_block_scalar_lines_starting_with_on(tmp_path: Path):
+    path = tmp_path / "protocols"
+    path.mkdir()
+    (path / "custom-review.yaml").write_text(
+        """
+name: custom-review
+phases:
+  - name: review
+    actions: [contribute]
+    guidance: |
+      Keep the checklist exactly as written.
+      on: this line is literal guidance, not a transition key
+  - name: decision
+    actions: [decide]
+transitions:
+  - from: review
+    to: decision
+    on: accept
+outcomes: [accept]
+""",
+        encoding="utf-8",
+    )
+
+    store = ProtocolStore(path)
+    proto = store.get_protocol("custom-review")
+
+    assert proto is not None
+    assert proto.phases[0].guidance == (
+        "Keep the checklist exactly as written.\n"
+        "on: this line is literal guidance, not a transition key\n"
+    )
+    assert proto.transitions[0].on == "accept"
 
 
 def test_protocol_rejects_unknown_guard_set_reference():
