@@ -20,6 +20,24 @@ class ScenarioTraceCheckpoint:
 
 
 @dataclass(frozen=True)
+class ScenarioVisualExpectation:
+    key: str
+    label: str
+    status: str
+    target_phase: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "key": self.key,
+            "label": self.label,
+            "status": self.status,
+        }
+        if self.target_phase is not None:
+            payload["target_phase"] = self.target_phase
+        return payload
+
+
+@dataclass(frozen=True)
 class ScenarioFixture:
     scenario_id: str
     protocol_name: str
@@ -32,6 +50,8 @@ class ScenarioFixture:
     outcome: str | None
     target_phase: str | None
     cycle_index_changes: tuple[tuple[int, int], ...]
+    visual_procedure: tuple[ScenarioVisualExpectation, ...] = ()
+    visual_gates: tuple[ScenarioVisualExpectation, ...] = ()
 
 
 def _review_loop_protocol_definition() -> dict[str, object]:
@@ -75,6 +95,8 @@ def _fixture(
     outcome: str | None,
     target_phase: str | None,
     cycle_index_changes: tuple[tuple[int, int], ...],
+    visual_procedure: tuple[ScenarioVisualExpectation, ...] = (),
+    visual_gates: tuple[ScenarioVisualExpectation, ...] = (),
 ) -> ScenarioFixture:
     return ScenarioFixture(
         scenario_id=scenario_id,
@@ -88,6 +110,8 @@ def _fixture(
         outcome=outcome,
         target_phase=target_phase,
         cycle_index_changes=cycle_index_changes,
+        visual_procedure=visual_procedure,
+        visual_gates=visual_gates,
     )
 
 
@@ -145,6 +169,24 @@ _SCENARIOS: dict[str, ScenarioFixture] = {
         outcome="retry",
         target_phase="review",
         cycle_index_changes=((1, 2), (2, 3)),
+        visual_procedure=(
+            ScenarioVisualExpectation(key="review-pass", label="Review", status="active"),
+            ScenarioVisualExpectation(key="revise-pass", label="Revise", status="pending"),
+        ),
+        visual_gates=(
+            ScenarioVisualExpectation(
+                key="retry-loop",
+                label="Retry Gate",
+                status="completed",
+                target_phase="review",
+            ),
+            ScenarioVisualExpectation(
+                key="accept-gate",
+                label="Accept Gate",
+                status="pending",
+                target_phase="decision",
+            ),
+        ),
     ),
     "blocked_stop_missing_contribution": _fixture(
         scenario_id="blocked_stop_missing_contribution",

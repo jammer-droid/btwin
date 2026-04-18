@@ -208,6 +208,10 @@ uv run --project "${REPO_ROOT}" python - <<'PY'
 import json
 import os
 
+from tests.protocol_scenario_matrix import get_scenario
+
+scenario = get_scenario("retry_same_phase")
+
 thread = json.loads(os.environ["JSON_PAYLOAD_THREAD"])
 bind = json.loads(os.environ["JSON_PAYLOAD_BIND"])
 current = json.loads(os.environ["JSON_PAYLOAD_CURRENT"])
@@ -246,12 +250,8 @@ assert phase_cycle["visual"]["procedure"][0]["key"] == "review-pass", phase_cycl
 assert phase_cycle["visual"]["procedure"][0]["label"] == "Review", phase_cycle
 assert phase_cycle["visual"]["procedure"][1]["key"] == "revise-pass", phase_cycle
 assert phase_cycle["visual"]["procedure"][1]["label"] == "Revise", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["key"] == "retry-loop", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["label"] == "Retry Gate", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["target_phase"] == "review", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["key"] == "accept-gate", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["label"] == "Accept Gate", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["target_phase"] == "decision", phase_cycle
+assert phase_cycle["visual"]["gates"][0] == scenario.visual_gates[0].as_dict(), phase_cycle
+assert phase_cycle["visual"]["gates"][1] == scenario.visual_gates[1].as_dict(), phase_cycle
 assert mailbox["count"] == 2, mailbox
 assert [report["cycle_index"] for report in mailbox["reports"]] == [2, 1], mailbox
 assert [report["next_cycle_index"] for report in mailbox["reports"]] == [3, 2], mailbox

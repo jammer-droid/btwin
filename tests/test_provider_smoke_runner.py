@@ -841,18 +841,8 @@ def test_attached_scenario_repeats_same_phase_across_multiple_cycles(provider_sm
         "label": "Revise",
         "status": "pending",
     }
-    assert phase_cycle_payload["visual"]["gates"][0] == {
-        "key": "retry-loop",
-        "label": "Retry Gate",
-        "status": "completed",
-        "target_phase": "review",
-    }
-    assert phase_cycle_payload["visual"]["gates"][1] == {
-        "key": "accept-gate",
-        "label": "Accept Gate",
-        "status": "pending",
-        "target_phase": "decision",
-    }
+    assert phase_cycle_payload["visual"]["gates"][0] == scenario.visual_gates[0].as_dict()
+    assert phase_cycle_payload["visual"]["gates"][1] == scenario.visual_gates[1].as_dict()
     assert scenario.gate_key == "retry-loop"
     assert scenario.procedure_key == "review-pass"
     assert scenario.outcome == "retry"
