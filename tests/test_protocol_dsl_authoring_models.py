@@ -13,7 +13,8 @@ def test_protocol_accepts_authoring_only_gate_and_outcome_policy_objects():
                     "actions": ["contribute"],
                     "gate": "review-gate",
                     "outcome_policy": "review-outcomes",
-                }
+                },
+                {"name": "decision", "actions": ["decide"]},
             ],
             "gates": [
                 {
@@ -81,6 +82,82 @@ def test_protocol_rejects_unknown_outcome_policy_reference():
                 "name": "review-loop",
                 "phases": [{"name": "review", "outcome_policy": "missing-policy"}],
                 "outcome_policies": [{"name": "review-outcomes"}],
+            }
+        )
+
+
+def test_protocol_rejects_authoring_gate_route_with_unknown_target_phase():
+    with pytest.raises(ValueError, match="unknown target_phase 'missing-phase'"):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [{"name": "review", "gate": "review-gate"}],
+                "gates": [
+                    {
+                        "name": "review-gate",
+                        "routes": [{"outcome": "retry", "target_phase": "missing-phase"}],
+                    }
+                ],
+                "transitions": [{"from": "review", "to": "review", "on": "retry"}],
+                "outcomes": ["retry"],
+            }
+        )
+
+
+def test_protocol_rejects_authoring_gate_route_with_outcome_outside_top_level_outcomes():
+    with pytest.raises(ValueError, match="gate 'review-gate' uses undeclared outcome 'accept'"):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [{"name": "review", "gate": "review-gate"}],
+                "gates": [
+                    {
+                        "name": "review-gate",
+                        "routes": [{"outcome": "accept", "target_phase": "review"}],
+                    }
+                ],
+                "transitions": [{"from": "review", "to": "review", "on": "retry"}],
+                "outcomes": ["retry"],
+            }
+        )
+
+
+def test_protocol_rejects_outcome_policy_outcome_outside_top_level_outcomes():
+    with pytest.raises(
+        ValueError, match="outcome_policy 'review-outcomes' uses undeclared outcome 'accept'"
+    ):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [{"name": "review", "outcome_policy": "review-outcomes"}],
+                "outcome_policies": [
+                    {"name": "review-outcomes", "outcomes": ["accept"]}
+                ],
+                "outcomes": ["retry"],
+            }
+        )
+
+
+def test_protocol_rejects_authoring_gate_route_that_conflicts_with_transition():
+    with pytest.raises(
+        ValueError,
+        match="gate 'review-gate' route for phase 'review' and outcome 'retry' contradicts canonical transition target 'review'",
+    ):
+        Protocol.model_validate(
+            {
+                "name": "review-loop",
+                "phases": [
+                    {"name": "review", "gate": "review-gate"},
+                    {"name": "decision"},
+                ],
+                "gates": [
+                    {
+                        "name": "review-gate",
+                        "routes": [{"outcome": "retry", "target_phase": "decision"}],
+                    }
+                ],
+                "transitions": [{"from": "review", "to": "review", "on": "retry"}],
+                "outcomes": ["retry"],
             }
         )
 

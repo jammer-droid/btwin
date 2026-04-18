@@ -173,6 +173,8 @@ class Protocol(BaseModel):
 
     @model_validator(mode="after")
     def validate_authoring_references(self) -> "Protocol":
+        phase_names = {phase.name for phase in self.phases}
+        declared_outcomes = set(self.outcomes)
         guard_set_names = {guard_set.name for guard_set in self.guard_sets}
         if len(guard_set_names) != len(self.guard_sets):
             raise ValueError("duplicate guard_set name values are not allowed")
@@ -184,6 +186,29 @@ class Protocol(BaseModel):
         }
         if len(outcome_policy_names) != len(self.outcome_policies):
             raise ValueError("duplicate outcome_policy name values are not allowed")
+        canonical_transitions: dict[tuple[str, str], set[str]] = {}
+        for transition in self.transitions:
+            if transition.on is None:
+                continue
+            canonical_transitions.setdefault(
+                (transition.from_phase, transition.on), set()
+            ).add(transition.to)
+        for gate in self.gates:
+            for route in gate.routes:
+                if route.target_phase not in phase_names:
+                    raise ValueError(
+                        f"gate '{gate.name}' references unknown target_phase '{route.target_phase}'"
+                    )
+                if route.outcome not in declared_outcomes:
+                    raise ValueError(
+                        f"gate '{gate.name}' uses undeclared outcome '{route.outcome}'"
+                    )
+        for outcome_policy in self.outcome_policies:
+            for outcome in outcome_policy.outcomes:
+                if outcome not in declared_outcomes:
+                    raise ValueError(
+                        f"outcome_policy '{outcome_policy.name}' uses undeclared outcome '{outcome}'"
+                    )
         for phase in self.phases:
             if phase.guard_set is not None and phase.guard_set not in guard_set_names:
                 raise ValueError(
@@ -200,6 +225,21 @@ class Protocol(BaseModel):
                 raise ValueError(
                     f"Phase '{phase.name}' references unknown outcome_policy '{phase.outcome_policy}'"
                 )
+            if phase.gate is None:
+                continue
+            gate = self.get_gate(phase.gate)
+            if gate is None:
+                continue
+            for route in gate.routes:
+                transition_targets = canonical_transitions.get((phase.name, route.outcome))
+                if transition_targets and route.target_phase not in transition_targets:
+                    canonical_target = sorted(transition_targets)[0]
+                    raise ValueError(
+                        "gate "
+                        f"'{gate.name}' route for phase '{phase.name}' and outcome "
+                        f"'{route.outcome}' contradicts canonical transition target "
+                        f"'{canonical_target}'"
+                    )
         return self
 
     def get_guard_set(self, name: str | None) -> ProtocolGuardSet | None:

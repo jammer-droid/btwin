@@ -228,7 +228,8 @@ def test_protocol_authoring_gate_and_outcome_policy_round_trip_through_store(tmp
                         {"role": "reviewer", "action": "review", "alias": "Review"},
                         {"role": "implementer", "action": "revise", "alias": "Revise"},
                     ],
-                )
+                ),
+                ProtocolPhase(name="decision", actions=["decide"]),
             ],
             transitions=[ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"})],
             outcomes=["retry", "accept"],
