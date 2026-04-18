@@ -104,39 +104,18 @@ from pathlib import Path
 
 import yaml
 
-protocol = {
-    "name": "attached-helper-smoke",
-    "description": "Minimal protocol for attached helper smoke",
-    "outcomes": ["retry", "accept"],
-    "phases": [
-        {
-            "name": "review",
-            "actions": ["contribute", "discuss"],
-            "template": [{"section": "completed", "required": True}],
-            "procedure": [
-                {"key": "review-pass", "role": "reviewer", "action": "review", "alias": "Review"},
-                {"key": "revise-pass", "role": "implementer", "action": "revise", "alias": "Revise"},
-            ],
-        },
-        {
-            "name": "decision",
-            "actions": ["discuss"],
-        },
-    ],
-    "transitions": [
-        {"key": "retry-loop", "from": "review", "to": "review", "on": "retry", "alias": "Retry Gate"},
-        {"key": "accept-loop", "from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate"},
-    ],
-}
+from tests.protocol_scenario_matrix import scenario_protocol_definition
+
+protocol = scenario_protocol_definition("retry_same_phase")
 
 for env_var in ("BTWIN_ATTACHED_SMOKE_DATA_PROTOCOLS_DIR", "BTWIN_ATTACHED_SMOKE_PROJECT_PROTOCOLS_DIR"):
-    path = Path(os.environ[env_var]) / "attached-helper-smoke.yaml"
+    path = Path(os.environ[env_var]) / "review-loop.yaml"
     path.write_text(yaml.safe_dump(protocol, sort_keys=False), encoding="utf-8")
 PY
 
 echo "Running attached helper flow..."
 run_btwin agent create alice --provider codex --role implementer --model gpt-5 >/dev/null
-THREAD_JSON="$(run_btwin thread create --topic "Attached helper smoke" --protocol attached-helper-smoke --participant alice --json)"
+THREAD_JSON="$(run_btwin thread create --topic "Attached helper smoke" --protocol review-loop --participant alice --json)"
 THREAD_ID="$(JSON_PAYLOAD="${THREAD_JSON}" run_python -c 'import json, os; print(json.loads(os.environ["JSON_PAYLOAD"])["thread_id"])')"
 RUN_BIND_JSON="$(run_btwin runtime bind --thread "${THREAD_ID}" --agent alice --json)"
 run_btwin live attach --thread "${THREAD_ID}" --agent alice --json >/dev/null
@@ -229,6 +208,10 @@ uv run --project "${REPO_ROOT}" python - <<'PY'
 import json
 import os
 
+from tests.protocol_scenario_matrix import get_scenario
+
+scenario = get_scenario("retry_same_phase")
+
 thread = json.loads(os.environ["JSON_PAYLOAD_THREAD"])
 bind = json.loads(os.environ["JSON_PAYLOAD_BIND"])
 current = json.loads(os.environ["JSON_PAYLOAD_CURRENT"])
@@ -267,12 +250,8 @@ assert phase_cycle["visual"]["procedure"][0]["key"] == "review-pass", phase_cycl
 assert phase_cycle["visual"]["procedure"][0]["label"] == "Review", phase_cycle
 assert phase_cycle["visual"]["procedure"][1]["key"] == "revise-pass", phase_cycle
 assert phase_cycle["visual"]["procedure"][1]["label"] == "Revise", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["key"] == "retry-loop", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["label"] == "Retry Gate", phase_cycle
-assert phase_cycle["visual"]["gates"][0]["target_phase"] == "review", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["key"] == "accept-loop", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["label"] == "Accept Gate", phase_cycle
-assert phase_cycle["visual"]["gates"][1]["target_phase"] == "decision", phase_cycle
+assert phase_cycle["visual"]["gates"][0] == scenario.visual_gates[0].as_dict(), phase_cycle
+assert phase_cycle["visual"]["gates"][1] == scenario.visual_gates[1].as_dict(), phase_cycle
 assert mailbox["count"] == 2, mailbox
 assert [report["cycle_index"] for report in mailbox["reports"]] == [2, 1], mailbox
 assert [report["next_cycle_index"] for report in mailbox["reports"]] == [3, 2], mailbox
