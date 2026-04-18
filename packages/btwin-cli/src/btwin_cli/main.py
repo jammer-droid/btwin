@@ -344,23 +344,25 @@ def _try_load_thread_snapshot(thread_id: str, config: BTwinConfig) -> tuple[dict
 
 
 def _thread_watch_kind_for_event(event_type: str) -> str:
-    if event_type == "hook_received":
-        return "hook_check"
-    if event_type == "hook_decision":
-        return "hook_decision"
     if event_type == "phase_attempt_started":
-        return "phase_attempt"
-    if event_type == "phase_exit_check_requested":
-        return "phase_exit_check"
+        return "attempt"
+    if event_type in {"hook_received", "hook_decision", "phase_exit_check_requested", "phase_exit_blocked"}:
+        return "guard"
     if event_type == "required_result_recorded":
-        return "required_result"
-    if event_type == "phase_exit_blocked":
-        return "phase_blocked"
-    if event_type == "runtime_binding_closed":
-        return "runtime_binding"
+        return "result"
     if event_type == "cycle_gate_completed":
-        return "cycle_gate"
-    return event_type or "event"
+        return "gate"
+    if event_type.startswith("runtime_"):
+        return "runtime"
+    if event_type.startswith("phase_"):
+        return "phase"
+    if "gate" in event_type:
+        return "gate"
+    if "result" in event_type:
+        return "result"
+    if "hook" in event_type or "guard" in event_type:
+        return "guard"
+    return "phase"
 
 
 def _build_thread_watch_trace_rows(
@@ -451,65 +453,110 @@ def _render_thread_watch(
     if trace_rows:
         lines.append("")
         for row in trace_rows:
-            timestamp = str(row.get("timestamp", ""))
-            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-            lane, headline, headline_style = _workflow_event_heading(row)
-            agent = row.get("agent")
-            phase = row.get("phase")
-            reason = row.get("reason")
-            session_id = row.get("session_id")
-            turn_id = row.get("turn_id")
-            lines.append(_style_hud_line(f"{time_label}  {lane}  {headline}", headline_style))
-            details = []
-            if agent:
-                details.append(f"agent: {agent}")
-            if phase:
-                details.append(f"phase: {phase}")
-            cycle_index = row.get("cycle_index")
-            next_cycle_index = row.get("next_cycle_index")
-            if isinstance(cycle_index, int):
-                cycle_text = f"cycle: {cycle_index}"
-                if isinstance(next_cycle_index, int):
-                    cycle_text += f" -> {next_cycle_index}"
-                details.append(cycle_text)
-            outcome = row.get("outcome")
-            if outcome:
-                details.append(f"outcome: {outcome}")
-            if reason:
-                details.append(f"reason: {reason}")
-            if details:
-                lines.append(f"          {'  '.join(details)}")
-            protocol_details = []
-            procedure_alias = row.get("procedure_alias")
-            procedure_key = row.get("procedure_key")
-            if procedure_alias or procedure_key:
-                label = str(procedure_alias or procedure_key)
-                if procedure_alias and procedure_key:
-                    label = f"{procedure_alias} [{procedure_key}]"
-                protocol_details.append(f"procedure: {label}")
-            gate_alias = row.get("gate_alias")
-            gate_key = row.get("gate_key")
-            if gate_alias or gate_key:
-                label = str(gate_alias or gate_key)
-                if gate_alias and gate_key:
-                    label = f"{gate_alias} [{gate_key}]"
-                protocol_details.append(f"gate: {label}")
-            target_phase = row.get("target_phase")
-            if target_phase:
-                protocol_details.append(f"target: {target_phase}")
-            if protocol_details:
-                lines.append(f"          {'  '.join(protocol_details)}")
-            ids = []
-            if session_id:
-                ids.append(f"session: {session_id}")
-            if turn_id:
-                ids.append(f"turn: {turn_id}")
-            if ids:
-                lines.append(f"          {'  '.join(ids)}")
-            summary = row.get("summary")
-            if summary:
-                lines.append(f"          summary: {summary}")
+            lines.extend(_render_trace_row_lines(row))
     return "\n".join(lines)
+
+
+def _render_hud_thread_snapshot(
+    thread: dict[str, object],
+    status_summary: dict[str, object],
+    trace_rows: list[dict[str, object]],
+) -> list[str]:
+    config = _get_config()
+    thread_id = str(thread.get("thread_id", ""))
+    lines = [
+        f"Thread  {thread_id}  {thread.get('protocol')}  phase={thread.get('current_phase')}",
+    ]
+    runtime_sessions = {
+        agent_name: session
+        for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
+    }
+    agents = status_summary.get("agents", [])
+    if isinstance(agents, list) and agents:
+        parts = []
+        for agent in agents:
+            if isinstance(agent, dict):
+                agent_name = str(agent.get("name") or "")
+                part = f"{agent_name}={agent.get('status')}"
+                runtime_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
+                if runtime_summary:
+                    part += f" ({runtime_summary})"
+                parts.append(part)
+        if parts:
+            lines.append(f"Agents  {', '.join(parts)}")
+    topic = thread.get("topic")
+    if topic:
+        lines.append(f"Topic   {topic}")
+    runtime_lines = _render_thread_runtime_diagnostics(thread_id, config)
+    if runtime_lines:
+        lines.extend(["", "Runtime"])
+        lines.extend(runtime_lines)
+    if trace_rows:
+        lines.extend(["", "Latest"])
+        lines.extend(_render_trace_row_lines(trace_rows[-1]))
+    return lines
+
+
+def _render_trace_row_lines(row: dict[str, object]) -> list[str]:
+    timestamp = str(row.get("timestamp", ""))
+    time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
+    lane, headline, headline_style = _workflow_event_heading(row)
+    agent = row.get("agent")
+    phase = row.get("phase")
+    reason = row.get("reason")
+    session_id = row.get("session_id")
+    turn_id = row.get("turn_id")
+    lines = [_style_hud_line(f"{time_label}  {lane}  {headline}", headline_style)]
+    details = []
+    if agent:
+        details.append(f"agent: {agent}")
+    if phase:
+        details.append(f"phase: {phase}")
+    cycle_index = row.get("cycle_index")
+    next_cycle_index = row.get("next_cycle_index")
+    if isinstance(cycle_index, int):
+        cycle_text = f"cycle: {cycle_index}"
+        if isinstance(next_cycle_index, int):
+            cycle_text += f" -> {next_cycle_index}"
+        details.append(cycle_text)
+    outcome = row.get("outcome")
+    if outcome:
+        details.append(f"outcome: {outcome}")
+    if reason:
+        details.append(f"reason: {reason}")
+    if details:
+        lines.append(f"          {'  '.join(details)}")
+    protocol_details = []
+    procedure_alias = row.get("procedure_alias")
+    procedure_key = row.get("procedure_key")
+    if procedure_alias or procedure_key:
+        label = str(procedure_alias or procedure_key)
+        if procedure_alias and procedure_key:
+            label = f"{procedure_alias} [{procedure_key}]"
+        protocol_details.append(f"procedure: {label}")
+    gate_alias = row.get("gate_alias")
+    gate_key = row.get("gate_key")
+    if gate_alias or gate_key:
+        label = str(gate_alias or gate_key)
+        if gate_alias and gate_key:
+            label = f"{gate_alias} [{gate_key}]"
+        protocol_details.append(f"gate: {label}")
+    target_phase = row.get("target_phase")
+    if target_phase:
+        protocol_details.append(f"target: {target_phase}")
+    if protocol_details:
+        lines.append(f"          {'  '.join(protocol_details)}")
+    ids = []
+    if session_id:
+        ids.append(f"session: {session_id}")
+    if turn_id:
+        ids.append(f"turn: {turn_id}")
+    if ids:
+        lines.append(f"          {'  '.join(ids)}")
+    summary = row.get("summary")
+    if summary:
+        lines.append(f"          summary: {summary}")
+    return lines
 
 
 def _truncate_hud_text(value: str, limit: int = 120) -> str:
@@ -940,7 +987,7 @@ def _render_hud(thread_id: str | None, limit: int, animation_phase: int | None =
         status_summary,
         _workflow_event_log(target_thread_id).list_events(limit=limit),
     )
-    lines.append(_render_thread_watch(thread, status_summary, trace_payload["trace"]))
+    lines.extend(_render_hud_thread_snapshot(thread, status_summary, trace_payload["trace"]))
     phase_cycle_payload = _phase_cycle_payload_for_thread(
         target_thread_id,
         thread=thread,
@@ -4067,11 +4114,11 @@ def thread_show(
 def thread_watch(
     thread_id: str = typer.Argument(..., help="Thread id"),
     limit: int = typer.Option(10, "--limit", min=1, help="Number of recent workflow events to show"),
-    follow: bool = typer.Option(False, "--follow", help="Poll and redraw the thread HUD"),
+    follow: bool = typer.Option(False, "--follow", help="Poll and redraw the thread timeline"),
     as_json: bool = typer.Option(False, "--json", help="Output normalized JSON trace"),
     interval: float = typer.Option(1.0, "--interval", min=0.2, help="Poll interval in seconds"),
 ):
-    """Show a compact workflow HUD for one thread."""
+    """Show a thread workflow timeline."""
 
     if follow and as_json:
         raise typer.BadParameter("--json cannot be used with --follow")

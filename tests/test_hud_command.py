@@ -89,6 +89,53 @@ def test_hud_with_binding_shows_bound_thread_and_recent_events(tmp_path, monkeyp
     assert "Stop allowed." in result.output
 
 
+def test_hud_keeps_only_compact_latest_event_snapshot(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store = ThreadStore(project_root / ".btwin" / "threads")
+    thread = thread_store.create_thread(
+        topic="HUD compact thread",
+        protocol="debate",
+        participants=["alice"],
+        initial_phase="context",
+    )
+    RuntimeBindingStore(project_root / ".btwin").bind(thread["thread_id"], "alice")
+    log = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"]))
+    log.append(
+        {
+            "timestamp": "2026-04-15T02:12:15+00:00",
+            "thread_id": thread["thread_id"],
+            "agent": "alice",
+            "phase": "context",
+            "event_type": "phase_attempt_started",
+            "summary": "Older event should stay out of the HUD snapshot.",
+        }
+    )
+    log.append(
+        {
+            "timestamp": "2026-04-15T02:12:16+00:00",
+            "thread_id": thread["thread_id"],
+            "agent": "alice",
+            "phase": "context",
+            "event_type": "hook_decision",
+            "hook_event_name": "Stop",
+            "decision": "allow",
+            "summary": "Newest event stays visible.",
+        }
+    )
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+    monkeypatch.setattr(main, "_get_thread_store", lambda: thread_store)
+
+    result = runner.invoke(app, ["hud"])
+
+    assert result.exit_code == 0, result.output
+    assert "Latest" in result.output
+    assert "Newest event stays visible." in result.output
+    assert "Older event should stay out of the HUD snapshot." not in result.output
+
+
 def test_hud_can_render_system_mailbox_reports(tmp_path, monkeypatch):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
@@ -919,7 +966,7 @@ def test_build_thread_watch_trace_rows_normalizes_required_fields():
     trace = main._build_thread_watch_trace_rows(thread, events)
 
     assert len(trace) == 2
-    assert trace[0]["kind"] == "phase_attempt"
+    assert trace[0]["kind"] == "attempt"
     assert trace[0]["timestamp"] == "2026-04-15T04:04:46+00:00"
     assert trace[0]["thread_id"] == "thread-1"
     assert trace[0]["phase"] == "context"
@@ -935,7 +982,7 @@ def test_build_thread_watch_trace_rows_normalizes_required_fields():
     assert trace[0]["summary"] == "Current phase: context. Required result type: contribution."
     assert trace[0]["source"] == "codex.hook"
 
-    assert trace[1]["kind"] == "runtime_binding"
+    assert trace[1]["kind"] == "runtime"
     assert trace[1]["timestamp"] == "2026-04-15T04:07:27+00:00"
     assert trace[1]["thread_id"] == "thread-1"
     assert trace[1]["phase"] is None
@@ -950,6 +997,26 @@ def test_build_thread_watch_trace_rows_normalizes_required_fields():
     assert trace[1]["reason"] == "stale_last_seen"
     assert trace[1]["summary"] == "Runtime binding closed: stale last seen."
     assert trace[1]["source"] == "btwin.runtime.binding.cleanup"
+
+
+def test_build_thread_watch_trace_rows_uses_canonical_kind_taxonomy():
+    thread = {
+        "thread_id": "thread-1",
+        "protocol": "debate",
+        "current_phase": "context",
+    }
+    events = [
+        {"timestamp": "2026-04-15T04:04:45+00:00", "thread_id": "thread-1", "event_type": "hook_decision"},
+        {"timestamp": "2026-04-15T04:04:46+00:00", "thread_id": "thread-1", "event_type": "phase_attempt_started"},
+        {"timestamp": "2026-04-15T04:04:47+00:00", "thread_id": "thread-1", "event_type": "required_result_recorded"},
+        {"timestamp": "2026-04-15T04:04:48+00:00", "thread_id": "thread-1", "event_type": "cycle_gate_completed"},
+        {"timestamp": "2026-04-15T04:04:49+00:00", "thread_id": "thread-1", "event_type": "phase_transitioned"},
+        {"timestamp": "2026-04-15T04:04:50+00:00", "thread_id": "thread-1", "event_type": "runtime_binding_closed"},
+    ]
+
+    trace = main._build_thread_watch_trace_rows(thread, events)
+
+    assert [row["kind"] for row in trace] == ["guard", "attempt", "result", "gate", "phase", "runtime"]
 
 
 def test_render_thread_watch_adds_app_server_hint_to_agents_summary(monkeypatch, tmp_path):

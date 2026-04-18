@@ -171,7 +171,7 @@ def test_thread_watch_json_emits_normalized_trace_rows(tmp_path, monkeypatch):
         assert required_fields.issubset(row)
 
     first = payload["trace"][0]
-    assert first["kind"] == "phase_exit_check"
+    assert first["kind"] == "guard"
     assert first["timestamp"] == "2026-04-15T01:09:10+00:00"
     assert first["thread_id"] == thread["thread_id"]
     assert first["phase"] == "context"
@@ -188,7 +188,7 @@ def test_thread_watch_json_emits_normalized_trace_rows(tmp_path, monkeypatch):
     assert first["source"] == "codex.hook"
 
     last = payload["trace"][-1]
-    assert last["kind"] == "cycle_gate"
+    assert last["kind"] == "gate"
     assert last["timestamp"] == "2026-04-15T01:10:02+00:00"
     assert last["thread_id"] == thread["thread_id"]
     assert last["phase"] == "context"
@@ -203,3 +203,11 @@ def test_thread_watch_json_emits_normalized_trace_rows(tmp_path, monkeypatch):
     assert last["reason"] is None
     assert last["summary"] == "Phase `context` requested retry; continuing in `context` with active cycle 2."
     assert last["source"] == "btwin.protocol.apply_next"
+
+
+def test_thread_watch_help_describes_timeline_not_hud():
+    result = runner.invoke(app, ["thread", "watch", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "timeline" in result.output.lower()
+    assert "hud" not in result.output.lower()
