@@ -7,4 +7,6 @@ HANDOFF.md
 .btwin/
 .btwin-test-env/
 .btwin-attached-test/
+.btwin-live-check/
 .test-artifacts/
+.DS_Store
