@@ -26,6 +26,69 @@ class ProtocolNextPlan(BaseModel):
     suggested_action: ProtocolSuggestedAction
     error: str | None = None
     manual_outcome_required: bool = False
+    guard_set: str | None = None
+    declared_guards: list[str] = Field(default_factory=list)
+    hint: str | None = None
+
+
+def resolve_phase_guard_set(protocol: Protocol, phase_name: str | None) -> tuple[str | None, list[str]]:
+    if not phase_name:
+        return None, []
+    phase = next((item for item in protocol.phases if item.name == phase_name), None)
+    if phase is None:
+        return None, []
+    declared_guard_set = protocol.get_guard_set(phase.guard_set)
+    if declared_guard_set is None:
+        return phase.guard_set, []
+    return declared_guard_set.name, list(declared_guard_set.guards)
+
+
+def _guard_note(*, guard_set: str | None, declared_guards: list[str]) -> str:
+    if declared_guards:
+        return "baseline runtime guard remains always-on; protocol-declared guards are additive in v1."
+    if guard_set:
+        return "baseline runtime guard remains always-on; this phase does not declare additional protocol guards."
+    return "baseline runtime guard remains always-on; no protocol-declared guard set is referenced for this phase."
+
+
+def _next_plan_hint(thread_id: str, plan: ProtocolNextPlan) -> str | None:
+    note = _guard_note(guard_set=plan.guard_set, declared_guards=plan.declared_guards)
+
+    if plan.error == "phase_not_found":
+        return f"Check `btwin thread show {thread_id}` and `btwin protocol next --thread {thread_id}`."
+
+    if not plan.passed:
+        agent_name = None
+        if plan.missing and isinstance(plan.missing[0], dict):
+            agent = plan.missing[0].get("agent")
+            if isinstance(agent, str) and agent:
+                agent_name = agent
+        hint = (
+            f"Try `btwin contribution submit --thread {thread_id} --agent {agent_name or '<agent>'} "
+            f"--phase {plan.current_phase or '<phase>'}` with the required sections."
+        )
+        return f"{hint} {note}"
+
+    if plan.error == "unsupported_outcome" and plan.valid_outcomes:
+        options = " | ".join(plan.valid_outcomes)
+        hint = f"Re-run `btwin protocol apply-next --thread {thread_id} --outcome <{options}>` with one of the valid outcomes."
+        return f"{hint} {note}"
+
+    if plan.suggested_action == "record_outcome" and plan.valid_outcomes:
+        options = " | ".join(plan.valid_outcomes)
+        hint = f"Choose an outcome and re-run `btwin protocol apply-next --thread {thread_id} --outcome <{options}>`."
+        return f"{hint} {note}"
+
+    if plan.suggested_action == "advance_phase":
+        suffix = f" to move into `{plan.next_phase}`" if plan.next_phase else ""
+        hint = f"Try `btwin protocol apply-next --thread {thread_id}`{suffix}."
+        return f"{hint} {note}" if note else hint
+
+    if plan.suggested_action == "close_thread":
+        hint = f"Try `btwin thread close --thread {thread_id} --summary \"...\"`."
+        return f"{hint} {note}"
+
+    return note
 
 
 def describe_next(
@@ -63,7 +126,18 @@ def describe_next(
             suggested_action="record_outcome",
             error="phase_not_found",
             requested_outcome=outcome,
+            hint=_next_plan_hint(thread_id, ProtocolNextPlan(
+                thread_id=thread_id,
+                protocol=protocol.name,
+                current_phase=current_phase,
+                passed=False,
+                suggested_action="record_outcome",
+                error="phase_not_found",
+                requested_outcome=outcome,
+            )),
         )
+
+    guard_set, declared_guards = resolve_phase_guard_set(protocol, current_phase)
 
     phase_participants = thread.get("phase_participants", [])
     if not isinstance(phase_participants, list):
@@ -98,6 +172,24 @@ def describe_next(
                 requested_outcome=outcome,
                 suggested_action="record_outcome",
                 error="unsupported_outcome",
+                guard_set=guard_set,
+                declared_guards=declared_guards,
+                hint=_next_plan_hint(
+                    thread_id,
+                    ProtocolNextPlan(
+                        thread_id=thread_id,
+                        protocol=protocol.name,
+                        current_phase=current_phase,
+                        passed=validation.passed,
+                        missing=validation.missing,
+                        valid_outcomes=[str(outcome_value) for outcome_value in valid_outcomes if outcome_value],
+                        requested_outcome=outcome,
+                        suggested_action="record_outcome",
+                        error="unsupported_outcome",
+                        guard_set=guard_set,
+                        declared_guards=declared_guards,
+                    ),
+                ),
             )
         matched = next((t for t in branch_transitions if t.on == outcome), None)
         next_phase = matched.to if matched else None
@@ -114,7 +206,7 @@ def describe_next(
         if next_phase:
             suggested_action = "advance_phase"
 
-    return ProtocolNextPlan(
+    plan = ProtocolNextPlan(
         thread_id=thread_id,
         protocol=protocol.name,
         current_phase=current_phase,
@@ -125,4 +217,8 @@ def describe_next(
         next_phase=next_phase,
         suggested_action=suggested_action,
         manual_outcome_required=manual_outcome_required,
+        guard_set=guard_set,
+        declared_guards=declared_guards,
     )
+    plan.hint = _next_plan_hint(thread_id, plan)
+    return plan

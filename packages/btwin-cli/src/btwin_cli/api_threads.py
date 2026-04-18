@@ -188,11 +188,13 @@ def _install_runtime_event_enricher(event_bus: EventBus, agent_runner: Any | Non
 def _build_phase_cycle_context_core(
     *,
     thread: dict[str, object],
+    protocol: Protocol | None,
     phase: ProtocolPhase,
     state: PhaseCycleState,
 ) -> ContextCore:
     return build_phase_cycle_context_core(
         thread=thread,
+        protocol=protocol,
         phase=phase,
         state=state,
     )
@@ -259,8 +261,16 @@ def _build_phase_cycle_visual(
                 "target_phase": state.phase_name,
             }
         )
+    guard_nodes: list[dict[str, object]] = []
+    if protocol is not None and phase is not None:
+        declared_guard_set = protocol.get_guard_set(phase.guard_set)
+        if declared_guard_set is not None:
+            guard_nodes = [
+                {"key": guard, "label": guard, "status": "declared"}
+                for guard in declared_guard_set.guards
+            ]
 
-    return {"procedure": procedure_nodes, "gates": gate_nodes}
+    return {"procedure": procedure_nodes, "gates": gate_nodes, "guards": guard_nodes}
 
 
 class ThreadCreateRequest(BaseModel):
@@ -574,7 +584,7 @@ def create_threads_router(
         phase = next((item for item in protocol.phases if item.name == current_phase), None)
         if phase is None:
             return {"state": state.model_dump(), "visual": _build_phase_cycle_visual(protocol=protocol, phase=None, state=state)}
-        context_core = _build_phase_cycle_context_core(thread=thread, phase=phase, state=state)
+        context_core = _build_phase_cycle_context_core(thread=thread, protocol=protocol, phase=phase, state=state)
         return {
             "state": state.model_dump(),
             "context_core": context_core.model_dump(),

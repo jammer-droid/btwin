@@ -660,6 +660,77 @@ def test_provider_smoke_workflow_hook_blocks_stop_without_required_contribution(
     assert payload["decision"] == "block"
     assert payload["reason"] == "missing_contribution"
     assert payload["required_result_recorded"] is False
+    assert "baseline runtime guard remains always-on" in payload["overlay"]
+    assert "no protocol-declared guard set" in payload["overlay"]
+
+
+def test_provider_smoke_protocol_guard_set_visible_but_baseline_guards_still_enforced(provider_smoke_env) -> None:
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name="provider-smoke-guard-set",
+        protocol_definition={
+            "name": "provider-smoke-guard-set",
+            "guard_sets": [
+                {
+                    "name": "review-default",
+                    "guards": [
+                        "contribution_required",
+                        "transition_precondition",
+                    ],
+                }
+            ],
+            "phases": [
+                {
+                    "name": "review",
+                    "actions": ["contribute"],
+                    "guard_set": "review-default",
+                    "template": [{"section": "completed", "required": True}],
+                },
+                {
+                    "name": "decision",
+                    "actions": ["decide"],
+                    "decided_by": "user",
+                },
+            ],
+        },
+    )
+
+    plan = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "next",
+        "--thread",
+        state["thread_id"],
+        "--json",
+    )
+
+    assert plan["guard_set"] == "review-default"
+    assert plan["declared_guards"] == ["contribution_required", "transition_precondition"]
+    assert "baseline runtime guard" in plan["hint"]
+
+    payload = _run_btwin(
+        provider_smoke_env,
+        "workflow",
+        "hook",
+        "--event",
+        "Stop",
+        "--thread",
+        state["thread_id"],
+        "--agent",
+        "alice",
+        "--json",
+        expected_returncode=2,
+    )
+
+    assert payload["reason"] == "missing_contribution"
+    assert payload["details"]["guard_source"] == "baseline"
+    assert payload["details"]["phase_guard_set"] == "review-default"
+    assert payload["details"]["declared_guards"] == [
+        "contribution_required",
+        "transition_precondition",
+    ]
+    assert "baseline runtime guard remains always-on" in payload["overlay"]
+    assert "protocol-declared guards are additive" in payload["overlay"]
 
 
 def test_provider_smoke_workflow_hook_allows_non_required_actor_in_user_decision_phase(provider_smoke_env) -> None:

@@ -649,18 +649,29 @@ def _phase_cycle_visual_payload(
             }
         )
 
-    return {"procedure": procedure_nodes, "gates": gate_nodes}
+    guard_nodes: list[dict[str, object]] = []
+    if protocol is not None and phase is not None:
+        declared_guard_set = protocol.get_guard_set(phase.guard_set)
+        if declared_guard_set is not None:
+            guard_nodes = [
+                {"key": guard, "label": guard, "status": "declared"}
+                for guard in declared_guard_set.guards
+            ]
+
+    return {"procedure": procedure_nodes, "gates": gate_nodes, "guards": guard_nodes}
 
 
 def _build_phase_cycle_context_core(
     *,
     thread: dict[str, object],
+    protocol: Protocol | None,
     phase: ProtocolPhase,
     state: PhaseCycleState,
     last_cycle_outcome: str | None,
 ) -> ContextCore:
     return build_phase_cycle_context_core(
         thread=thread,
+        protocol=protocol,
         phase=phase,
         state=state,
         last_cycle_outcome=last_cycle_outcome,
@@ -724,6 +735,7 @@ def _phase_cycle_payload_for_thread(
         }
     context_core = _build_phase_cycle_context_core(
         thread=thread,
+        protocol=protocol,
         phase=phase,
         state=state,
         last_cycle_outcome=state.last_gate_outcome,
@@ -817,6 +829,19 @@ def _render_protocol_progress_lines(
             )
             lines.append("Gates")
             lines.append(gate_line)
+        guards = visual.get("guards")
+        if isinstance(guards, list) and guards:
+            guard_line = " -- ".join(
+                _protocol_progress_node(
+                    str(node.get("label", node.get("key", ""))),
+                    str(node.get("status", "pending")),
+                    animation_phase=animation_phase,
+                )
+                for node in guards
+                if isinstance(node, dict)
+            )
+            lines.append("Guards")
+            lines.append(guard_line)
     return lines
 
 
@@ -3430,6 +3455,7 @@ def protocol_apply_next(
         )
         context_core = _build_phase_cycle_context_core(
             thread=thread,
+            protocol=protocol,
             phase=phase,
             state=next_cycle_state,
             last_cycle_outcome=next_cycle_state.last_gate_outcome,
@@ -3519,6 +3545,7 @@ def protocol_apply_next(
             )
             context_core = _build_phase_cycle_context_core(
                 thread=thread,
+                protocol=protocol,
                 phase=target_phase,
                 state=next_cycle_state,
                 last_cycle_outcome=plan.requested_outcome or "completed",

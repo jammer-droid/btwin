@@ -193,6 +193,7 @@ def test_context_core_uses_current_step_index_when_action_labels_repeat():
 
     context_core = build_phase_cycle_context_core(
         thread={"thread_id": "thread-1", "topic": "Dual review thread"},
+        protocol=protocol,
         phase=protocol.phases[0],
         state=state,
     )

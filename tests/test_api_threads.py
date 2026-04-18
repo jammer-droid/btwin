@@ -160,11 +160,21 @@ def test_threads_router_exposes_phase_cycle_progress(tmp_path):
     protocol_store.save_protocol(
         Protocol(
             name="debate",
+            guard_sets=[
+                {
+                    "name": "review-default",
+                    "guards": [
+                        "phase_actor_eligibility",
+                        "direct_target_eligibility",
+                    ],
+                }
+            ],
             phases=[
                 ProtocolPhase(
                     name="review",
                     actions=["contribute"],
                     template=[ProtocolSection(section="completed", required=True)],
+                    guard_set="review-default",
                     procedure=[
                         {"role": "reviewer", "action": "review", "alias": "Review"},
                         {"role": "implementer", "action": "revise", "alias": "Revise"},
@@ -211,8 +221,25 @@ def test_threads_router_exposes_phase_cycle_progress(tmp_path):
     assert payload["context_core"]["next_expected_action"] == "revise"
     assert payload["context_core"]["current_step_alias"] == "Revise"
     assert payload["context_core"]["current_step_role"] == "implementer"
+    assert payload["context_core"]["guard_set"] == "review-default"
+    assert payload["context_core"]["declared_guards"] == [
+        "phase_actor_eligibility",
+        "direct_target_eligibility",
+    ]
     assert payload["visual"]["procedure"][0]["label"] == "Review"
     assert payload["visual"]["procedure"][-1]["key"] == "gate"
+    assert payload["visual"]["guards"] == [
+        {
+            "key": "phase_actor_eligibility",
+            "label": "phase_actor_eligibility",
+            "status": "declared",
+        },
+        {
+            "key": "direct_target_eligibility",
+            "label": "direct_target_eligibility",
+            "status": "declared",
+        },
+    ]
 
 
 def test_threads_router_preserves_last_cycle_outcome_after_phase_transition(tmp_path):

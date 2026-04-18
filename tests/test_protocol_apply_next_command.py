@@ -106,12 +106,22 @@ def _review_retry_protocol() -> Protocol:
     return Protocol(
         name="review-retry",
         description="Repeat the same phase until accepted",
+        guard_sets=[
+            {
+                "name": "review-default",
+                "guards": [
+                    "phase_actor_eligibility",
+                    "direct_target_eligibility",
+                ],
+            }
+        ],
         phases=[
             ProtocolPhase(
                 name="review",
                 description="Review and revise the work.",
                 actions=["contribute"],
                 template=[ProtocolSection(section="completed", required=True)],
+                guard_set="review-default",
                 procedure=[
                     {
                         "role": "reviewer",
@@ -298,6 +308,11 @@ def test_protocol_apply_next_updates_phase_cycle_state_on_retry(tmp_path, monkey
     assert payload["cycle"]["cycle_index"] == 2
     assert payload["cycle"]["phase_name"] == "review"
     assert payload["context_core"]["current_cycle_index"] == 2
+    assert payload["context_core"]["guard_set"] == "review-default"
+    assert payload["context_core"]["declared_guards"] == [
+        "phase_actor_eligibility",
+        "direct_target_eligibility",
+    ]
     assert payload["context_core"]["next_expected_role"] == "reviewer"
     assert payload["context_core"]["next_expected_action"] == "Review the current implementation state."
     assert payload["context_core"]["current_step_alias"] == "review"

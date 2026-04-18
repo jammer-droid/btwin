@@ -130,6 +130,13 @@ class Protocol(BaseModel):
                 )
         return self
 
+    def get_guard_set(self, name: str | None) -> ProtocolGuardSet | None:
+        if name is None:
+            return None
+        for guard_set in self.guard_sets:
+            if guard_set.name == name:
+                return guard_set
+        return None
 
 class ProtocolStore:
     """Read-only store for protocol YAML definitions."""
