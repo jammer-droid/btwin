@@ -231,6 +231,68 @@ def _setup_provider_smoke_thread(
     }
 
 
+def _provider_review_retry_protocol_definition(name: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "description": "Repeat the same phase until accepted.",
+        "outcomes": ["retry", "accept"],
+        "guard_sets": [
+            {
+                "name": "review-default",
+                "guards": [
+                    "phase_actor_eligibility",
+                    "direct_target_eligibility",
+                ],
+            }
+        ],
+        "phases": [
+            {
+                "name": "review",
+                "description": "Review and revise the work.",
+                "actions": ["contribute"],
+                "template": [{"section": "completed", "required": True}],
+                "guard_set": "review-default",
+                "gate": "review-gate",
+                "outcome_policy": "review-outcomes",
+                "procedure": [
+                    {
+                        "role": "reviewer",
+                        "action": "review",
+                        "guidance": "Review the current implementation state.",
+                    },
+                    {
+                        "role": "implementer",
+                        "action": "revise",
+                        "guidance": "Implement revisions from review feedback.",
+                    },
+                ],
+            },
+            {
+                "name": "decision",
+                "description": "Record final acceptance.",
+                "actions": ["decide"],
+            },
+        ],
+        "gates": [
+            {
+                "name": "review-gate",
+                "routes": [
+                    {"outcome": "retry", "target_phase": "review"},
+                    {"outcome": "accept", "target_phase": "decision"},
+                ],
+            }
+        ],
+        "outcome_policies": [
+            {
+                "name": "review-outcomes",
+                "emitters": ["reviewer", "user"],
+                "actions": ["decide"],
+                "outcomes": ["retry", "accept"],
+            }
+        ],
+    }
+
+
 def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str, object]:
     state = _setup_provider_smoke_thread(
         provider_smoke_env,
@@ -402,6 +464,91 @@ def test_provider_smoke_apply_next_reports_missing_contribution_hint(provider_sm
     assert payload["applied"] is False
     assert payload["suggested_action"] == "submit_contribution"
     assert "btwin contribution submit" in payload["hint"]
+
+
+def test_provider_smoke_compiled_outcome_policy_hints_visible_on_next_and_apply_next(provider_smoke_env) -> None:
+    protocol_name = "provider-smoke-review-retry"
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name=protocol_name,
+        protocol_definition=_provider_review_retry_protocol_definition(protocol_name),
+        participants=("alice",),
+    )
+    thread_id = str(state["thread_id"])
+
+    _run_btwin(
+        provider_smoke_env,
+        "contribution",
+        "submit",
+        "--thread",
+        thread_id,
+        "--agent",
+        "alice",
+        "--phase",
+        "review",
+        "--content",
+        "## completed\nNeeds another pass.\n",
+        "--tldr",
+        "review retry",
+        "--json",
+    )
+
+    plan = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "next",
+        "--thread",
+        thread_id,
+        "--outcome",
+        "retry",
+        "--json",
+    )
+
+    assert plan["current_phase"] == "review"
+    assert plan["requested_outcome"] == "retry"
+    assert plan["next_phase"] == "review"
+    assert plan["suggested_action"] == "advance_phase"
+    assert plan["valid_outcomes"] == ["retry", "accept"]
+    assert plan["guard_set"] == "review-default"
+    assert plan["declared_guards"] == [
+        "phase_actor_eligibility",
+        "direct_target_eligibility",
+    ]
+    assert plan["outcome_policy"] == "review-outcomes"
+    assert plan["outcome_emitters"] == ["reviewer", "user"]
+    assert plan["outcome_actions"] == ["decide"]
+    assert plan["policy_outcomes"] == ["retry", "accept"]
+    assert "baseline runtime guard remains always-on" in plan["hint"]
+
+    applied = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "apply-next",
+        "--thread",
+        thread_id,
+        "--outcome",
+        "retry",
+        "--json",
+    )
+
+    assert applied["applied"] is True
+    assert applied["thread"]["current_phase"] == plan["next_phase"]
+    assert applied["suggested_action"] == "advance_phase"
+    assert applied["cycle"]["cycle_index"] == 2
+    assert applied["cycle"]["phase_name"] == "review"
+    assert applied["context_core"]["current_cycle_index"] == 2
+    assert applied["context_core"]["last_cycle_outcome"] == "retry"
+    assert applied["context_core"]["guard_set"] == plan["guard_set"]
+    assert applied["context_core"]["declared_guards"] == plan["declared_guards"]
+    assert applied["context_core"]["outcome_policy"] == plan["outcome_policy"]
+    assert applied["context_core"]["outcome_emitters"] == plan["outcome_emitters"]
+    assert applied["context_core"]["outcome_actions"] == plan["outcome_actions"]
+    assert applied["context_core"]["policy_outcomes"] == plan["policy_outcomes"]
+    assert applied["context_core"]["current_step_key"] == "review"
+    assert applied["context_core"]["current_step_alias"] == "review"
+    assert applied["context_core"]["current_step_role"] == "reviewer"
+    assert applied["context_core"]["next_expected_role"] == "reviewer"
+    assert applied["context_core"]["next_expected_action"] == "Review the current implementation state."
 
 
 def test_provider_smoke_stop_block_uses_shared_scenario_fixture(provider_smoke_env) -> None:
