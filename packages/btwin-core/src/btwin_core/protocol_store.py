@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 SUPPORTED_PROTOCOL_GUARDS = {
@@ -45,16 +45,22 @@ def load_protocol_yaml(path: Path) -> Any:
 
 
 class ProtocolSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     section: str
     required: bool = False
     guidance: str = ""
 
 
 class CycleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     until: Literal["decide"] = "decide"
 
 
 class ProtocolProcedureStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
     action: str
     guidance: str | None = None
@@ -69,12 +75,16 @@ class ProtocolProcedureStep(BaseModel):
 
 
 class ProtocolInteraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mode: Literal["passive", "chat", "orchestrated_chat"] = "passive"
     allow_user_chat: bool = False
     default_actor: str | None = None
 
 
 class ProtocolGuardSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str | None = None
     guards: list[str] = []
@@ -90,6 +100,8 @@ class ProtocolGuardSet(BaseModel):
 
 
 class ProtocolAuthoringGateRoute(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     outcome: str
     target_phase: str
     alias: str | None = None
@@ -97,6 +109,8 @@ class ProtocolAuthoringGateRoute(BaseModel):
 
 
 class ProtocolAuthoringGate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str | None = None
     authoring_only: Literal[True] = True
@@ -104,6 +118,8 @@ class ProtocolAuthoringGate(BaseModel):
 
 
 class ProtocolOutcomePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str | None = None
     authoring_only: Literal[True] = True
@@ -113,6 +129,8 @@ class ProtocolOutcomePolicy(BaseModel):
 
 
 class ProtocolPhase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str = ""
     actions: list[Literal["contribute", "review", "discuss", "decide"]] = []
@@ -150,6 +168,8 @@ class ProtocolPhase(BaseModel):
 
 
 class ProtocolTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     from_phase: str = Field(alias="from")
     to: str
     on: str | None = None
@@ -164,6 +184,8 @@ class ProtocolTransition(BaseModel):
 
 
 class Protocol(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str = ""
     phases: list[ProtocolPhase]
@@ -290,6 +312,8 @@ class Protocol(BaseModel):
 
 
 class ProtocolAuthoringDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str = ""
     phases: list[ProtocolPhase]

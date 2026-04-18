@@ -129,6 +129,25 @@ def test_compile_protocol_definition_reports_schema_layer_errors():
         )
 
 
+def test_compile_protocol_definition_rejects_unknown_authoring_field_at_schema_layer():
+    with pytest.raises(
+        ProtocolValidationLayerError,
+        match="schema validation failed: phases\\.0\\.guard_sett: Extra inputs are not permitted",
+    ):
+        compile_protocol_definition(
+            {
+                "name": "review-loop",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "guard_sett": "review-default",
+                    }
+                ],
+            }
+        )
+
+
 def test_compile_protocol_definition_reports_semantic_layer_errors():
     definition = _authoring_protocol_definition()
     definition["transitions"] = [{"from": "review", "to": "review", "on": "accept"}]
