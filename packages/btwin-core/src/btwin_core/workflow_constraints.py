@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from btwin_core.protocol_flow import ProtocolNextPlan, describe_next
 from btwin_core.protocol_store import Protocol
@@ -24,6 +24,7 @@ class WorkflowHookResult(BaseModel):
     reason: str | None = None
     overlay: str | None = None
     required_result_recorded: bool = False
+    details: dict[str, object] = Field(default_factory=dict)
 
 
 class CodexHookPayload(BaseModel):
@@ -57,7 +58,7 @@ class WorkflowConstraintViolation(BaseModel):
     error: str
     message: str
     hint: str | None = None
-    details: dict[str, object] = {}
+    details: dict[str, object] = Field(default_factory=dict)
 
 
 def _thread_id(thread: dict) -> str:
@@ -108,6 +109,40 @@ def _artifact_actors(thread: dict, protocol: Protocol, phase_name: str | None) -
     return _phase_participants(thread)
 
 
+def _resolve_phase_guard_context(protocol: Protocol, phase_name: str | None) -> dict[str, object]:
+    phase = _phase_definition(protocol, phase_name)
+    if phase is None:
+        phase_guard_set = None
+        declared_guards: list[str] = []
+    else:
+        declared_guard_set = protocol.get_guard_set(phase.guard_set)
+        if declared_guard_set is None:
+            phase_guard_set = phase.guard_set
+            declared_guards = []
+        else:
+            phase_guard_set = declared_guard_set.name
+            declared_guards = list(declared_guard_set.guards)
+    return {
+        "guard_source": "baseline",
+        "phase_guard_set": phase_guard_set,
+        "declared_guards": declared_guards,
+        "baseline_guards": [
+            "contribution_required",
+            "phase_actor_eligibility",
+            "direct_target_eligibility",
+            "transition_precondition",
+        ],
+    }
+
+
+def _guard_note(*, phase_guard_set: str | None, declared_guards: list[str]) -> str:
+    if declared_guards:
+        return "baseline runtime guard remains always-on; protocol-declared guards are additive in v1."
+    if phase_guard_set:
+        return "baseline runtime guard remains always-on; this phase does not declare additional protocol guards."
+    return "baseline runtime guard remains always-on; no protocol-declared guard set is referenced for this phase."
+
+
 def _render_contribution_hint(
     *,
     thread_id: str,
@@ -129,34 +164,66 @@ def build_protocol_plan_hint(thread_id: str, plan: ProtocolNextPlan) -> str | No
             agent = plan.missing[0].get("agent")
             if isinstance(agent, str) and agent:
                 agent_name = agent
-        return _render_contribution_hint(
-            thread_id=thread_id,
-            phase_name=plan.current_phase,
-            agent_name=agent_name,
+        return _append_guard_note(
+            _render_contribution_hint(
+                thread_id=thread_id,
+                phase_name=plan.current_phase,
+                agent_name=agent_name,
+            ),
+            plan=plan,
         )
 
     if plan.error == "unsupported_outcome" and plan.valid_outcomes:
         options = " | ".join(plan.valid_outcomes)
-        return (
-            f"Re-run `btwin protocol apply-next --thread {thread_id} --outcome <{options}>` "
-            "with one of the valid outcomes."
+        return _append_guard_note(
+            (
+                f"Re-run `btwin protocol apply-next --thread {thread_id} --outcome <{options}>` "
+                "with one of the valid outcomes."
+            ),
+            plan=plan,
         )
 
     if plan.suggested_action == "record_outcome" and plan.valid_outcomes:
         options = " | ".join(plan.valid_outcomes)
-        return (
-            f"Choose an outcome and re-run `btwin protocol apply-next --thread {thread_id} "
-            f"--outcome <{options}>`."
+        return _append_guard_note(
+            (
+                f"Choose an outcome and re-run `btwin protocol apply-next --thread {thread_id} "
+                f"--outcome <{options}>`."
+            ),
+            plan=plan,
         )
 
     if plan.suggested_action == "advance_phase":
         suffix = f" to move into `{plan.next_phase}`" if plan.next_phase else ""
-        return f"Try `btwin protocol apply-next --thread {thread_id}`{suffix}."
+        return _append_guard_note(
+            f"Try `btwin protocol apply-next --thread {thread_id}`{suffix}.",
+            plan=plan,
+        )
 
     if plan.suggested_action == "close_thread":
-        return f"Try `btwin thread close --thread {thread_id} --summary \"...\"`."
+        return _append_guard_note(
+            f"Try `btwin thread close --thread {thread_id} --summary \"...\"`.",
+            plan=plan,
+        )
 
     return None
+
+
+def _append_guard_note(hint: str | None, *, plan: ProtocolNextPlan) -> str | None:
+    if not hint:
+        return hint
+    note = _guard_note(phase_guard_set=plan.guard_set, declared_guards=plan.declared_guards)
+    return f"{hint} {note}"
+
+
+def _hook_overlay_with_guard_context(
+    *,
+    overlay: str,
+    protocol: Protocol,
+    phase_name: str | None,
+) -> str:
+    context = _resolve_phase_guard_context(protocol, phase_name)
+    return f"{overlay} {_guard_note(phase_guard_set=context['phase_guard_set'], declared_guards=context['declared_guards'])}"
 
 
 def validate_contribution_submission(
@@ -270,14 +337,17 @@ def validate_thread_close(
     contributions: list[dict],
 ) -> WorkflowConstraintViolation | None:
     thread_id = _thread_id(thread)
+    phase_name = _phase_name(thread)
     plan = describe_next(thread, protocol, contributions)
     hint = build_protocol_plan_hint(thread_id, plan)
+    guard_details = _resolve_phase_guard_context(protocol, phase_name)
 
     if plan.error:
         return WorkflowConstraintViolation(
             error=plan.error,
             message=f"thread cannot be closed from phase `{plan.current_phase}`",
             hint=hint,
+            details=guard_details,
         )
 
     if not plan.passed:
@@ -285,7 +355,7 @@ def validate_thread_close(
             error="phase_requirements_not_met",
             message=f"current phase `{plan.current_phase}` still has missing required contributions",
             hint=hint,
-            details={"missing": plan.missing, "current_phase": plan.current_phase},
+            details={"missing": plan.missing, "current_phase": plan.current_phase, **guard_details},
         )
 
     if plan.suggested_action != "close_thread":
@@ -298,6 +368,7 @@ def validate_thread_close(
                 "suggested_action": plan.suggested_action,
                 "next_phase": plan.next_phase,
                 "valid_outcomes": plan.valid_outcomes,
+                **guard_details,
             },
         )
 
@@ -389,15 +460,21 @@ def evaluate_workflow_hook(
             required_result_recorded=True,
         )
 
+    guard_details = _resolve_phase_guard_context(protocol, phase_name)
     return WorkflowHookResult(
         event=event,
         decision="block",
         reason="missing_contribution",
-        overlay=(
-            f"Current phase {phase_name or 'unknown'} still needs a contribution "
-            f"from {actor or 'the current actor'} before stopping."
+        overlay=_hook_overlay_with_guard_context(
+            overlay=(
+                f"Current phase {phase_name or 'unknown'} still needs a contribution "
+                f"from {actor or 'the current actor'} before stopping."
+            ),
+            protocol=protocol,
+            phase_name=phase_name,
         ),
         required_result_recorded=False,
+        details=guard_details,
     )
 
 
