@@ -22,6 +22,20 @@ class CycleConfig(BaseModel):
     until: Literal["decide"] = "decide"
 
 
+class ProtocolProcedureStep(BaseModel):
+    role: str
+    action: str
+    guidance: str | None = None
+    alias: str | None = None
+    key: str | None = None
+
+    def visual_key(self) -> str:
+        return self.key or self.action
+
+    def visual_label(self) -> str:
+        return self.alias or self.action
+
+
 class ProtocolInteraction(BaseModel):
     mode: Literal["passive", "chat", "orchestrated_chat"] = "passive"
     allow_user_chat: bool = False
@@ -33,6 +47,7 @@ class ProtocolPhase(BaseModel):
     description: str = ""
     actions: list[Literal["contribute", "review", "discuss", "decide"]] = []
     template: list[ProtocolSection] | None = None
+    procedure: list[ProtocolProcedureStep] | None = None
     mode: Literal["realtime_messages"] | None = None
     guidance: str | None = None
     decided_by: Literal["user", "consensus", "vote"] | None = None
@@ -61,6 +76,14 @@ class ProtocolTransition(BaseModel):
     from_phase: str = Field(alias="from")
     to: str
     on: str | None = None
+    alias: str | None = None
+    key: str | None = None
+
+    def visual_key(self) -> str:
+        return self.key or self.on or self.to
+
+    def visual_label(self) -> str:
+        return self.alias or self.on or self.to
 
 
 class Protocol(BaseModel):

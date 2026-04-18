@@ -4,7 +4,10 @@ from fastapi.testclient import TestClient
 
 from btwin_cli.api_threads import create_threads_router
 from btwin_core.event_bus import EventBus
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore
+from btwin_core.phase_cycle import PhaseCycleState
+from btwin_core.phase_cycle_store import PhaseCycleStore
+from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
+from btwin_core.system_mailbox_store import SystemMailboxStore
 from btwin_core.thread_store import ThreadStore
 
 
@@ -112,6 +115,165 @@ def test_threads_router_exposes_agent_inbox_and_agent_status(tmp_path):
     assert status_response.status_code == 200
     assert status_response.json()["participant_status"] == "joined"
     assert status_response.json()["pending_message_count"] == 1
+
+
+def test_threads_router_exposes_system_mailbox_reports(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+
+    thread = thread_store.create_thread(
+        topic="Mailbox thread",
+        protocol="debate",
+        participants=["alice"],
+        initial_phase="context",
+    )
+    SystemMailboxStore(thread_store.data_dir).append_report(
+        {
+            "thread_id": thread["thread_id"],
+            "report_type": "cycle_result",
+            "audience": "monitoring",
+            "summary": "Cycle complete",
+            "created_at": "2026-04-17T00:00:00+00:00",
+        }
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.get("/api/system-mailbox", params={"threadId": thread["thread_id"], "limit": 5})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["reports"][0]["report_type"] == "cycle_result"
+    assert payload["reports"][0]["audience"] == "monitoring"
+
+
+def test_threads_router_exposes_phase_cycle_progress(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        Protocol(
+            name="debate",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise"},
+                    ],
+                )
+            ],
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Cycle thread",
+        protocol="debate",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_label": "revise",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.get(f"/api/threads/{thread['thread_id']}/phase-cycle")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"]["cycle_index"] == 2
+    assert payload["state"]["procedure_steps"] == ["review", "revise"]
+    assert payload["state"]["current_step_label"] == "revise"
+    assert payload["context_core"]["next_expected_role"] == "implementer"
+    assert payload["context_core"]["next_expected_action"] == "revise"
+    assert payload["context_core"]["current_step_alias"] == "Revise"
+    assert payload["context_core"]["current_step_role"] == "implementer"
+    assert payload["visual"]["procedure"][0]["label"] == "Review"
+    assert payload["visual"]["procedure"][-1]["key"] == "gate"
+
+
+def test_threads_router_preserves_last_cycle_outcome_after_phase_transition(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        Protocol(
+            name="review-then-decision",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                    ],
+                ),
+                ProtocolPhase(
+                    name="decision",
+                    actions=["decide"],
+                    procedure=[
+                        {"role": "decider", "action": "decide", "alias": "Decision"},
+                    ],
+                ),
+            ],
+            transitions=[ProtocolTransition.model_validate({"from": "review", "to": "decision", "on": "accept"})],
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Transitioned cycle thread",
+        protocol="review-then-decision",
+        participants=["alice"],
+        initial_phase="decision",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="decision",
+            procedure_steps=["decide"],
+        ).model_copy(
+            update={
+                "last_gate_outcome": None,
+                "last_cycle_outcome": "accept",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.get(f"/api/threads/{thread['thread_id']}/phase-cycle")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"]["phase_name"] == "decision"
+    assert payload["context_core"]["last_cycle_outcome"] == "accept"
 
 
 def test_agent_runtime_status_includes_helper_overlay_fields(tmp_path):

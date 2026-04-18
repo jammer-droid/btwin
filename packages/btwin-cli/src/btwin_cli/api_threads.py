@@ -9,11 +9,19 @@ from typing import Any, Callable
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from btwin_core.context_core import ContextCore
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.locale_settings import LocaleSettingsStore
+from btwin_core.phase_cycle import PhaseCycleState
+from btwin_core.phase_cycle_engine import (
+    build_phase_cycle_context_core,
+    resolve_phase_cycle_current_step_index,
+)
+from btwin_core.phase_cycle_store import PhaseCycleStore
 from btwin_core.phase_context import PhaseContextBuilder
-from btwin_core.protocol_store import ProtocolStore
+from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolStore
 from btwin_core.protocol_validator import ProtocolValidator
+from btwin_core.system_mailbox_store import SystemMailboxStore
 from btwin_core.thread_store import ThreadStore
 from btwin_core.thread_summarizer import ThreadSummarizer
 from btwin_core.workflow_constraints import (
@@ -177,6 +185,84 @@ def _install_runtime_event_enricher(event_bus: EventBus, agent_runner: Any | Non
     setattr(event_bus, "_btwin_runtime_event_enricher_installed", True)
 
 
+def _build_phase_cycle_context_core(
+    *,
+    thread: dict[str, object],
+    phase: ProtocolPhase,
+    state: PhaseCycleState,
+) -> ContextCore:
+    return build_phase_cycle_context_core(
+        thread=thread,
+        phase=phase,
+        state=state,
+    )
+
+
+def _build_phase_cycle_visual(
+    *,
+    protocol: Protocol | None,
+    phase: ProtocolPhase | None,
+    state: PhaseCycleState,
+) -> dict[str, object]:
+    procedure_nodes: list[dict[str, object]] = []
+    current_step_index = resolve_phase_cycle_current_step_index(phase, state)
+    raw_steps = phase.procedure if phase is not None and phase.procedure else None
+    if raw_steps:
+        for index, step in enumerate(raw_steps):
+            status = "pending"
+            if state.status == "completed":
+                status = "completed"
+            elif current_step_index is not None and index < current_step_index:
+                status = "completed"
+            elif current_step_index is not None and index == current_step_index:
+                status = "active"
+            procedure_nodes.append(
+                {
+                    "key": step.visual_key(),
+                    "label": step.visual_label(),
+                    "status": status,
+                }
+            )
+    else:
+        step_labels = [step for step in state.procedure_steps if isinstance(step, str)]
+        for index, step in enumerate(step_labels):
+            status = "pending"
+            if state.status == "completed":
+                status = "completed"
+            elif current_step_index is not None and index < current_step_index:
+                status = "completed"
+            elif current_step_index is not None and index == current_step_index:
+                status = "active"
+            procedure_nodes.append({"key": step, "label": step, "status": status})
+    gate_status = "completed" if state.status == "completed" else "pending"
+    procedure_nodes.append({"key": "gate", "label": "gate", "status": gate_status})
+
+    gate_nodes: list[dict[str, object]] = []
+    if protocol is not None:
+        for transition in protocol.transitions:
+            if transition.from_phase != state.phase_name:
+                continue
+            gate_nodes.append(
+                {
+                    "key": transition.visual_key(),
+                    "label": transition.visual_label(),
+                    "status": "completed" if transition.on and state.last_gate_outcome == transition.on else "pending",
+                    "target_phase": transition.to,
+                }
+            )
+    elif state.last_gate_outcome:
+        gate_nodes.append(
+            {
+                "key": state.last_gate_outcome,
+                "label": state.last_gate_outcome,
+                "status": "completed",
+                "target_phase": state.phase_name,
+            }
+        )
+
+    return {"procedure": procedure_nodes, "gates": gate_nodes}
+
+
 class ThreadCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     topic: str
@@ -250,6 +336,8 @@ def create_threads_router(
     router = APIRouter()
     _install_runtime_event_enricher(event_bus, agent_runner)
     locale_settings_store = LocaleSettingsStore(thread_store.data_dir)
+    system_mailbox_store = SystemMailboxStore(thread_store.data_dir)
+    phase_cycle_store = PhaseCycleStore(thread_store.data_dir)
 
     @router.get("/api/protocols")
     def list_protocols():
@@ -463,6 +551,34 @@ def create_threads_router(
             "agent": agent,
             "pending_count": len(messages),
             "messages": messages,
+        }
+
+    @router.get("/api/system-mailbox")
+    def list_system_mailbox(threadId: str | None = None, limit: int = 20):
+        reports = system_mailbox_store.list_reports(thread_id=threadId, limit=limit)
+        return {"count": len(reports), "reports": reports}
+
+    @router.get("/api/threads/{thread_id}/phase-cycle")
+    def get_phase_cycle(thread_id: str):
+        thread = thread_store.get_thread(thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+        state = phase_cycle_store.read(thread_id)
+        if state is None:
+            return {"state": None}
+        protocol_name = thread.get("protocol")
+        protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+        if protocol is None:
+            return {"state": state.model_dump(), "visual": _build_phase_cycle_visual(protocol=None, phase=None, state=state)}
+        current_phase = thread.get("current_phase")
+        phase = next((item for item in protocol.phases if item.name == current_phase), None)
+        if phase is None:
+            return {"state": state.model_dump(), "visual": _build_phase_cycle_visual(protocol=protocol, phase=None, state=state)}
+        context_core = _build_phase_cycle_context_core(thread=thread, phase=phase, state=state)
+        return {
+            "state": state.model_dump(),
+            "context_core": context_core.model_dump(),
+            "visual": _build_phase_cycle_visual(protocol=protocol, phase=phase, state=state),
         }
 
     @router.post("/api/threads/{thread_id}/contributions")
