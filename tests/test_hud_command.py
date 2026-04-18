@@ -137,11 +137,21 @@ def test_hud_renders_current_protocol_cycle_and_step(tmp_path, monkeypatch):
     protocol_store.save_protocol(
         Protocol(
             name="review-loop",
+            guard_sets=[
+                {
+                    "name": "review-default",
+                    "guards": [
+                        "phase_actor_eligibility",
+                        "direct_target_eligibility",
+                    ],
+                }
+            ],
             phases=[
                 ProtocolPhase(
                     name="review",
                     actions=["contribute"],
                     template=[ProtocolSection(section="completed", required=True)],
+                    guard_set="review-default",
                     procedure=[
                         {"role": "reviewer", "action": "review", "alias": "Review"},
                         {"role": "implementer", "action": "revise", "alias": "Revise"},
@@ -192,6 +202,9 @@ def test_hud_renders_current_protocol_cycle_and_step(tmp_path, monkeypatch):
     assert "Revise" in result.output
     assert "Retry Gate" in result.output
     assert "Accept Gate" in result.output
+    assert "Guards" in result.output
+    assert "phase_actor_eligibility" in result.output
+    assert "direct_target_eligibility" in result.output
     assert "Current:" not in result.output
     assert "Last gate:" not in result.output
 

@@ -19,3 +19,5 @@ class ContextCore(BaseModel):
     current_step_label: str | None = None
     current_step_alias: str | None = None
     current_step_role: str | None = None
+    guard_set: str | None = None
+    declared_guards: list[str] = Field(default_factory=list)

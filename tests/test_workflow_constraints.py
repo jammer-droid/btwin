@@ -1,5 +1,10 @@
 from btwin_core.protocol_store import Protocol, ProtocolGuardSet, ProtocolPhase, ProtocolSection
-from btwin_core.workflow_constraints import evaluate_workflow_hook, validate_thread_close
+from btwin_core.workflow_constraints import (
+    evaluate_workflow_hook,
+    validate_contribution_submission,
+    validate_direct_message_targets,
+    validate_thread_close,
+)
 
 
 def _protocol() -> Protocol:
@@ -128,6 +133,57 @@ def test_protocol_guard_set_does_not_disable_transition_precondition():
         "transition_precondition",
     ]
     assert "baseline runtime guard" in (violation.hint or "")
+
+
+def test_contribution_violation_exposes_guard_context_and_hint():
+    protocol = _protocol()
+    thread = {
+        "thread_id": "thread-789",
+        "current_phase": "implementation",
+        "phase_participants": ["alice"],
+    }
+
+    violation = validate_contribution_submission(
+        thread=thread,
+        protocol=protocol,
+        actor="bob",
+        phase_name="implementation",
+    )
+
+    assert violation is not None
+    assert violation.error == "actor_not_allowed_for_phase"
+    assert violation.details["guard_source"] == "baseline"
+    assert violation.details["phase_guard_set"] is None
+    assert violation.details["declared_guards"] == []
+    assert "baseline runtime guard remains always-on" in (violation.hint or "")
+
+
+def test_direct_message_violation_exposes_guard_context_and_hint():
+    protocol = _protocol_with_guard_set()
+    thread = {
+        "thread_id": "thread-999",
+        "current_phase": "review",
+        "participants": ["alice", "user"],
+        "phase_participants": ["alice"],
+    }
+
+    violation = validate_direct_message_targets(
+        thread=thread,
+        protocol=protocol,
+        from_agent="alice",
+        target_agents=["user"],
+    )
+
+    assert violation is not None
+    assert violation.error == "direct_message_not_allowed_in_phase"
+    assert violation.details["guard_source"] == "baseline"
+    assert violation.details["phase_guard_set"] == "review-default"
+    assert violation.details["declared_guards"] == [
+        "contribution_required",
+        "transition_precondition",
+    ]
+    assert "baseline runtime guard remains always-on" in (violation.hint or "")
+    assert "protocol-declared guards are additive" in (violation.hint or "")
 
 
 def test_stop_allows_when_actor_is_not_required_for_user_decision_phase():

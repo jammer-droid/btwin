@@ -158,6 +158,10 @@ def _render_contribution_hint(
 
 
 def build_protocol_plan_hint(thread_id: str, plan: ProtocolNextPlan) -> str | None:
+    phase_not_found_hint = f"Check `btwin thread show {thread_id}` and `btwin protocol next --thread {thread_id}`."
+    if plan.error == "phase_not_found":
+        return _append_guard_note(phase_not_found_hint, plan=plan)
+
     if not plan.passed:
         agent_name = None
         if plan.missing and isinstance(plan.missing[0], dict):
@@ -216,6 +220,21 @@ def _append_guard_note(hint: str | None, *, plan: ProtocolNextPlan) -> str | Non
     return f"{hint} {note}"
 
 
+def _append_phase_guard_note(
+    hint: str | None,
+    *,
+    protocol: Protocol,
+    phase_name: str | None,
+) -> str | None:
+    if not hint:
+        return hint
+    context = _resolve_phase_guard_context(protocol, phase_name)
+    return (
+        f"{hint} "
+        f"{_guard_note(phase_guard_set=context['phase_guard_set'], declared_guards=context['declared_guards'])}"
+    )
+
+
 def _hook_overlay_with_guard_context(
     *,
     overlay: str,
@@ -235,19 +254,29 @@ def validate_contribution_submission(
 ) -> WorkflowConstraintViolation | None:
     thread_id = _thread_id(thread)
     current_phase = _phase_name(thread)
+    guard_details = _resolve_phase_guard_context(protocol, current_phase)
     if not current_phase:
         return WorkflowConstraintViolation(
             error="phase_not_found",
             message="thread does not have an active phase",
-            hint=f"Check `btwin thread show {thread_id}` and `btwin protocol next --thread {thread_id}`.",
+            hint=_append_phase_guard_note(
+                f"Check `btwin thread show {thread_id}` and `btwin protocol next --thread {thread_id}`.",
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details=guard_details,
         )
 
     if phase_name != current_phase:
         return WorkflowConstraintViolation(
             error="phase_mismatch",
             message=f"current phase is `{current_phase}`, not `{phase_name}`",
-            hint=_render_contribution_hint(thread_id=thread_id, phase_name=current_phase, agent_name=actor),
-            details={"current_phase": current_phase, "requested_phase": phase_name},
+            hint=_append_phase_guard_note(
+                _render_contribution_hint(thread_id=thread_id, phase_name=current_phase, agent_name=actor),
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details={"current_phase": current_phase, "requested_phase": phase_name, **guard_details},
         )
 
     phase = _phase_definition(protocol, current_phase)
@@ -255,15 +284,24 @@ def validate_contribution_submission(
         return WorkflowConstraintViolation(
             error="phase_not_found",
             message=f"phase `{current_phase}` is not defined in protocol `{protocol.name}`",
-            hint=f"Inspect the protocol with `btwin protocol show {protocol.name}`.",
+            hint=_append_phase_guard_note(
+                f"Inspect the protocol with `btwin protocol show {protocol.name}`.",
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details=guard_details,
         )
 
     if "contribute" not in phase.actions and "decide" not in phase.actions:
         return WorkflowConstraintViolation(
             error="phase_action_not_allowed",
             message=f"phase `{current_phase}` does not accept structured contributions",
-            hint=f"Use `btwin thread send-message --thread {thread_id} ...` or `btwin protocol apply-next --thread {thread_id}` instead.",
-            details={"current_phase": current_phase, "phase_actions": list(phase.actions)},
+            hint=_append_phase_guard_note(
+                f"Use `btwin thread send-message --thread {thread_id} ...` or `btwin protocol apply-next --thread {thread_id}` instead.",
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details={"current_phase": current_phase, "phase_actions": list(phase.actions), **guard_details},
         )
 
     allowed_actors = _artifact_actors(thread, protocol, current_phase)
@@ -276,8 +314,12 @@ def validate_contribution_submission(
         return WorkflowConstraintViolation(
             error="actor_not_allowed_for_phase",
             message=f"`{actor}` is not allowed to submit the `{current_phase}` result",
-            hint=hint,
-            details={"current_phase": current_phase, "actor": actor, "allowed_actors": allowed_actors},
+            hint=_append_phase_guard_note(
+                hint,
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details={"current_phase": current_phase, "actor": actor, "allowed_actors": allowed_actors, **guard_details},
         )
 
     return None
@@ -293,23 +335,33 @@ def validate_direct_message_targets(
     thread_id = _thread_id(thread)
     current_phase = _phase_name(thread)
     phase = _phase_definition(protocol, current_phase)
+    guard_details = _resolve_phase_guard_context(protocol, current_phase)
     if current_phase is None or phase is None:
         return WorkflowConstraintViolation(
             error="phase_not_found",
             message="current phase is unavailable",
-            hint=f"Inspect the thread with `btwin thread show {thread_id}`.",
+            hint=_append_phase_guard_note(
+                f"Inspect the thread with `btwin thread show {thread_id}`.",
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
+            details=guard_details,
         )
 
     if "discuss" not in phase.actions and "review" not in phase.actions:
         return WorkflowConstraintViolation(
             error="direct_message_not_allowed_in_phase",
             message=f"phase `{current_phase}` does not allow direct chat routing",
-            hint=(
-                _render_contribution_hint(thread_id=thread_id, phase_name=current_phase, agent_name=from_agent)
-                if ("contribute" in phase.actions or "decide" in phase.actions)
-                else f"Try `btwin protocol apply-next --thread {thread_id}`."
+            hint=_append_phase_guard_note(
+                (
+                    _render_contribution_hint(thread_id=thread_id, phase_name=current_phase, agent_name=from_agent)
+                    if ("contribute" in phase.actions or "decide" in phase.actions)
+                    else f"Try `btwin protocol apply-next --thread {thread_id}`."
+                ),
+                protocol=protocol,
+                phase_name=current_phase,
             ),
-            details={"current_phase": current_phase, "phase_actions": list(phase.actions)},
+            details={"current_phase": current_phase, "phase_actions": list(phase.actions), **guard_details},
         )
 
     eligible_targets = [name for name in _phase_participants(thread) if name != from_agent]
@@ -319,11 +371,16 @@ def validate_direct_message_targets(
         return WorkflowConstraintViolation(
             error="target_not_eligible_for_phase",
             message=f"direct target is not eligible in phase `{current_phase}`",
-            hint=f"Eligible direct targets in `{current_phase}`: {participants}.",
+            hint=_append_phase_guard_note(
+                f"Eligible direct targets in `{current_phase}`: {participants}.",
+                protocol=protocol,
+                phase_name=current_phase,
+            ),
             details={
                 "current_phase": current_phase,
                 "invalid_targets": invalid_targets,
                 "eligible_targets": eligible_targets,
+                **guard_details,
             },
         )
 

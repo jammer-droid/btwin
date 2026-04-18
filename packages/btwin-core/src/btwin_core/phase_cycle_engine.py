@@ -41,6 +41,7 @@ def advance_phase_cycle(
 
     context_core = build_phase_cycle_context_core(
         thread=thread,
+        protocol=protocol,
         phase=target_phase,
         state=next_state,
         last_cycle_outcome=outcome,
@@ -51,11 +52,13 @@ def advance_phase_cycle(
 def build_phase_cycle_context_core(
     *,
     thread: dict[str, object],
+    protocol: Protocol | None,
     phase: ProtocolPhase,
     state: PhaseCycleState,
     last_cycle_outcome: str | None = None,
 ) -> ContextCore:
     current_step = _current_step(phase, state)
+    declared_guard_set = protocol.get_guard_set(phase.guard_set) if protocol is not None else None
     return ContextCore(
         thread_goal=str(thread.get("topic") or thread.get("thread_id") or ""),
         phase_purpose=phase.description or phase.name,
@@ -72,6 +75,8 @@ def build_phase_cycle_context_core(
         current_step_label=state.current_step_label,
         current_step_alias=_step_alias(current_step, state.current_step_label),
         current_step_role=current_step.role if current_step is not None else None,
+        guard_set=phase.guard_set,
+        declared_guards=list(declared_guard_set.guards) if declared_guard_set is not None else [],
     )
 
 
