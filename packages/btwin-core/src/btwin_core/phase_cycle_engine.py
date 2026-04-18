@@ -82,6 +82,9 @@ def build_phase_cycle_context_core(
 ) -> ContextCore:
     current_step = _current_step(phase, state)
     declared_guard_set = protocol.get_guard_set(phase.guard_set) if protocol is not None else None
+    declared_outcome_policy = (
+        protocol.get_outcome_policy(phase.outcome_policy) if protocol is not None else None
+    )
     return ContextCore(
         thread_goal=str(thread.get("topic") or thread.get("thread_id") or ""),
         phase_purpose=phase.description or phase.name,
@@ -101,6 +104,16 @@ def build_phase_cycle_context_core(
         current_step_role=current_step.role if current_step is not None else None,
         guard_set=phase.guard_set,
         declared_guards=list(declared_guard_set.guards) if declared_guard_set is not None else [],
+        outcome_policy=phase.outcome_policy,
+        outcome_emitters=(
+            list(declared_outcome_policy.emitters) if declared_outcome_policy is not None else []
+        ),
+        outcome_actions=(
+            list(declared_outcome_policy.actions) if declared_outcome_policy is not None else []
+        ),
+        policy_outcomes=(
+            list(declared_outcome_policy.outcomes) if declared_outcome_policy is not None else []
+        ),
     )
 
 

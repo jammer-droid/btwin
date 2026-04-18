@@ -11,7 +11,14 @@ from btwin_core.agent_store import AgentStore
 from btwin_core.config import BTwinConfig, RuntimeConfig
 from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_store import PhaseCycleStore
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolPhase,
+    ProtocolSection,
+    ProtocolStore,
+    ProtocolTransition,
+    compile_protocol_definition,
+)
 from btwin_core.runtime_binding_store import RuntimeBindingStore
 from btwin_core.thread_store import ThreadStore
 from btwin_core.workflow_event_log import WorkflowEventLog
@@ -262,29 +269,35 @@ def test_standalone_phase_cycle_payload_prefers_protocol_keys_in_visuals(tmp_pat
     thread_store = ThreadStore(project_root / ".btwin" / "threads")
     protocol_store = ProtocolStore(project_root / ".btwin" / "protocols")
     protocol_store.save_protocol(
-        Protocol(
-            name="review-loop",
-            phases=[
-                ProtocolPhase(
-                    name="review",
-                    actions=["contribute"],
-                    template=[ProtocolSection(section="completed", required=True)],
-                    procedure=[
-                        {"role": "reviewer", "action": "review", "alias": "Review", "key": "step-review"},
-                        {"role": "implementer", "action": "revise", "alias": "Revise", "key": "step-revise"},
-                    ],
-                ),
-                ProtocolPhase(name="decision", actions=["decide"]),
-            ],
-            transitions=[
-                ProtocolTransition.model_validate(
-                    {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate", "key": "gate-retry"}
-                ),
-                ProtocolTransition.model_validate(
-                    {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate", "key": "gate-accept"}
-                ),
-            ],
-            outcomes=["retry", "accept"],
+        compile_protocol_definition(
+            {
+                "name": "review-loop",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "outcome_policy": "review-outcomes",
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review", "key": "step-review"},
+                            {"role": "implementer", "action": "revise", "alias": "Revise", "key": "step-revise"},
+                        ],
+                    },
+                    {"name": "decision", "actions": ["decide"]},
+                ],
+                "transitions": [
+                    {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate", "key": "gate-retry"},
+                    {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate", "key": "gate-accept"},
+                ],
+                "outcome_policies": [
+                    {
+                        "name": "review-outcomes",
+                        "emitters": ["reviewer", "user"],
+                        "actions": ["decide"],
+                        "outcomes": ["retry", "accept"],
+                    }
+                ],
+            }
         )
     )
     thread = thread_store.create_thread(
@@ -314,6 +327,10 @@ def test_standalone_phase_cycle_payload_prefers_protocol_keys_in_visuals(tmp_pat
     payload = main._phase_cycle_payload_for_thread(thread["thread_id"], thread=thread, config=_standalone_config(data_dir))
 
     assert payload is not None
+    assert payload["context_core"]["outcome_policy"] == "review-outcomes"
+    assert payload["context_core"]["outcome_emitters"] == ["reviewer", "user"]
+    assert payload["context_core"]["outcome_actions"] == ["decide"]
+    assert payload["context_core"]["policy_outcomes"] == ["retry", "accept"]
     assert payload["visual"]["procedure"][0] == {"key": "step-review", "label": "Review", "status": "active"}
     assert payload["visual"]["procedure"][1] == {"key": "step-revise", "label": "Revise", "status": "pending"}
     assert payload["visual"]["gates"][0] == {
