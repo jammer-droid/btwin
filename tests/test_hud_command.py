@@ -937,6 +937,48 @@ def test_render_thread_watch_colors_allow_and_noop_headlines():
     assert "[green]04:07:27  BTWIN -> CODEX  Required result recorded[/green]" in rendered
 
 
+def test_render_thread_watch_uses_normalized_rows_as_canonical_boundary():
+    thread = {
+        "thread_id": "thread-1",
+        "protocol": "review-loop",
+        "current_phase": "review",
+    }
+    status_summary = {"agents": [{"name": "alice", "status": "contributed"}]}
+    trace = [
+        {
+            "kind": "gate",
+            "timestamp": "2026-04-15T04:07:27+00:00",
+            "thread_id": "thread-1",
+            "phase": "review",
+            "cycle_index": 1,
+            "next_cycle_index": 2,
+            "outcome": "retry",
+            "procedure_key": "review-pass",
+            "procedure_alias": "Review",
+            "gate_key": "retry-loop",
+            "gate_alias": "Retry Gate",
+            "target_phase": "review",
+            "reason": None,
+            "summary": "Retry gate advanced review to cycle 2.",
+            "source": "btwin.protocol.apply_next",
+            "agent": "alice",
+            "session_id": None,
+            "turn_id": None,
+            "event_type": "unexpected_raw_event_name",
+            "hook_event_name": None,
+            "decision": None,
+        }
+    ]
+
+    rendered = main._render_thread_watch(thread, status_summary, trace)
+
+    assert "[green]04:07:27  BTWIN -> CODEX  Retry Gate completed[/green]" in rendered
+    assert "procedure: Review [review-pass]" in rendered
+    assert "gate: Retry Gate [retry-loop]" in rendered
+    assert "outcome: retry" in rendered
+    assert "target: review" in rendered
+
+
 def test_build_thread_watch_trace_rows_normalizes_required_fields():
     thread = {
         "thread_id": "thread-1",

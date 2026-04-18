@@ -6,7 +6,9 @@ from typer.testing import CliRunner
 import btwin_cli.main as main
 from btwin_cli.main import app
 from btwin_core.config import BTwinConfig, RuntimeConfig
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore
+from btwin_core.phase_cycle import PhaseCycleState
+from btwin_core.phase_cycle_store import PhaseCycleStore
+from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
 from btwin_core.thread_store import ThreadStore
 from btwin_core.workflow_event_log import WorkflowEventLog
 
@@ -83,6 +85,92 @@ def _seed_thread(tmp_path: Path):
             "reason": "stale_last_seen",
             "summary": "Runtime binding closed: stale last seen.",
         }
+    )
+    return project_root, data_dir, thread_store, thread
+
+
+def _seed_retry_trace_thread(tmp_path: Path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store = ThreadStore(project_root / ".btwin" / "threads")
+    protocol_store = ProtocolStore(project_root / ".btwin" / "protocols")
+    protocol_store.save_protocol(
+        Protocol(
+            name="review-loop",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review", "key": "review-pass"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise", "key": "revise-pass"},
+                    ],
+                ),
+                ProtocolPhase(name="decision", actions=["decide"]),
+            ],
+            transitions=[
+                ProtocolTransition.model_validate(
+                    {"from": "review", "to": "review", "on": "retry", "alias": "Retry Gate", "key": "retry-loop"}
+                ),
+                ProtocolTransition.model_validate(
+                    {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate", "key": "accept-gate"}
+                ),
+            ],
+            outcomes=["retry", "accept"],
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="Retry trace",
+        protocol="review-loop",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(project_root / ".btwin").write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+    WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).append(
+        {
+            "timestamp": "2026-04-15T01:10:02+00:00",
+            "thread_id": thread["thread_id"],
+            "phase": "review",
+            "event_type": "cycle_gate_completed",
+            "source": "btwin.protocol.apply_next",
+            "cycle_index": 1,
+            "next_cycle_index": 2,
+            "summary": "Phase `review` requested retry; continuing in `review` with active cycle 2.",
+        }
+    )
+    mailbox_path = project_root / ".btwin" / "runtime" / "system-mailbox.jsonl"
+    mailbox_path.parent.mkdir(parents=True, exist_ok=True)
+    mailbox_path.write_text(
+        json.dumps(
+            {
+                "thread_id": thread["thread_id"],
+                "report_type": "cycle_result",
+                "audience": "monitoring",
+                "summary": "Phase `review` requested retry; continuing in `review` with active cycle 2.",
+                "cycle_finished": True,
+                "created_at": "2026-04-15T01:10:02+00:00",
+                "phase": "review",
+                "protocol": "review-loop",
+                "next_phase": "review",
+                "cycle_index": 1,
+                "next_cycle_index": 2,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
     return project_root, data_dir, thread_store, thread
 
@@ -211,3 +299,28 @@ def test_thread_watch_help_describes_timeline_not_hud():
     assert result.exit_code == 0, result.output
     assert "timeline" in result.output.lower()
     assert "hud" not in result.output.lower()
+
+
+def test_thread_watch_json_derives_gate_semantics_from_existing_runtime_state(tmp_path, monkeypatch):
+    project_root, data_dir, thread_store, thread = _seed_retry_trace_thread(tmp_path)
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+    monkeypatch.setattr(main, "_get_thread_store", lambda: thread_store)
+
+    result = runner.invoke(app, ["thread", "watch", thread["thread_id"], "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    row = payload["trace"][-1]
+
+    assert row["kind"] == "gate"
+    assert row["phase"] == "review"
+    assert row["cycle_index"] == 1
+    assert row["next_cycle_index"] == 2
+    assert row["procedure_key"] == "review-pass"
+    assert row["procedure_alias"] == "Review"
+    assert row["gate_key"] == "retry-loop"
+    assert row["gate_alias"] == "Retry Gate"
+    assert row["outcome"] == "retry"
+    assert row["target_phase"] == "review"
