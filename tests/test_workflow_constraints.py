@@ -1,4 +1,10 @@
-from btwin_core.protocol_store import Protocol, ProtocolGuardSet, ProtocolPhase, ProtocolSection
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolGuardSet,
+    ProtocolPhase,
+    ProtocolSection,
+    compile_protocol_definition,
+)
 from btwin_core.workflow_constraints import (
     evaluate_workflow_hook,
     validate_contribution_submission,
@@ -48,6 +54,53 @@ def _protocol_with_guard_set() -> Protocol:
                 decided_by="user",
             ),
         ],
+    )
+
+
+def _compiled_authoring_protocol() -> Protocol:
+    return compile_protocol_definition(
+        {
+            "name": "workflow-check-authoring",
+            "description": "Authoring protocol compiled into the runtime shape",
+            "guard_sets": [
+                {
+                    "name": "review-default",
+                    "guards": ["contribution_required", "transition_precondition"],
+                }
+            ],
+            "phases": [
+                {
+                    "name": "review",
+                    "actions": ["contribute"],
+                    "template": [{"section": "completed", "required": True}],
+                    "guard_set": "review-default",
+                    "gate": "review-gate",
+                    "outcome_policy": "review-outcomes",
+                },
+                {
+                    "name": "decision",
+                    "actions": ["decide"],
+                    "decided_by": "user",
+                },
+            ],
+            "gates": [
+                {
+                    "name": "review-gate",
+                    "routes": [
+                        {"outcome": "retry", "target_phase": "review"},
+                        {"outcome": "accept", "target_phase": "decision"},
+                    ],
+                }
+            ],
+            "outcome_policies": [
+                {
+                    "name": "review-outcomes",
+                    "emitters": ["reviewer", "user"],
+                    "actions": ["decide"],
+                    "outcomes": ["retry", "accept"],
+                }
+            ],
+        }
     )
 
 
@@ -132,6 +185,39 @@ def test_protocol_guard_set_does_not_disable_transition_precondition():
         "contribution_required",
         "transition_precondition",
     ]
+    assert "baseline runtime guard" in (violation.hint or "")
+
+
+def test_compiled_authoring_protocol_exposes_guard_and_outcome_policy_hints_without_weakening_guards():
+    protocol = _compiled_authoring_protocol()
+    thread = {
+        "thread_id": "thread-456",
+        "current_phase": "review",
+        "participants": ["alice"],
+        "phase_participants": ["alice"],
+    }
+    contributions = [
+        {
+            "agent": "alice",
+            "phase": "review",
+            "_content": "## completed\nImplemented the requested change.\n",
+        }
+    ]
+
+    violation = validate_thread_close(thread=thread, protocol=protocol, contributions=contributions)
+
+    assert violation is not None
+    assert violation.error == "thread_not_closable_from_phase"
+    assert violation.details["guard_source"] == "baseline"
+    assert violation.details["phase_guard_set"] == "review-default"
+    assert violation.details["declared_guards"] == [
+        "contribution_required",
+        "transition_precondition",
+    ]
+    assert violation.details["outcome_policy"] == "review-outcomes"
+    assert violation.details["outcome_emitters"] == ["reviewer", "user"]
+    assert violation.details["outcome_actions"] == ["decide"]
+    assert violation.details["policy_outcomes"] == ["retry", "accept"]
     assert "baseline runtime guard" in (violation.hint or "")
 
 

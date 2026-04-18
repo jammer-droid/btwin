@@ -1,3 +1,5 @@
+"""Shared phase-cycle visual payload builder for CLI and API surfaces."""
+
 from __future__ import annotations
 
 from btwin_core.phase_cycle import PhaseCycleState
@@ -5,12 +7,11 @@ from btwin_core.phase_cycle_engine import resolve_phase_cycle_current_step_index
 from btwin_core.protocol_store import Protocol, ProtocolPhase
 
 
-def build_phase_cycle_visual(
+def build_phase_cycle_visual_payload(
     *,
     protocol: Protocol | None,
     phase: ProtocolPhase | None,
     state: PhaseCycleState,
-    gate_label: str = "Gate",
 ) -> dict[str, object]:
     procedure_nodes: list[dict[str, object]] = []
     current_step_index = resolve_phase_cycle_current_step_index(phase, state)
@@ -24,7 +25,13 @@ def build_phase_cycle_visual(
                 status = "completed"
             elif current_step_index is not None and index == current_step_index:
                 status = "active"
-            procedure_nodes.append({"key": step.visual_key(), "label": step.visual_label(), "status": status})
+            procedure_nodes.append(
+                {
+                    "key": step.visual_key(),
+                    "label": step.visual_label(),
+                    "status": status,
+                }
+            )
     else:
         step_labels = [step for step in state.procedure_steps if isinstance(step, str)]
         for index, step in enumerate(step_labels):
@@ -37,7 +44,7 @@ def build_phase_cycle_visual(
                 status = "active"
             procedure_nodes.append({"key": step, "label": step, "status": status})
     gate_status = "completed" if state.status == "completed" else "pending"
-    procedure_nodes.append({"key": "gate", "label": gate_label, "status": gate_status})
+    procedure_nodes.append({"key": "gate", "label": "Gate", "status": gate_status})
 
     gate_nodes: list[dict[str, object]] = []
     if protocol is not None:

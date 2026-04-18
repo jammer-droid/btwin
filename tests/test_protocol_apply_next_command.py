@@ -6,7 +6,15 @@ from typer.testing import CliRunner
 import btwin_cli.main as main
 from btwin_cli.main import app
 from btwin_core.config import BTwinConfig, RuntimeConfig
-from btwin_core.protocol_store import Protocol, ProtocolInteraction, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolInteraction,
+    ProtocolPhase,
+    ProtocolSection,
+    ProtocolStore,
+    ProtocolTransition,
+    compile_protocol_definition,
+)
 from btwin_core.runtime_binding_store import RuntimeBindingStore
 from btwin_core.thread_store import ThreadStore
 
@@ -103,45 +111,65 @@ def _transition_protocol() -> Protocol:
 
 
 def _review_retry_protocol() -> Protocol:
-    return Protocol(
-        name="review-retry",
-        description="Repeat the same phase until accepted",
-        guard_sets=[
-            {
-                "name": "review-default",
-                "guards": [
-                    "phase_actor_eligibility",
-                    "direct_target_eligibility",
-                ],
-            }
-        ],
-        phases=[
-            ProtocolPhase(
-                name="review",
-                description="Review and revise the work.",
-                actions=["contribute"],
-                template=[ProtocolSection(section="completed", required=True)],
-                guard_set="review-default",
-                procedure=[
-                    {
-                        "role": "reviewer",
-                        "action": "review",
-                        "guidance": "Review the current implementation state.",
-                    },
-                    {
-                        "role": "implementer",
-                        "action": "revise",
-                        "guidance": "Implement revisions from review feedback.",
-                    },
-                ],
-            ),
-            ProtocolPhase(name="decision", description="Record final acceptance.", actions=["decide"]),
-        ],
-        transitions=[
-            ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"}),
-            ProtocolTransition.model_validate({"from": "review", "to": "decision", "on": "accept"}),
-        ],
-        outcomes=["retry", "accept"],
+    return compile_protocol_definition(
+        {
+            "name": "review-retry",
+            "description": "Repeat the same phase until accepted",
+            "guard_sets": [
+                {
+                    "name": "review-default",
+                    "guards": [
+                        "phase_actor_eligibility",
+                        "direct_target_eligibility",
+                    ],
+                }
+            ],
+            "phases": [
+                {
+                    "name": "review",
+                    "description": "Review and revise the work.",
+                    "actions": ["contribute"],
+                    "template": [{"section": "completed", "required": True}],
+                    "guard_set": "review-default",
+                    "gate": "review-gate",
+                    "outcome_policy": "review-outcomes",
+                    "procedure": [
+                        {
+                            "role": "reviewer",
+                            "action": "review",
+                            "guidance": "Review the current implementation state.",
+                        },
+                        {
+                            "role": "implementer",
+                            "action": "revise",
+                            "guidance": "Implement revisions from review feedback.",
+                        },
+                    ],
+                },
+                {
+                    "name": "decision",
+                    "description": "Record final acceptance.",
+                    "actions": ["decide"],
+                },
+            ],
+            "gates": [
+                {
+                    "name": "review-gate",
+                    "routes": [
+                        {"outcome": "retry", "target_phase": "review"},
+                        {"outcome": "accept", "target_phase": "decision"},
+                    ],
+                }
+            ],
+            "outcome_policies": [
+                {
+                    "name": "review-outcomes",
+                    "emitters": ["reviewer", "user"],
+                    "actions": ["decide"],
+                    "outcomes": ["retry", "accept"],
+                }
+            ],
+        }
     )
 
 
@@ -196,6 +224,71 @@ def test_protocol_next_reports_manual_outcome_needed(tmp_path, monkeypatch):
     assert payload["suggested_action"] == "record_outcome"
     assert payload["valid_outcomes"] == ["yes", "no"]
     assert payload["next_phase"] is None
+
+
+def test_protocol_next_uses_unquoted_on_transitions_from_hand_written_yaml(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store, thread = _seed_agentless_thread(
+        project_root,
+        "custom-review",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    protocols_dir = project_root / ".btwin" / "protocols"
+    protocols_dir.mkdir(parents=True, exist_ok=True)
+    (protocols_dir / "custom-review.yaml").write_text(
+        """
+name: custom-review
+description: Hand-written custom review protocol.
+phases:
+  - name: review
+    actions: [contribute]
+    template:
+      - section: completed
+        required: true
+  - name: decision
+    actions: [decide]
+transitions:
+  - from: review
+    to: review
+    on: retry
+  - from: review
+    to: decision
+    on: accept
+outcomes: [retry, accept]
+""",
+        encoding="utf-8",
+    )
+    thread_store.submit_contribution(
+        thread["thread_id"],
+        "alice",
+        "review",
+        content="## completed\nNeeds another pass.\n",
+        tldr="review retry",
+    )
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "next",
+            "--thread",
+            thread["thread_id"],
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["requested_outcome"] == "retry"
+    assert payload["next_phase"] == "review"
+    assert payload["suggested_action"] == "advance_phase"
 
 
 def test_protocol_next_reports_unsupported_outcome_error(tmp_path, monkeypatch):
@@ -313,10 +406,51 @@ def test_protocol_apply_next_updates_phase_cycle_state_on_retry(tmp_path, monkey
         "phase_actor_eligibility",
         "direct_target_eligibility",
     ]
+    assert payload["context_core"]["outcome_policy"] == "review-outcomes"
+    assert payload["context_core"]["outcome_emitters"] == ["reviewer", "user"]
+    assert payload["context_core"]["outcome_actions"] == ["decide"]
+    assert payload["context_core"]["policy_outcomes"] == ["retry", "accept"]
     assert payload["context_core"]["next_expected_role"] == "reviewer"
     assert payload["context_core"]["next_expected_action"] == "Review the current implementation state."
     assert payload["context_core"]["current_step_alias"] == "review"
     assert payload["context_core"]["current_step_role"] == "reviewer"
+
+
+def test_protocol_next_exposes_compiled_outcome_policy_hints(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store, thread = _seed_agentless_thread(project_root, "review-retry", participants=["alice"], initial_phase="review")
+    _save_protocol(project_root, _review_retry_protocol())
+    thread_store.submit_contribution(
+        thread["thread_id"],
+        "alice",
+        "review",
+        content="## completed\nNeeds another pass.\n",
+        tldr="review retry",
+    )
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "next",
+            "--thread",
+            thread["thread_id"],
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["outcome_policy"] == "review-outcomes"
+    assert payload["outcome_emitters"] == ["reviewer", "user"]
+    assert payload["outcome_actions"] == ["decide"]
+    assert payload["policy_outcomes"] == ["retry", "accept"]
 
 
 def test_protocol_apply_next_reports_unsupported_outcome_error(tmp_path, monkeypatch):

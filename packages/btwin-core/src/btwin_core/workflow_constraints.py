@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from btwin_core.protocol_flow import ProtocolNextPlan, describe_next
-from btwin_core.protocol_store import Protocol
+from btwin_core.protocol_store import Protocol, ensure_protocol_compiled
 from btwin_core.protocol_validator import ProtocolValidator
 
 
@@ -111,21 +111,20 @@ def _artifact_actors(thread: dict, protocol: Protocol, phase_name: str | None) -
 
 def _resolve_phase_guard_context(protocol: Protocol, phase_name: str | None) -> dict[str, object]:
     phase = _phase_definition(protocol, phase_name)
-    if phase is None:
-        phase_guard_set = None
-        declared_guards: list[str] = []
-    else:
-        declared_guard_set = protocol.get_guard_set(phase.guard_set)
-        if declared_guard_set is None:
-            phase_guard_set = phase.guard_set
-            declared_guards = []
-        else:
-            phase_guard_set = declared_guard_set.name
-            declared_guards = list(declared_guard_set.guards)
+    phase_guard_set = phase.guard_set if phase is not None else None
+    declared_guards = list(phase.declared_guards) if phase is not None else []
+    outcome_policy = phase.outcome_policy if phase is not None else None
+    outcome_emitters = list(phase.outcome_emitters) if phase is not None else []
+    outcome_actions = list(phase.outcome_actions) if phase is not None else []
+    policy_outcomes = list(phase.policy_outcomes) if phase is not None else []
     return {
         "guard_source": "baseline",
         "phase_guard_set": phase_guard_set,
         "declared_guards": declared_guards,
+        "outcome_policy": outcome_policy,
+        "outcome_emitters": outcome_emitters,
+        "outcome_actions": outcome_actions,
+        "policy_outcomes": policy_outcomes,
         "baseline_guards": [
             "contribution_required",
             "phase_actor_eligibility",
@@ -252,6 +251,7 @@ def validate_contribution_submission(
     actor: str,
     phase_name: str,
 ) -> WorkflowConstraintViolation | None:
+    protocol = ensure_protocol_compiled(protocol)
     thread_id = _thread_id(thread)
     current_phase = _phase_name(thread)
     guard_details = _resolve_phase_guard_context(protocol, current_phase)
@@ -332,6 +332,7 @@ def validate_direct_message_targets(
     from_agent: str,
     target_agents: list[str],
 ) -> WorkflowConstraintViolation | None:
+    protocol = ensure_protocol_compiled(protocol)
     thread_id = _thread_id(thread)
     current_phase = _phase_name(thread)
     phase = _phase_definition(protocol, current_phase)
@@ -393,6 +394,7 @@ def validate_thread_close(
     protocol: Protocol,
     contributions: list[dict],
 ) -> WorkflowConstraintViolation | None:
+    protocol = ensure_protocol_compiled(protocol)
     thread_id = _thread_id(thread)
     phase_name = _phase_name(thread)
     plan = describe_next(thread, protocol, contributions)
@@ -476,6 +478,7 @@ def evaluate_workflow_hook(
     contributions: list[dict],
 ) -> WorkflowHookResult:
     """Evaluate the minimal workflow constraint contract for one hook event."""
+    protocol = ensure_protocol_compiled(protocol)
     phase_name = _phase_name(thread)
     phase = _phase_definition(protocol, phase_name)
     required_sections = _required_sections(protocol, phase_name)

@@ -50,11 +50,19 @@ from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_engine import (
     advance_phase_cycle,
     build_phase_cycle_context_core,
+    build_phase_cycle_trace_context,
     phase_cycle_procedure_actions,
 )
 from btwin_core.phase_cycle_store import PhaseCycleStore
 from btwin_core.protocol_flow import describe_next
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolStore
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolPhase,
+    ProtocolStore,
+    build_protocol_preview,
+    compile_protocol_definition,
+    load_protocol_yaml,
+)
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.sources import SourceRegistry
 from btwin_core.system_mailbox_store import SystemMailboxStore
@@ -81,7 +89,7 @@ from btwin_cli.provider_init import (
     validate_provider_cli,
     write_provider_config,
 )
-from btwin_cli.phase_cycle_visual import build_phase_cycle_visual
+from btwin_cli.phase_cycle_visual import build_phase_cycle_visual_payload
 from btwin_cli.resource_paths import resolve_bundled_skills_dir
 from btwin_core.resource_paths import resolve_bundled_protocols_dir
 
@@ -343,7 +351,473 @@ def _try_load_thread_snapshot(thread_id: str, config: BTwinConfig) -> tuple[dict
     return thread, status_summary, None
 
 
-def _render_thread_watch(thread: dict[str, object], status_summary: dict[str, object], events: list[dict[str, object]]) -> str:
+def _thread_watch_kind_for_event(event_type: str) -> str:
+    if event_type == "phase_attempt_started":
+        return "attempt"
+    if event_type in {"hook_received", "hook_decision", "phase_exit_check_requested", "phase_exit_blocked"}:
+        return "guard"
+    if event_type == "required_result_recorded":
+        return "result"
+    if event_type == "cycle_gate_completed":
+        return "gate"
+    if event_type.startswith("runtime_"):
+        return "runtime"
+    if event_type.startswith("phase_"):
+        return "phase"
+    if "gate" in event_type:
+        return "gate"
+    if "result" in event_type:
+        return "result"
+    if "hook" in event_type or "guard" in event_type:
+        return "guard"
+    return "phase"
+
+
+def _thread_watch_protocol(
+    thread: dict[str, object],
+    config: BTwinConfig | None = None,
+) -> Protocol | None:
+    current_config = config or _get_config()
+    protocol_name = thread.get("protocol")
+    if not isinstance(protocol_name, str) or not protocol_name.strip():
+        return None
+    if _use_attached_api(current_config):
+        try:
+            payload = _api_get(f"/api/protocols/{protocol_name}")
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            try:
+                return compile_protocol_definition(payload)
+            except Exception:
+                pass
+    return _get_protocol_store().get_protocol(protocol_name)
+
+
+def _thread_watch_protocol_phase(protocol: Protocol | None, phase_name: object) -> ProtocolPhase | None:
+    if protocol is None or not isinstance(phase_name, str):
+        return None
+    return next((phase for phase in protocol.phases if phase.name == phase_name), None)
+
+
+def _thread_watch_cycle_report(
+    row: dict[str, object],
+    reports: list[dict[str, object]],
+) -> dict[str, object] | None:
+    for report in reports:
+        if str(report.get("report_type")) != "cycle_result":
+            continue
+        report_phase = report.get("phase")
+        if row.get("phase") and report_phase and report_phase != row.get("phase"):
+            continue
+        report_cycle_index = report.get("cycle_index")
+        if row.get("cycle_index") is not None and report_cycle_index is not None and report_cycle_index != row.get("cycle_index"):
+            continue
+        report_next_cycle_index = report.get("next_cycle_index")
+        if (
+            row.get("next_cycle_index") is not None
+            and report_next_cycle_index is not None
+            and report_next_cycle_index != row.get("next_cycle_index")
+        ):
+            continue
+        return report
+    return None
+
+
+def _thread_watch_active_procedure_row(
+    phase_cycle_payload: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(phase_cycle_payload, dict):
+        return None
+    visual = phase_cycle_payload.get("visual")
+    if not isinstance(visual, dict):
+        return None
+    procedure = visual.get("procedure")
+    if not isinstance(procedure, list):
+        return None
+    active = next(
+        (
+            node
+            for node in procedure
+            if isinstance(node, dict) and node.get("status") == "active" and node.get("key") != "gate"
+        ),
+        None,
+    )
+    if isinstance(active, dict):
+        return active
+    completed = [
+        node
+        for node in procedure
+        if isinstance(node, dict) and node.get("status") == "completed" and node.get("key") != "gate"
+    ]
+    if completed:
+        return completed[-1]
+    return None
+
+
+def _thread_watch_completed_gate_row(
+    phase_cycle_payload: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(phase_cycle_payload, dict):
+        return None
+    visual = phase_cycle_payload.get("visual")
+    if not isinstance(visual, dict):
+        return None
+    gates = visual.get("gates")
+    if not isinstance(gates, list):
+        return None
+    return next(
+        (node for node in gates if isinstance(node, dict) and node.get("status") == "completed"),
+        None,
+    )
+
+
+def _enrich_thread_watch_gate_row(
+    *,
+    row: dict[str, object],
+    thread: dict[str, object],
+    protocol: Protocol | None,
+    phase_cycle_payload: dict[str, object] | None,
+    reports: list[dict[str, object]],
+) -> None:
+    source_phase_name = row.get("phase") or thread.get("current_phase")
+    source_phase = _thread_watch_protocol_phase(protocol, source_phase_name)
+    if source_phase is None or protocol is None:
+        return
+
+    cycle_report = _thread_watch_cycle_report(row, reports)
+    if row.get("target_phase") is None and isinstance(cycle_report, dict):
+        row["target_phase"] = cycle_report.get("next_phase")
+
+    current_state = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else None
+    if row.get("outcome") is None and isinstance(current_state, dict) and source_phase.name == thread.get("current_phase"):
+        current_outcome = current_state.get("last_gate_outcome")
+        if isinstance(current_outcome, str) and current_outcome.strip():
+            row["outcome"] = current_outcome
+
+    completed_gate = None
+    if source_phase.name == thread.get("current_phase"):
+        completed_gate = _thread_watch_completed_gate_row(phase_cycle_payload)
+        if row.get("gate_key") is None and isinstance(completed_gate, dict):
+            row["gate_key"] = completed_gate.get("key")
+        if row.get("gate_alias") is None and isinstance(completed_gate, dict):
+            row["gate_alias"] = completed_gate.get("label")
+        if row.get("target_phase") is None and isinstance(completed_gate, dict):
+            row["target_phase"] = completed_gate.get("target_phase")
+
+    transitions = [transition for transition in protocol.transitions if transition.from_phase == source_phase.name]
+    selected_transition = None
+    if row.get("gate_key"):
+        selected_transition = next(
+            (transition for transition in transitions if transition.visual_key() == row.get("gate_key")),
+            None,
+        )
+    if selected_transition is None and row.get("outcome"):
+        selected_transition = next(
+            (transition for transition in transitions if transition.on == row.get("outcome")),
+            None,
+        )
+    if selected_transition is None and row.get("target_phase"):
+        matches = [transition for transition in transitions if transition.to == row.get("target_phase")]
+        if len(matches) == 1:
+            selected_transition = matches[0]
+    if selected_transition is None and isinstance(completed_gate, dict):
+        gate_label = completed_gate.get("label")
+        selected_transition = next(
+            (
+                transition
+                for transition in transitions
+                if transition.visual_label() == gate_label or transition.visual_key() == completed_gate.get("key")
+            ),
+            None,
+        )
+
+    if selected_transition is not None:
+        row["gate_key"] = selected_transition.visual_key()
+        row["gate_alias"] = selected_transition.visual_label()
+        row["target_phase"] = selected_transition.to
+        if row.get("outcome") is None:
+            row["outcome"] = selected_transition.on
+
+    row["outcome_policy"] = source_phase.outcome_policy
+    row["outcome_emitters"] = list(source_phase.outcome_emitters)
+    row["outcome_actions"] = list(source_phase.outcome_actions)
+    row["policy_outcomes"] = list(source_phase.policy_outcomes)
+
+    if row.get("procedure_key") is None or row.get("procedure_alias") is None:
+        procedure_row = None
+        if source_phase.name == thread.get("current_phase"):
+            procedure_row = _thread_watch_active_procedure_row(phase_cycle_payload)
+        if isinstance(procedure_row, dict):
+            row["procedure_key"] = row.get("procedure_key") or procedure_row.get("key")
+            row["procedure_alias"] = row.get("procedure_alias") or procedure_row.get("label")
+        elif source_phase.procedure:
+            first_step = source_phase.procedure[0]
+            row["procedure_key"] = row.get("procedure_key") or first_step.visual_key()
+            row["procedure_alias"] = row.get("procedure_alias") or first_step.visual_label()
+
+
+def _enrich_thread_watch_row(
+    *,
+    row: dict[str, object],
+    thread: dict[str, object],
+    protocol: Protocol | None,
+    phase_cycle_payload: dict[str, object] | None,
+    reports: list[dict[str, object]],
+) -> None:
+    if row.get("kind") == "gate":
+        _enrich_thread_watch_gate_row(
+            row=row,
+            thread=thread,
+            protocol=protocol,
+            phase_cycle_payload=phase_cycle_payload,
+            reports=reports,
+        )
+
+
+def _synthetic_thread_watch_gate_row(
+    *,
+    thread: dict[str, object],
+    protocol: Protocol | None,
+    phase_cycle_payload: dict[str, object] | None,
+    reports: list[dict[str, object]],
+    existing_rows: list[dict[str, object]],
+) -> dict[str, object] | None:
+    if any(row.get("kind") == "gate" for row in existing_rows):
+        return None
+    if protocol is None or not isinstance(phase_cycle_payload, dict):
+        return None
+    state = phase_cycle_payload.get("state")
+    if not isinstance(state, dict):
+        return None
+    current_phase_name = state.get("phase_name") or thread.get("current_phase")
+    if not isinstance(current_phase_name, str) or not current_phase_name.strip():
+        return None
+
+    outcome = state.get("last_gate_outcome")
+    if not isinstance(outcome, str) or not outcome.strip():
+        outcome = state.get("last_cycle_outcome")
+    if not isinstance(outcome, str) or not outcome.strip():
+        return None
+
+    cycle_index_value = state.get("cycle_index")
+    if not isinstance(cycle_index_value, int) or cycle_index_value < 1:
+        return None
+
+    selected_transition = None
+    transition_matches = [
+        transition
+        for transition in protocol.transitions
+        if transition.to == current_phase_name and transition.on == outcome
+    ]
+    if len(transition_matches) == 1:
+        selected_transition = transition_matches[0]
+
+    source_phase_name = selected_transition.from_phase if selected_transition is not None else current_phase_name
+    status = state.get("status")
+    fallback_cycle_index = None
+    fallback_next_cycle_index = None
+    if status == "active" and cycle_index_value > 1:
+        if selected_transition is not None and selected_transition.to != selected_transition.from_phase:
+            fallback_cycle_index = cycle_index_value
+            fallback_next_cycle_index = cycle_index_value
+        else:
+            fallback_cycle_index = cycle_index_value - 1
+            fallback_next_cycle_index = cycle_index_value
+    elif status == "active" and selected_transition is not None and selected_transition.to != selected_transition.from_phase:
+        fallback_cycle_index = cycle_index_value
+        fallback_next_cycle_index = cycle_index_value
+
+    cycle_report = _thread_watch_cycle_report(
+        {
+            "phase": source_phase_name,
+            "cycle_index": fallback_cycle_index,
+            "next_cycle_index": fallback_next_cycle_index,
+        },
+        reports,
+    )
+
+    if cycle_report is None and fallback_cycle_index is None:
+        return None
+
+    row = {
+        "kind": "gate",
+        "timestamp": (
+            cycle_report.get("created_at")
+            if isinstance(cycle_report, dict)
+            else state.get("last_completed_at")
+        ),
+        "thread_id": thread.get("thread_id"),
+        "phase": cycle_report.get("phase") if isinstance(cycle_report, dict) else source_phase_name,
+        "cycle_index": cycle_report.get("cycle_index") if isinstance(cycle_report, dict) else fallback_cycle_index,
+        "next_cycle_index": (
+            cycle_report.get("next_cycle_index")
+            if isinstance(cycle_report, dict)
+            else fallback_next_cycle_index
+        ),
+        "outcome": outcome,
+        "procedure_key": None,
+        "procedure_alias": None,
+        "gate_key": selected_transition.visual_key() if selected_transition is not None else None,
+        "gate_alias": selected_transition.visual_label() if selected_transition is not None else None,
+        "target_phase": (
+            cycle_report.get("next_phase")
+            if isinstance(cycle_report, dict)
+            else (selected_transition.to if selected_transition is not None else current_phase_name)
+        ),
+        "reason": None,
+        "summary": (
+            cycle_report.get("summary")
+            if isinstance(cycle_report, dict)
+            else "Gate row synthesized from phase-cycle state."
+        ),
+        "source": "btwin.thread_watch.synthetic",
+        "outcome_policy": None,
+        "outcome_emitters": [],
+        "outcome_actions": [],
+        "policy_outcomes": [],
+        "agent": None,
+        "session_id": None,
+        "turn_id": None,
+        "event_type": "synthetic_gate",
+        "hook_event_name": None,
+        "decision": None,
+        "baseline_guard": None,
+    }
+    _enrich_thread_watch_row(
+        row=row,
+        thread=thread,
+        protocol=protocol,
+        phase_cycle_payload=phase_cycle_payload,
+        reports=reports,
+    )
+    if not any(row.get(key) for key in ("gate_key", "gate_alias", "target_phase", "procedure_key", "procedure_alias")):
+        return None
+    return row
+
+
+def _build_thread_watch_trace_rows(
+    thread: dict[str, object],
+    events: list[dict[str, object]],
+    *,
+    phase_cycle_payload: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    thread_id = str(thread.get("thread_id") or "")
+    current_config = _get_config()
+    protocol = _thread_watch_protocol(thread, current_config)
+    if phase_cycle_payload is None:
+        phase_cycle_payload = _phase_cycle_payload_for_thread(thread_id, thread=thread, config=current_config)
+    reports = _list_system_mailbox_reports(thread_id=thread_id, limit=max(len(events), 5), config=current_config)
+    rows: list[dict[str, object]] = []
+    for event in events:
+        event_type = str(event.get("event_type") or "event")
+        row = {
+            "kind": _thread_watch_kind_for_event(event_type),
+            "timestamp": event.get("timestamp"),
+            "thread_id": event.get("thread_id") or thread_id,
+            "phase": event.get("phase"),
+            "cycle_index": event.get("cycle_index"),
+            "next_cycle_index": event.get("next_cycle_index"),
+            "outcome": event.get("outcome"),
+            "procedure_key": event.get("procedure_key"),
+            "procedure_alias": event.get("procedure_alias"),
+            "gate_key": event.get("gate_key"),
+            "gate_alias": event.get("gate_alias"),
+            "target_phase": event.get("target_phase"),
+            "reason": event.get("reason"),
+            "summary": event.get("summary"),
+            "source": event.get("source"),
+            "outcome_policy": None,
+            "outcome_emitters": [],
+            "outcome_actions": [],
+            "policy_outcomes": [],
+            "agent": event.get("agent"),
+            "session_id": event.get("session_id"),
+            "turn_id": event.get("turn_id"),
+            "event_type": event_type,
+            "hook_event_name": event.get("hook_event_name"),
+            "decision": event.get("decision"),
+            "baseline_guard": event.get("baseline_guard"),
+        }
+        _enrich_thread_watch_row(
+            row=row,
+            thread=thread,
+            protocol=protocol,
+            phase_cycle_payload=phase_cycle_payload,
+            reports=reports,
+        )
+        rows.append(row)
+    synthetic_gate = _synthetic_thread_watch_gate_row(
+        thread=thread,
+        protocol=protocol,
+        phase_cycle_payload=phase_cycle_payload,
+        reports=reports,
+        existing_rows=rows,
+    )
+    if synthetic_gate is not None:
+        rows.append(synthetic_gate)
+    return rows
+
+
+def _thread_watch_phase_cycle_payload(
+    thread: dict[str, object],
+    config: BTwinConfig | None = None,
+) -> dict[str, object] | None:
+    current_config = config or _get_config()
+    thread_id = str(thread.get("thread_id") or "")
+    phase_cycle_payload = _phase_cycle_payload_for_thread(thread_id, thread=thread, config=current_config)
+    if isinstance(phase_cycle_payload, dict) and isinstance(phase_cycle_payload.get("state"), dict):
+        return phase_cycle_payload
+
+    protocol = _thread_watch_protocol(thread, current_config)
+    current_phase_name = thread.get("current_phase")
+    phase = _thread_watch_protocol_phase(protocol, current_phase_name)
+    if protocol is None or phase is None:
+        return phase_cycle_payload
+
+    seed_state = PhaseCycleState.start(
+        thread_id=thread_id,
+        phase_name=phase.name,
+        procedure_steps=_phase_cycle_procedure_steps(phase),
+    )
+    context_core = _build_phase_cycle_context_core(
+        thread=thread,
+        protocol=protocol,
+        phase=phase,
+        state=seed_state,
+        last_cycle_outcome=None,
+    )
+    return {
+        "state": seed_state.model_dump(),
+        "context_core": context_core.model_dump(),
+        "visual": _phase_cycle_visual_payload(protocol=protocol, phase=phase, state=seed_state),
+        "synthetic": True,
+        "source": "btwin.thread_watch.synthetic",
+    }
+
+
+def _thread_watch_payload(
+    thread: dict[str, object],
+    status_summary: dict[str, object],
+    events: list[dict[str, object]],
+) -> dict[str, object]:
+    phase_cycle_payload = _thread_watch_phase_cycle_payload(thread)
+    return {
+        "thread_id": thread.get("thread_id"),
+        "protocol": thread.get("protocol"),
+        "current_phase": thread.get("current_phase"),
+        "topic": thread.get("topic"),
+        "status_summary": status_summary,
+        "phase_cycle": phase_cycle_payload,
+        "trace": _build_thread_watch_trace_rows(thread, events, phase_cycle_payload=phase_cycle_payload),
+    }
+
+
+def _render_thread_watch(
+    thread: dict[str, object],
+    status_summary: dict[str, object],
+    trace_rows: list[dict[str, object]],
+) -> str:
     config = _get_config()
     thread_id = str(thread.get("thread_id", ""))
     lines = [
@@ -373,38 +847,116 @@ def _render_thread_watch(thread: dict[str, object], status_summary: dict[str, ob
     if runtime_lines:
         lines.extend(["", "Runtime"])
         lines.extend(runtime_lines)
-    if events:
+    if trace_rows:
         lines.append("")
-        for event in events:
-            timestamp = str(event.get("timestamp", ""))
-            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-            lane, headline, headline_style = _workflow_event_heading(event)
-            agent = event.get("agent")
-            phase = event.get("phase")
-            reason = event.get("reason")
-            session_id = event.get("session_id")
-            turn_id = event.get("turn_id")
-            lines.append(_style_hud_line(f"{time_label}  {lane}  {headline}", headline_style))
-            details = []
-            if agent:
-                details.append(f"agent: {agent}")
-            if phase:
-                details.append(f"phase: {phase}")
-            if reason:
-                details.append(f"reason: {reason}")
-            if details:
-                lines.append(f"          {'  '.join(details)}")
-            ids = []
-            if session_id:
-                ids.append(f"session: {session_id}")
-            if turn_id:
-                ids.append(f"turn: {turn_id}")
-            if ids:
-                lines.append(f"          {'  '.join(ids)}")
-            summary = event.get("summary")
-            if summary:
-                lines.append(f"          summary: {summary}")
+        for row in trace_rows:
+            lines.extend(_render_trace_row_lines(row))
     return "\n".join(lines)
+
+
+def _render_hud_thread_snapshot(
+    thread: dict[str, object],
+    status_summary: dict[str, object],
+    trace_rows: list[dict[str, object]],
+) -> list[str]:
+    config = _get_config()
+    thread_id = str(thread.get("thread_id", ""))
+    lines = [
+        f"Thread  {thread_id}  {thread.get('protocol')}  phase={thread.get('current_phase')}",
+    ]
+    runtime_sessions = {
+        agent_name: session
+        for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
+    }
+    agents = status_summary.get("agents", [])
+    if isinstance(agents, list) and agents:
+        parts = []
+        for agent in agents:
+            if isinstance(agent, dict):
+                agent_name = str(agent.get("name") or "")
+                part = f"{agent_name}={agent.get('status')}"
+                runtime_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
+                if runtime_summary:
+                    part += f" ({runtime_summary})"
+                parts.append(part)
+        if parts:
+            lines.append(f"Agents  {', '.join(parts)}")
+    topic = thread.get("topic")
+    if topic:
+        lines.append(f"Topic   {topic}")
+    runtime_lines = _render_thread_runtime_diagnostics(thread_id, config)
+    if runtime_lines:
+        lines.extend(["", "Runtime"])
+        lines.extend(runtime_lines)
+    if trace_rows:
+        lines.extend(["", "Latest"])
+        lines.extend(_render_trace_row_lines(trace_rows[-1]))
+    return lines
+
+
+def _render_trace_row_lines(row: dict[str, object]) -> list[str]:
+    timestamp = str(row.get("timestamp", ""))
+    time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
+    lane, headline, headline_style = _workflow_event_heading(row)
+    agent = row.get("agent")
+    phase = row.get("phase")
+    reason = row.get("reason")
+    session_id = row.get("session_id")
+    turn_id = row.get("turn_id")
+    lines = [_style_hud_line(f"{time_label}  {lane}  {headline}", headline_style)]
+    details = []
+    if agent:
+        details.append(f"agent: {agent}")
+    if phase:
+        details.append(f"phase: {phase}")
+    cycle_index = row.get("cycle_index")
+    next_cycle_index = row.get("next_cycle_index")
+    if isinstance(cycle_index, int):
+        cycle_text = f"cycle: {cycle_index}"
+        if isinstance(next_cycle_index, int):
+            cycle_text += f" -> {next_cycle_index}"
+        details.append(cycle_text)
+    outcome = row.get("outcome")
+    if outcome:
+        details.append(f"outcome: {outcome}")
+    if reason:
+        details.append(f"reason: {reason}")
+    baseline_guard = row.get("baseline_guard")
+    if baseline_guard:
+        details.append(f"baseline guard: {baseline_guard}")
+    if details:
+        lines.append(f"          {'  '.join(details)}")
+    protocol_details = []
+    procedure_alias = row.get("procedure_alias")
+    procedure_key = row.get("procedure_key")
+    if procedure_alias or procedure_key:
+        label = str(procedure_alias or procedure_key)
+        if procedure_alias and procedure_key:
+            label = f"{procedure_alias} [{procedure_key}]"
+        protocol_details.append(f"procedure: {label}")
+    gate_alias = row.get("gate_alias")
+    gate_key = row.get("gate_key")
+    if gate_alias or gate_key:
+        label = str(gate_alias or gate_key)
+        if gate_alias and gate_key:
+            label = f"{gate_alias} [{gate_key}]"
+        protocol_details.append(f"gate: {label}")
+    target_phase = row.get("target_phase")
+    if target_phase:
+        protocol_details.append(f"target: {target_phase}")
+    if protocol_details:
+        lines.append(f"          {'  '.join(protocol_details)}")
+    ids = []
+    if session_id:
+        ids.append(f"session: {session_id}")
+    if turn_id:
+        ids.append(f"turn: {turn_id}")
+    if ids:
+        lines.append(f"          {'  '.join(ids)}")
+    summary = row.get("summary")
+    if summary:
+        lines.append(f"          summary: {summary}")
+    return lines
 
 
 def _truncate_hud_text(value: str, limit: int = 120) -> str:
@@ -422,33 +974,52 @@ def _style_hud_line(text: str, style: str | None = None) -> str:
 
 
 def _workflow_event_heading(event: dict[str, object]) -> tuple[str, str, str | None]:
-    event_type = str(event.get("event_type", "event"))
+    kind = str(event.get("kind") or "")
     hook_name = str(event.get("hook_event_name") or "").strip()
     decision = str(event.get("decision") or "").strip()
     source = str(event.get("source") or "").strip()
-    lane = "BTWIN -> CODEX" if source.startswith("btwin.") or event_type == "hook_decision" else "CODEX -> BTWIN"
+    lane = "BTWIN -> CODEX" if source.startswith("btwin.") or decision else "CODEX -> BTWIN"
     style = "cyan" if lane == "CODEX -> BTWIN" else None
-    if event_type == "hook_received":
-        return lane, f"{hook_name or 'Hook'} check requested", style
-    if event_type == "hook_decision":
+    if kind == "guard":
         if decision == "block":
+            if hook_name == "Stop":
+                return lane, "Exit blocked", "red"
             return lane, f"{hook_name or 'Hook'} blocked", "red"
         if decision == "allow":
             return lane, f"{hook_name or 'Hook'} allowed", "green"
         if decision == "noop":
             return lane, f"{hook_name or 'Hook'} no-op", "yellow"
-        return lane, f"{hook_name or 'Hook'} decision", "yellow"
-    if event_type == "phase_attempt_started":
+        if event.get("reason"):
+            if hook_name == "Stop":
+                return lane, "Exit blocked", "red"
+            return lane, "Guard blocked", "red"
+        if hook_name == "Stop":
+            return lane, "Exit check requested", style
+        if hook_name:
+            return lane, f"{hook_name} check requested", style
+        return lane, "Guard check", style
+    if kind == "attempt":
         return lane, "Phase attempt started", "cyan"
-    if event_type == "phase_exit_check_requested":
-        return lane, "Exit check requested", "cyan"
-    if event_type == "required_result_recorded":
+    if kind == "result":
         return lane, "Required result recorded", "green"
-    if event_type == "phase_exit_blocked":
-        return lane, "Exit blocked", "red"
-    if event_type == "runtime_binding_closed":
-        return lane, "Runtime binding closed", "yellow"
-    return lane, event_type.replace("_", " "), style
+    if kind == "gate":
+        gate_label = str(event.get("gate_alias") or event.get("gate_key") or "Cycle gate").strip()
+        return lane, f"{gate_label} completed", "green"
+    if kind == "runtime":
+        summary = str(event.get("summary") or "").strip()
+        if summary.lower().startswith("runtime binding closed"):
+            return lane, "Runtime binding closed", "yellow"
+        return lane, "Runtime update", "yellow"
+    if kind == "phase":
+        target_phase = str(event.get("target_phase") or "").strip()
+        if target_phase:
+            return lane, f"Phase advanced to {target_phase}", "green"
+        phase = str(event.get("phase") or "").strip()
+        if phase:
+            return lane, f"Phase update in {phase}", None
+        return lane, "Phase update", None
+    raw_event_type = str(event.get("event_type") or "event")
+    return lane, raw_event_type.replace("_", " "), style
 
 
 def _runtime_session_style(session: dict[str, object]) -> str | None:
@@ -598,7 +1169,7 @@ def _phase_cycle_visual_payload(
     phase: ProtocolPhase | None,
     state: PhaseCycleState,
 ) -> dict[str, object]:
-    return build_phase_cycle_visual(protocol=protocol, phase=phase, state=state)
+    return build_phase_cycle_visual_payload(protocol=protocol, phase=phase, state=state)
 
 
 def _build_phase_cycle_context_core(
@@ -616,6 +1187,79 @@ def _build_phase_cycle_context_core(
         state=state,
         last_cycle_outcome=last_cycle_outcome,
     )
+
+
+def _phase_cycle_state_for_trace(
+    *,
+    thread: dict[str, object],
+    phase: ProtocolPhase,
+    config: BTwinConfig,
+) -> PhaseCycleState:
+    thread_id = str(thread.get("thread_id") or "")
+    current_state = _get_phase_cycle_store(config).read(thread_id) if thread_id else None
+    if current_state is not None and current_state.phase_name == phase.name:
+        return current_state
+    return PhaseCycleState.start(
+        thread_id=thread_id,
+        phase_name=phase.name,
+        procedure_steps=_phase_cycle_procedure_steps(phase),
+    )
+
+
+def _phase_cycle_trace_fields(
+    *,
+    thread: dict[str, object],
+    protocol: Protocol | None,
+    phase: ProtocolPhase | None,
+    config: BTwinConfig,
+    outcome: str | None = None,
+    next_cycle_index: int | None = None,
+    target_phase: str | None = None,
+) -> dict[str, object]:
+    if phase is None:
+        return {}
+    trace_context = build_phase_cycle_trace_context(
+        protocol=protocol,
+        phase=phase,
+        state=_phase_cycle_state_for_trace(thread=thread, phase=phase, config=config),
+        outcome=outcome,
+        next_cycle_index=next_cycle_index,
+        target_phase=target_phase,
+    )
+    return trace_context.model_dump()
+
+
+def _attached_protocol_flow_context_or_none(
+    thread_id: str,
+) -> tuple[dict[str, object] | None, Protocol | None, ProtocolPhase | None]:
+    try:
+        thread_payload = _api_get(f"/api/threads/{thread_id}")
+    except Exception:
+        return None, None, None
+    if not isinstance(thread_payload, dict):
+        return None, None, None
+    protocol_name = thread_payload.get("protocol")
+    if not isinstance(protocol_name, str) or not protocol_name.strip():
+        return dict(thread_payload), None, None
+    try:
+        protocol_payload = _api_get(f"/api/protocols/{protocol_name}")
+    except Exception:
+        return dict(thread_payload), None, None
+    if not isinstance(protocol_payload, dict):
+        return dict(thread_payload), None, None
+    try:
+        protocol = Protocol.model_validate(protocol_payload)
+    except Exception:
+        return dict(thread_payload), None, None
+    phase_name = thread_payload.get("current_phase")
+    phase = next((item for item in protocol.phases if item.name == phase_name), None)
+    return dict(thread_payload), protocol, phase
+
+
+def _baseline_guard_identity(reason: object) -> str | None:
+    if reason == "missing_contribution":
+        return "contribution_required"
+    return None
 
 
 def _ensure_phase_cycle_state(
@@ -818,7 +1462,12 @@ def _render_hud(thread_id: str | None, limit: int, animation_phase: int | None =
         return "\n".join(lines)
 
     lines.append("")
-    lines.append(_render_thread_watch(thread, status_summary, _workflow_event_log(target_thread_id).list_events(limit=limit)))
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(target_thread_id).list_events(limit=limit),
+    )
+    lines.extend(_render_hud_thread_snapshot(thread, status_summary, trace_payload["trace"]))
     phase_cycle_payload = _phase_cycle_payload_for_thread(
         target_thread_id,
         thread=thread,
@@ -1283,6 +1932,15 @@ def _api_post(path: str, data: dict) -> dict:
         return resp.json()
 
 
+def _api_put(path: str, data: dict) -> dict:
+    import httpx
+
+    with httpx.Client(base_url=_api_base_url(), timeout=30.0) as client:
+        resp = client.put(path, json=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _api_get(path: str, params: dict | None = None):
     import httpx
 
@@ -1409,6 +2067,19 @@ def _attached_api_call_or_exit(path: str, data: dict) -> dict:
 
     try:
         return _api_post(path, data)
+    except httpx.HTTPStatusError as exc:
+        _render_attached_http_status_error(exc)
+        raise typer.Exit(_attached_http_status_exit_code(exc))
+    except httpx.RequestError as exc:
+        _render_attached_transport_error(exc)
+        raise typer.Exit(1)
+
+
+def _attached_api_put_or_exit(path: str, data: dict) -> dict:
+    import httpx
+
+    try:
+        return _api_put(path, data)
     except httpx.HTTPStatusError as exc:
         _render_attached_http_status_error(exc)
         raise typer.Exit(_attached_http_status_exit_code(exc))
@@ -3255,8 +3926,8 @@ def protocol_validate(
     """Validate a protocol YAML file."""
     path = Path(file).expanduser()
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        protocol = Protocol.model_validate(data)
+        data = load_protocol_yaml(path)
+        protocol = compile_protocol_definition(data)
     except Exception as exc:
         payload = {"valid": False, "file": str(path), "error": str(exc)}
         _emit_payload(payload, as_json=as_json)
@@ -3270,6 +3941,125 @@ def protocol_validate(
         "phase_count": len(protocol.phases),
     }
     _emit_payload(payload, as_json=as_json)
+
+
+def _protocol_file_payload(path: Path) -> dict[str, object]:
+    data = load_protocol_yaml(path)
+    if not isinstance(data, dict):
+        raise typer.BadParameter("Protocol YAML must decode to a mapping object.")
+    return data
+
+
+def _protocol_saved_payload(
+    *,
+    protocol: Protocol,
+    source_file: Path,
+    saved_path: Path | None,
+) -> dict[str, object]:
+    payload = {
+        "saved": True,
+        "name": protocol.name,
+        "source_file": str(source_file),
+        "protocol": protocol.model_dump(exclude_none=True, by_alias=True),
+    }
+    if saved_path is not None:
+        payload["path"] = str(saved_path)
+    return payload
+
+
+@protocol_app.command("create")
+def protocol_create(
+    file: str = typer.Option(..., "--file", help="Path to a protocol YAML file"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Create a protocol from a YAML file."""
+    path = Path(file).expanduser()
+    data = _protocol_file_payload(path)
+    config = _get_config()
+    if _use_attached_api(config):
+        protocol_payload = _attached_api_call_or_exit("/api/protocols", data)
+        protocol = Protocol.model_validate(protocol_payload)
+        _emit_payload(
+            _protocol_saved_payload(protocol=protocol, source_file=path, saved_path=None),
+            as_json=as_json,
+        )
+        return
+
+    protocol = compile_protocol_definition(data)
+    saved_path = _get_protocol_store().save_protocol(protocol)
+    _emit_payload(
+        _protocol_saved_payload(protocol=protocol, source_file=path, saved_path=saved_path),
+        as_json=as_json,
+    )
+
+
+@protocol_app.command("edit")
+def protocol_edit(
+    name: str = typer.Argument(..., help="Existing protocol name"),
+    file: str = typer.Option(..., "--file", help="Path to a protocol YAML file"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Update an existing protocol from a YAML file."""
+    path = Path(file).expanduser()
+    data = _protocol_file_payload(path)
+    protocol = compile_protocol_definition(data)
+    if protocol.name != name:
+        console.print(
+            f"[red]Protocol name mismatch:[/red] file defines '{protocol.name}', expected '{name}'."
+        )
+        raise typer.Exit(2)
+
+    config = _get_config()
+    if _use_attached_api(config):
+        protocol_payload = _attached_api_put_or_exit(f"/api/protocols/{name}", data)
+        updated = Protocol.model_validate(protocol_payload)
+        _emit_payload(
+            _protocol_saved_payload(protocol=updated, source_file=path, saved_path=None),
+            as_json=as_json,
+        )
+        return
+
+    saved_path = _get_protocol_store().save_protocol(protocol)
+    _emit_payload(
+        _protocol_saved_payload(protocol=protocol, source_file=path, saved_path=saved_path),
+        as_json=as_json,
+    )
+
+
+@protocol_app.command("preview")
+def protocol_preview(
+    name: str | None = typer.Argument(None, help="Protocol name"),
+    file: str | None = typer.Option(None, "--file", help="Path to a protocol YAML file"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Preview the runtime-canonical interpretation of a protocol."""
+    if bool(name) == bool(file):
+        raise typer.BadParameter("Provide exactly one of a protocol name or --file.")
+
+    config = _get_config()
+    if file is not None:
+        path = Path(file).expanduser()
+        payload = build_protocol_preview(
+            _protocol_file_payload(path),
+            source={"kind": "file", "file": str(path)},
+        )
+        _emit_payload(payload, as_json=as_json)
+        return
+
+    assert name is not None
+    if _use_attached_api(config):
+        payload = _attached_api_get_or_exit(f"/api/protocols/{name}/preview")
+        _emit_payload(payload, as_json=as_json)
+        return
+
+    protocol = _get_protocol_store().get_protocol(name)
+    if protocol is None:
+        console.print(f"[red]Protocol not found:[/red] {name}")
+        raise typer.Exit(4)
+    _emit_payload(
+        build_protocol_preview(protocol, source={"kind": "store", "name": name}),
+        as_json=as_json,
+    )
 
 
 @protocol_app.command("check")
@@ -3419,6 +4209,15 @@ def protocol_apply_next(
             requested_outcome=plan.requested_outcome,
             next_cycle_index=next_cycle_state.cycle_index,
         )
+        close_trace_fields = _phase_cycle_trace_fields(
+            thread=thread,
+            protocol=protocol,
+            phase=phase,
+            config=config,
+            outcome=plan.requested_outcome or "completed",
+            next_cycle_index=next_cycle_state.cycle_index,
+            target_phase=plan.next_phase,
+        )
         _append_workflow_event(
             resolved_thread_id,
             event_type="cycle_gate_completed",
@@ -3426,9 +4225,8 @@ def protocol_apply_next(
             phase=plan.current_phase,
             scope="cycle_gate",
             cycle_finished=True,
-            cycle_index=current_cycle_state.cycle_index,
-            next_cycle_index=next_cycle_state.cycle_index,
             summary=cycle_summary,
+            **close_trace_fields,
         )
         _append_system_mailbox_report(
             thread_id=resolved_thread_id,
@@ -3473,6 +4271,7 @@ def protocol_apply_next(
             )
             next_cycle_state = _get_phase_cycle_store(config).write(transition.next_state)
             context_core = transition.context_core
+            advance_trace_fields = transition.trace_context.model_dump()
         else:
             target_phase = next((item for item in protocol.phases if item.name == plan.next_phase), None)
             if target_phase is None:
@@ -3489,6 +4288,15 @@ def protocol_apply_next(
                 phase=target_phase,
                 state=next_cycle_state,
                 last_cycle_outcome=plan.requested_outcome or "completed",
+            )
+            advance_trace_fields = _phase_cycle_trace_fields(
+                thread=thread,
+                protocol=protocol,
+                phase=phase,
+                config=config,
+                outcome=plan.requested_outcome,
+                next_cycle_index=next_cycle_state.cycle_index,
+                target_phase=plan.next_phase,
             )
 
         result_payload = {
@@ -3516,9 +4324,8 @@ def protocol_apply_next(
             phase=plan.current_phase,
             scope="cycle_gate",
             cycle_finished=True,
-            cycle_index=current_cycle_state.cycle_index,
-            next_cycle_index=next_cycle_state.cycle_index,
             summary=cycle_summary,
+            **advance_trace_fields,
         )
         _append_system_mailbox_report(
             thread_id=resolved_thread_id,
@@ -3652,6 +4459,9 @@ def live_attach(
             "projectRoot": str(_project_root()),
         },
     )
+    thread, protocol, phase = _attached_protocol_flow_context_or_none(thread_id)
+    if thread is not None and protocol is not None and phase is not None:
+        _ensure_phase_cycle_state(thread=thread, phase=phase, config=config)
     if as_json:
         _emit_payload(payload, as_json=True)
         return
@@ -3945,19 +4755,32 @@ def thread_show(
 def thread_watch(
     thread_id: str = typer.Argument(..., help="Thread id"),
     limit: int = typer.Option(10, "--limit", min=1, help="Number of recent workflow events to show"),
-    follow: bool = typer.Option(False, "--follow", help="Poll and redraw the thread HUD"),
+    follow: bool = typer.Option(False, "--follow", help="Poll and redraw the thread timeline"),
+    as_json: bool = typer.Option(False, "--json", help="Output normalized JSON trace"),
     interval: float = typer.Option(1.0, "--interval", min=0.2, help="Poll interval in seconds"),
 ):
-    """Show a compact workflow HUD for one thread."""
+    """Show a thread workflow timeline."""
+
+    if follow and as_json:
+        raise typer.BadParameter("--json cannot be used with --follow")
 
     def render_once() -> str:
         config = _get_config()
         thread, status_summary = _load_thread_snapshot(thread_id, config)
-        events = _workflow_event_log(thread_id).list_events(limit=limit)
-        return _render_thread_watch(thread, status_summary, events)
+        payload = _thread_watch_payload(
+            thread,
+            status_summary,
+            _workflow_event_log(thread_id).list_events(limit=limit),
+        )
+        if as_json:
+            _emit_payload(payload, as_json=True)
+            return ""
+        return _render_thread_watch(thread, status_summary, payload["trace"])
 
     if not follow:
-        console.print(render_once())
+        rendered = render_once()
+        if rendered:
+            console.print(rendered)
         return
 
     _run_live_view(render_once, interval)
@@ -4092,6 +4915,16 @@ def contribution_submit(
     """Persist a structured contribution for the current protocol phase."""
     current_config = _get_config()
     resolved_content = _resolve_content(content)
+    thread: dict[str, object] | None = None
+    protocol: Protocol | None = None
+    phase_definition: ProtocolPhase | None = None
+    if _use_attached_api(current_config):
+        thread, protocol, phase_definition = _attached_protocol_flow_context_or_none(thread_id)
+    else:
+        thread, protocol, phase_definition, _phase_participants, _contributions = _load_protocol_flow_context(
+            thread_id,
+            current_config,
+        )
     if _use_attached_api(current_config):
         contribution = _attached_api_call_or_exit(
             f"/api/threads/{thread_id}/contributions",
@@ -4103,10 +4936,6 @@ def contribution_submit(
             },
         )
     else:
-        thread, protocol, _phase, _phase_participants, _contributions = _load_protocol_flow_context(
-            thread_id,
-            current_config,
-        )
         violation = validate_contribution_submission(
             thread=thread,
             protocol=protocol,
@@ -4134,6 +4963,16 @@ def contribution_submit(
         phase=phase,
         contribution_id=contribution.get("contribution_id"),
         summary=tldr,
+        **(
+            _phase_cycle_trace_fields(
+                thread=thread,
+                protocol=protocol,
+                phase=phase_definition,
+                config=current_config,
+            )
+            if thread is not None
+            else {}
+        ),
     )
     _emit_payload(contribution, as_json=as_json)
 
@@ -4175,7 +5014,7 @@ def workflow_hook(
 
     _observe_runtime_binding_on_hook_event(resolved_thread_id, agent_name, event)
 
-    thread, protocol, _phase, _phase_participants, contributions = _load_protocol_flow_context(
+    thread, protocol, phase_definition, _phase_participants, contributions = _load_protocol_flow_context(
         resolved_thread_id,
         current_config,
     )
@@ -4186,42 +5025,51 @@ def workflow_hook(
         actor=agent_name,
         contributions=contributions,
     )
-    if codex_payload is not None:
-        canonical_extra: dict[str, object] = {
-            "agent": agent_name,
-            "phase": thread.get("current_phase"),
-            "session_id": codex_payload.session_id,
-            "turn_id": codex_payload.turn_id,
-            "hook_event_name": event,
-        }
-        if event == "UserPromptSubmit":
+    trace_fields = _phase_cycle_trace_fields(
+        thread=thread,
+        protocol=protocol,
+        phase=phase_definition,
+        config=current_config,
+    )
+    canonical_extra: dict[str, object] = {
+        "agent": agent_name,
+        "phase": thread.get("current_phase"),
+        "session_id": codex_payload.session_id if codex_payload is not None else None,
+        "turn_id": codex_payload.turn_id if codex_payload is not None else None,
+        "hook_event_name": event,
+    }
+    if event == "UserPromptSubmit":
+        _append_workflow_event(
+            resolved_thread_id,
+            event_type="phase_attempt_started",
+            source="codex.hook" if codex_payload is not None else "btwin.workflow.hook",
+            summary=result.overlay or "Phase attempt started.",
+            **trace_fields,
+            **canonical_extra,
+        )
+    elif event == "Stop":
+        _append_workflow_event(
+            resolved_thread_id,
+            event_type="phase_exit_check_requested",
+            source="codex.hook" if codex_payload is not None else "btwin.workflow.hook",
+            summary="Stop exit check requested.",
+            **trace_fields,
+            **canonical_extra,
+        )
+        if result.decision == "block":
             _append_workflow_event(
                 resolved_thread_id,
-                event_type="phase_attempt_started",
-                source="codex.hook",
-                summary=result.overlay or "Phase attempt started.",
+                event_type="phase_exit_blocked",
+                source="btwin.workflow.hook",
+                scope="local_recovery",
+                cycle_finished=False,
+                decision=result.decision,
+                reason=result.reason,
+                baseline_guard=_baseline_guard_identity(result.reason),
+                summary=result.overlay or result.reason or "Stop blocked by workflow constraints.",
+                **trace_fields,
                 **canonical_extra,
             )
-        elif event == "Stop":
-            _append_workflow_event(
-                resolved_thread_id,
-                event_type="phase_exit_check_requested",
-                source="codex.hook",
-                summary="Stop exit check requested.",
-                **canonical_extra,
-            )
-            if result.decision == "block":
-                _append_workflow_event(
-                    resolved_thread_id,
-                    event_type="phase_exit_blocked",
-                    source="btwin.workflow.hook",
-                    scope="local_recovery",
-                    cycle_finished=False,
-                    decision=result.decision,
-                    reason=result.reason,
-                    summary=result.overlay or result.reason or "Stop blocked by workflow constraints.",
-                    **canonical_extra,
-                )
     if codex_payload is not None and not as_json:
         raw_response = build_codex_hook_response(codex_payload, result)
         if raw_response is not None:

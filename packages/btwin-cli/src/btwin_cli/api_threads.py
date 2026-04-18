@@ -13,10 +13,18 @@ from btwin_core.context_core import ContextCore
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.locale_settings import LocaleSettingsStore
 from btwin_core.phase_cycle import PhaseCycleState
-from btwin_core.phase_cycle_engine import build_phase_cycle_context_core
+from btwin_core.phase_cycle_engine import (
+    build_phase_cycle_context_core,
+)
 from btwin_core.phase_cycle_store import PhaseCycleStore
 from btwin_core.phase_context import PhaseContextBuilder
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolStore
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolPhase,
+    ProtocolStore,
+    build_protocol_preview,
+    compile_protocol_definition,
+)
 from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.system_mailbox_store import SystemMailboxStore
 from btwin_core.thread_store import ThreadStore
@@ -26,7 +34,7 @@ from btwin_core.workflow_constraints import (
     validate_direct_message_targets,
     validate_thread_close,
 )
-from btwin_cli.phase_cycle_visual import build_phase_cycle_visual
+from btwin_cli.phase_cycle_visual import build_phase_cycle_visual_payload
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +212,7 @@ def _build_phase_cycle_visual(
     phase: ProtocolPhase | None,
     state: PhaseCycleState,
 ) -> dict[str, object]:
-    return build_phase_cycle_visual(protocol=protocol, phase=phase, state=state)
+    return build_phase_cycle_visual_payload(protocol=protocol, phase=phase, state=state)
 
 
 class ThreadCreateRequest(BaseModel):
@@ -754,27 +762,37 @@ def create_threads_router(
 
     @router.post("/api/protocols")
     def create_protocol(req: dict):
-        from btwin_core.protocol_store import Protocol
-
         try:
-            proto = Protocol.model_validate(req)
+            proto = compile_protocol_definition(req)
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         protocol_store.save_protocol(proto)
-        return proto.model_dump(exclude_none=True)
+        return proto.model_dump(exclude_none=True, by_alias=True)
 
     @router.put("/api/protocols/{name}")
     def update_protocol(name: str, req: dict):
-        from btwin_core.protocol_store import Protocol
-
         try:
-            proto = Protocol.model_validate(req)
+            proto = compile_protocol_definition(req)
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         if proto.name != name:
             raise HTTPException(status_code=400, detail="Protocol name in body must match URL")
         protocol_store.save_protocol(proto)
-        return proto.model_dump(exclude_none=True)
+        return proto.model_dump(exclude_none=True, by_alias=True)
+
+    @router.post("/api/protocols/preview")
+    def preview_protocol(req: dict):
+        try:
+            return build_protocol_preview(req)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @router.get("/api/protocols/{name}/preview")
+    def preview_saved_protocol(name: str):
+        proto = protocol_store.get_protocol(name)
+        if proto is None:
+            raise HTTPException(status_code=404, detail=f"Protocol '{name}' not found")
+        return build_protocol_preview(proto, source={"kind": "store", "name": name})
 
     @router.delete("/api/protocols/{name}")
     def delete_protocol(name: str):

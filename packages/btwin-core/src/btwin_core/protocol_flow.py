@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from btwin_core.protocol_store import Protocol
+from btwin_core.protocol_store import Protocol, ensure_protocol_compiled
 from btwin_core.protocol_validator import ProtocolValidator
 
 ProtocolSuggestedAction = Literal["submit_contribution", "advance_phase", "record_outcome", "close_thread"]
@@ -28,19 +28,29 @@ class ProtocolNextPlan(BaseModel):
     manual_outcome_required: bool = False
     guard_set: str | None = None
     declared_guards: list[str] = Field(default_factory=list)
+    outcome_policy: str | None = None
+    outcome_emitters: list[str] = Field(default_factory=list)
+    outcome_actions: list[str] = Field(default_factory=list)
+    policy_outcomes: list[str] = Field(default_factory=list)
     hint: str | None = None
 
 
-def resolve_phase_guard_set(protocol: Protocol, phase_name: str | None) -> tuple[str | None, list[str]]:
+def resolve_phase_runtime_metadata(
+    protocol: Protocol, phase_name: str | None
+) -> tuple[str | None, list[str], str | None, list[str], list[str], list[str]]:
     if not phase_name:
-        return None, []
+        return None, [], None, [], [], []
     phase = next((item for item in protocol.phases if item.name == phase_name), None)
     if phase is None:
-        return None, []
-    declared_guard_set = protocol.get_guard_set(phase.guard_set)
-    if declared_guard_set is None:
-        return phase.guard_set, []
-    return declared_guard_set.name, list(declared_guard_set.guards)
+        return None, [], None, [], [], []
+    return (
+        phase.guard_set,
+        list(phase.declared_guards),
+        phase.outcome_policy,
+        list(phase.outcome_emitters),
+        list(phase.outcome_actions),
+        list(phase.policy_outcomes),
+    )
 
 
 def _guard_note(*, guard_set: str | None, declared_guards: list[str]) -> str:
@@ -99,6 +109,7 @@ def describe_next(
     outcome: str | None = None,
 ) -> ProtocolNextPlan:
     """Describe the next valid protocol action for a thread."""
+    protocol = ensure_protocol_compiled(protocol)
     thread_id = str(thread.get("thread_id") or "")
     current_phase = thread.get("current_phase")
 
@@ -137,7 +148,14 @@ def describe_next(
             )),
         )
 
-    guard_set, declared_guards = resolve_phase_guard_set(protocol, current_phase)
+    (
+        guard_set,
+        declared_guards,
+        outcome_policy,
+        outcome_emitters,
+        outcome_actions,
+        policy_outcomes,
+    ) = resolve_phase_runtime_metadata(protocol, current_phase)
 
     phase_participants = thread.get("phase_participants", [])
     if not isinstance(phase_participants, list):
@@ -174,6 +192,10 @@ def describe_next(
                 error="unsupported_outcome",
                 guard_set=guard_set,
                 declared_guards=declared_guards,
+                outcome_policy=outcome_policy,
+                outcome_emitters=outcome_emitters,
+                outcome_actions=outcome_actions,
+                policy_outcomes=policy_outcomes,
                 hint=_next_plan_hint(
                     thread_id,
                     ProtocolNextPlan(
@@ -188,6 +210,10 @@ def describe_next(
                         error="unsupported_outcome",
                         guard_set=guard_set,
                         declared_guards=declared_guards,
+                        outcome_policy=outcome_policy,
+                        outcome_emitters=outcome_emitters,
+                        outcome_actions=outcome_actions,
+                        policy_outcomes=policy_outcomes,
                     ),
                 ),
             )
@@ -219,6 +245,10 @@ def describe_next(
         manual_outcome_required=manual_outcome_required,
         guard_set=guard_set,
         declared_guards=declared_guards,
+        outcome_policy=outcome_policy,
+        outcome_emitters=outcome_emitters,
+        outcome_actions=outcome_actions,
+        policy_outcomes=policy_outcomes,
     )
     plan.hint = _next_plan_hint(thread_id, plan)
     return plan

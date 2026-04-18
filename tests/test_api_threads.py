@@ -6,7 +6,14 @@ from btwin_cli.api_threads import create_threads_router
 from btwin_core.event_bus import EventBus
 from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_store import PhaseCycleStore
-from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore, ProtocolTransition
+from btwin_core.protocol_store import (
+    Protocol,
+    ProtocolPhase,
+    ProtocolSection,
+    ProtocolStore,
+    ProtocolTransition,
+    compile_protocol_definition,
+)
 from btwin_core.system_mailbox_store import SystemMailboxStore
 from btwin_core.thread_store import ThreadStore
 
@@ -158,29 +165,40 @@ def test_threads_router_exposes_phase_cycle_progress(tmp_path):
     protocol_store = ProtocolStore(tmp_path / "protocols")
     event_bus = EventBus()
     protocol_store.save_protocol(
-        Protocol(
-            name="debate",
-            guard_sets=[
-                {
-                    "name": "review-default",
-                    "guards": [
-                        "phase_actor_eligibility",
-                        "direct_target_eligibility",
-                    ],
-                }
-            ],
-            phases=[
-                ProtocolPhase(
-                    name="review",
-                    actions=["contribute"],
-                    template=[ProtocolSection(section="completed", required=True)],
-                    guard_set="review-default",
-                    procedure=[
-                        {"role": "reviewer", "action": "review", "alias": "Review"},
-                        {"role": "implementer", "action": "revise", "alias": "Revise"},
-                    ],
-                )
-            ],
+        compile_protocol_definition(
+            {
+                "name": "debate",
+                "guard_sets": [
+                    {
+                        "name": "review-default",
+                        "guards": [
+                            "phase_actor_eligibility",
+                            "direct_target_eligibility",
+                        ],
+                    }
+                ],
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "guard_set": "review-default",
+                        "outcome_policy": "review-outcomes",
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                            {"role": "implementer", "action": "revise", "alias": "Revise"},
+                        ],
+                    }
+                ],
+                "outcome_policies": [
+                    {
+                        "name": "review-outcomes",
+                        "emitters": ["reviewer", "user"],
+                        "actions": ["decide"],
+                        "outcomes": ["retry", "accept"],
+                    }
+                ],
+            }
         )
     )
 
@@ -226,6 +244,10 @@ def test_threads_router_exposes_phase_cycle_progress(tmp_path):
         "phase_actor_eligibility",
         "direct_target_eligibility",
     ]
+    assert payload["context_core"]["outcome_policy"] == "review-outcomes"
+    assert payload["context_core"]["outcome_emitters"] == ["reviewer", "user"]
+    assert payload["context_core"]["outcome_actions"] == ["decide"]
+    assert payload["context_core"]["policy_outcomes"] == ["retry", "accept"]
     assert payload["visual"]["procedure"][0]["label"] == "Review"
     assert payload["visual"]["procedure"][-1]["key"] == "gate"
     assert payload["visual"]["guards"] == [

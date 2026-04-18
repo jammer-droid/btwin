@@ -4,18 +4,34 @@ from btwin_core.phase_cycle_engine import phase_cycle_procedure_actions
 from btwin_core.protocol_flow import describe_next
 from btwin_core.protocol_store import (
     Protocol,
+    ProtocolAuthoringGate,
+    ProtocolAuthoringGateRoute,
     ProtocolGuardSet,
+    ProtocolOutcomePolicy,
     ProtocolPhase,
     ProtocolProcedureStep,
     ProtocolSection,
     ProtocolStore,
     ProtocolTransition,
+    compile_protocol_definition,
 )
 from btwin_core.phase_cycle import PhaseCycleState
 from btwin_cli.api_threads import _build_phase_cycle_visual
 from btwin_cli.main import _phase_cycle_visual_payload
 
 from tests.protocol_scenario_matrix import get_scenario, scenario_protocol_definition
+
+
+def _expected_phase_cycle_visual_payload(scenario_id: str) -> dict[str, object]:
+    scenario = get_scenario(scenario_id)
+    return {
+        "procedure": [
+            *[step.as_dict() for step in scenario.visual_procedure],
+            {"key": "gate", "label": "Gate", "status": "pending"},
+        ],
+        "gates": [gate.as_dict() for gate in scenario.visual_gates],
+        "guards": [],
+    }
 
 
 def test_protocol_phase_can_define_role_agnostic_procedure_steps():
@@ -154,7 +170,10 @@ def test_protocol_guard_sets_and_phase_guard_set_round_trip_through_store(tmp_pa
                     ],
                 )
             ],
-            transitions=[ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"})],
+            transitions=[
+                ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"}),
+                ProtocolTransition.model_validate({"from": "review", "to": "decision", "on": "accept"}),
+            ],
             outcomes=["retry", "accept"],
         )
     )
@@ -166,6 +185,74 @@ def test_protocol_guard_sets_and_phase_guard_set_round_trip_through_store(tmp_pa
     assert proto.guard_sets[0].description == "Guard set for the review phase."
     assert proto.guard_sets[0].guards == ["contribution_required", "phase_actor_eligibility"]
     assert proto.phases[0].guard_set == "review-guards"
+
+
+def test_protocol_authoring_gate_and_outcome_policy_round_trip_through_store(tmp_path):
+    store = ProtocolStore(tmp_path / "protocols")
+    store.save_protocol(
+        Protocol(
+            name="review-loop",
+            gates=[
+                ProtocolAuthoringGate(
+                    name="review-gate",
+                    description="Authoring-only gate definition for the review phase.",
+                    routes=[
+                        ProtocolAuthoringGateRoute(
+                            outcome="retry",
+                            target_phase="review",
+                            alias="Retry Loop",
+                            key="retry-loop",
+                        ),
+                        ProtocolAuthoringGateRoute(
+                            outcome="accept",
+                            target_phase="decision",
+                            alias="Accept Gate",
+                            key="accept-gate",
+                        ),
+                    ],
+                )
+            ],
+            outcome_policies=[
+                ProtocolOutcomePolicy(
+                    name="review-outcomes",
+                    description="Authoring-only outcome emission policy for review.",
+                    emitters=["reviewer", "user"],
+                    actions=["decide"],
+                    outcomes=["retry", "accept"],
+                )
+            ],
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    gate="review-gate",
+                    outcome_policy="review-outcomes",
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise"},
+                    ],
+                ),
+                ProtocolPhase(name="decision", actions=["decide"]),
+            ],
+            transitions=[
+                ProtocolTransition.model_validate({"from": "review", "to": "review", "on": "retry"}),
+                ProtocolTransition.model_validate({"from": "review", "to": "decision", "on": "accept"}),
+            ],
+            outcomes=["retry", "accept"],
+        )
+    )
+
+    proto = store.get_protocol("review-loop")
+
+    assert proto is not None
+    assert proto.gates[0].authoring_only is True
+    assert proto.gates[0].routes[0].outcome == "retry"
+    assert proto.gates[0].routes[0].target_phase == "review"
+    assert proto.outcome_policies[0].authoring_only is True
+    assert proto.outcome_policies[0].emitters == ["reviewer", "user"]
+    assert proto.phases[0].gate == "review-gate"
+    assert proto.phases[0].outcome_policy == "review-outcomes"
 
 
 def test_api_phase_cycle_visual_prefers_protocol_keys_and_aliases():
@@ -286,23 +373,15 @@ def test_api_phase_cycle_visual_uses_step_index_for_repeated_actions():
     ),
 )
 def test_cli_phase_cycle_visual_matches_shared_scenario_matrix(scenario_id: str):
-    scenario = get_scenario(scenario_id)
-    protocol = Protocol.model_validate(scenario_protocol_definition(scenario_id))
+    protocol = compile_protocol_definition(scenario_protocol_definition(scenario_id))
     phase = protocol.phases[0]
     state = PhaseCycleState.start(
         thread_id="thread-1",
         phase_name=phase.name,
         procedure_steps=phase_cycle_procedure_actions(phase),
-    ).model_copy(update={"last_gate_outcome": scenario.outcome})
+    ).model_copy(update={"last_gate_outcome": get_scenario(scenario_id).outcome})
 
-    expected_visual = {
-        "procedure": [
-            *[step.as_dict() for step in scenario.visual_procedure],
-            {"key": "gate", "label": "Gate", "status": "pending"},
-        ],
-        "gates": [gate.as_dict() for gate in scenario.visual_gates],
-        "guards": [],
-    }
+    expected_visual = _expected_phase_cycle_visual_payload(scenario_id)
     cli_visual = _phase_cycle_visual_payload(protocol=protocol, phase=phase, state=state)
     api_visual = _build_phase_cycle_visual(protocol=protocol, phase=phase, state=state)
 
