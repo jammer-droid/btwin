@@ -109,6 +109,36 @@ def _thread_messages(provider_smoke_env: dict[str, str], thread_id: str) -> list
     ).json()
 
 
+def _thread_watch_payload(
+    provider_smoke_env: dict[str, str],
+    thread_id: str,
+    *,
+    limit: int = 10,
+) -> dict[str, object]:
+    return _run_btwin(
+        provider_smoke_env,
+        "thread",
+        "watch",
+        thread_id,
+        "--limit",
+        str(limit),
+        "--json",
+    )
+
+
+def _latest_trace_row(
+    trace_payload: dict[str, object],
+    *,
+    kind: str,
+) -> dict[str, object]:
+    trace = trace_payload.get("trace")
+    assert isinstance(trace, list), trace_payload
+    for row in reversed(trace):
+        if isinstance(row, dict) and row.get("kind") == kind:
+            return row
+    raise AssertionError(f"no trace row found for kind={kind}: {trace_payload}")
+
+
 def _provider_preflight(provider_smoke_env: dict[str, str]) -> dict[str, object]:
     result = asyncio.run(
         run_provider_scenario(
@@ -598,6 +628,105 @@ def test_provider_smoke_close_gate_blocks_when_required_contributions_missing(pr
     detail = response["detail"]
     assert detail["error"] == "phase_requirements_not_met"
     assert "btwin contribution submit" in detail["hint"]
+
+
+def test_provider_smoke_close_path_thread_watch_gate_matches_preview(provider_smoke_env) -> None:
+    scenario = get_scenario("close_path")
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name=scenario.protocol_name,
+        protocol_definition=scenario_protocol_definition("close_path"),
+        participants=("alice",),
+    )
+    thread_id = str(state["thread_id"])
+
+    _run_btwin(
+        provider_smoke_env,
+        "contribution",
+        "submit",
+        "--thread",
+        thread_id,
+        "--agent",
+        "alice",
+        "--phase",
+        "review",
+        "--content",
+        "## completed\nReady to close.\n",
+        "--tldr",
+        "close path ready",
+        "--json",
+    )
+    preview = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "next",
+        "--thread",
+        thread_id,
+        "--outcome",
+        str(scenario.outcome),
+        "--json",
+    )
+    applied = _run_btwin(
+        provider_smoke_env,
+        "protocol",
+        "apply-next",
+        "--thread",
+        thread_id,
+        "--outcome",
+        str(scenario.outcome),
+        "--summary",
+        "Closed from provider smoke",
+        "--decision",
+        "close",
+        "--json",
+    )
+    trace_payload = _thread_watch_payload(provider_smoke_env, thread_id, limit=10)
+    gate_row = _latest_trace_row(trace_payload, kind="gate")
+
+    assert scenario.preview_status == "valid"
+    assert scenario.live_smoke_required is True
+    assert preview["requested_outcome"] == scenario.outcome
+    assert preview["next_phase"] == scenario.target_phase
+    assert applied["applied"] is True
+    assert applied["suggested_action"] == "advance_phase"
+    assert applied["thread"]["current_phase"] == scenario.target_phase
+    assert gate_row["outcome"] == scenario.outcome
+    assert gate_row["gate_key"] == scenario.gate_key
+    assert gate_row["target_phase"] == scenario.target_phase
+    assert gate_row["procedure_key"] == scenario.procedure_key
+
+
+def test_provider_smoke_attach_seed_first_cycle_uses_real_phase_cycle_state(provider_smoke_env) -> None:
+    scenario = get_scenario("attach_seed_first_cycle")
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name=scenario.protocol_name,
+        protocol_definition=scenario_protocol_definition("attach_seed_first_cycle"),
+        participants=("alice",),
+    )
+    thread_id = str(state["thread_id"])
+
+    phase_cycle_response = httpx.get(
+        f'{provider_smoke_env["BTWIN_API_URL"]}/api/threads/{thread_id}/phase-cycle',
+        timeout=5.0,
+    )
+    phase_cycle_response.raise_for_status()
+    phase_cycle = phase_cycle_response.json()
+    trace_payload = _thread_watch_payload(provider_smoke_env, thread_id, limit=10)
+    watch_phase_cycle = trace_payload.get("phase_cycle")
+
+    assert scenario.preview_status == "valid"
+    assert scenario.live_smoke_required is True
+    assert phase_cycle["state"]["cycle_index"] == 1
+    assert phase_cycle["state"]["phase_name"] == "review"
+    assert phase_cycle["context_core"]["current_step_alias"] == "Review"
+    assert phase_cycle["context_core"]["next_expected_role"] == "reviewer"
+    assert phase_cycle["visual"]["procedure"][0]["key"] == scenario.procedure_key
+    assert phase_cycle["visual"]["gates"][0]["key"] == scenario.gate_key
+    assert phase_cycle["visual"]["gates"][0]["target_phase"] == scenario.target_phase
+    assert isinstance(watch_phase_cycle, dict), trace_payload
+    assert watch_phase_cycle["state"]["cycle_index"] == 1
+    assert "synthetic" not in watch_phase_cycle
 
 
 def test_provider_smoke_workflow_hook_blocks_stop_without_required_contribution(provider_smoke_env) -> None:

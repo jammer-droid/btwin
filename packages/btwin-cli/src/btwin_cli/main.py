@@ -683,11 +683,14 @@ def _synthetic_thread_watch_gate_row(
 def _build_thread_watch_trace_rows(
     thread: dict[str, object],
     events: list[dict[str, object]],
+    *,
+    phase_cycle_payload: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     thread_id = str(thread.get("thread_id") or "")
     current_config = _get_config()
     protocol = _thread_watch_protocol(thread, current_config)
-    phase_cycle_payload = _phase_cycle_payload_for_thread(thread_id, thread=thread, config=current_config)
+    if phase_cycle_payload is None:
+        phase_cycle_payload = _phase_cycle_payload_for_thread(thread_id, thread=thread, config=current_config)
     reports = _list_system_mailbox_reports(thread_id=thread_id, limit=max(len(events), 5), config=current_config)
     rows: list[dict[str, object]] = []
     for event in events:
@@ -736,18 +739,57 @@ def _build_thread_watch_trace_rows(
     return rows
 
 
+def _thread_watch_phase_cycle_payload(
+    thread: dict[str, object],
+    config: BTwinConfig | None = None,
+) -> dict[str, object] | None:
+    current_config = config or _get_config()
+    thread_id = str(thread.get("thread_id") or "")
+    phase_cycle_payload = _phase_cycle_payload_for_thread(thread_id, thread=thread, config=current_config)
+    if isinstance(phase_cycle_payload, dict) and isinstance(phase_cycle_payload.get("state"), dict):
+        return phase_cycle_payload
+
+    protocol = _thread_watch_protocol(thread, current_config)
+    current_phase_name = thread.get("current_phase")
+    phase = _thread_watch_protocol_phase(protocol, current_phase_name)
+    if protocol is None or phase is None:
+        return phase_cycle_payload
+
+    seed_state = PhaseCycleState.start(
+        thread_id=thread_id,
+        phase_name=phase.name,
+        procedure_steps=_phase_cycle_procedure_steps(phase),
+    )
+    context_core = _build_phase_cycle_context_core(
+        thread=thread,
+        protocol=protocol,
+        phase=phase,
+        state=seed_state,
+        last_cycle_outcome=None,
+    )
+    return {
+        "state": seed_state.model_dump(),
+        "context_core": context_core.model_dump(),
+        "visual": _phase_cycle_visual_payload(protocol=protocol, phase=phase, state=seed_state),
+        "synthetic": True,
+        "source": "btwin.thread_watch.synthetic",
+    }
+
+
 def _thread_watch_payload(
     thread: dict[str, object],
     status_summary: dict[str, object],
     events: list[dict[str, object]],
 ) -> dict[str, object]:
+    phase_cycle_payload = _thread_watch_phase_cycle_payload(thread)
     return {
         "thread_id": thread.get("thread_id"),
         "protocol": thread.get("protocol"),
         "current_phase": thread.get("current_phase"),
         "topic": thread.get("topic"),
         "status_summary": status_summary,
-        "trace": _build_thread_watch_trace_rows(thread, events),
+        "phase_cycle": phase_cycle_payload,
+        "trace": _build_thread_watch_trace_rows(thread, events, phase_cycle_payload=phase_cycle_payload),
     }
 
 
@@ -4256,6 +4298,9 @@ def live_attach(
             "projectRoot": str(_project_root()),
         },
     )
+    thread, protocol, phase = _attached_protocol_flow_context_or_none(thread_id)
+    if thread is not None and protocol is not None and phase is not None:
+        _ensure_phase_cycle_state(thread=thread, phase=phase, config=config)
     if as_json:
         _emit_payload(payload, as_json=True)
         return
@@ -4825,46 +4870,45 @@ def workflow_hook(
         phase=phase_definition,
         config=current_config,
     )
-    if codex_payload is not None:
-        canonical_extra: dict[str, object] = {
-            "agent": agent_name,
-            "phase": thread.get("current_phase"),
-            "session_id": codex_payload.session_id,
-            "turn_id": codex_payload.turn_id,
-            "hook_event_name": event,
-        }
-        if event == "UserPromptSubmit":
+    canonical_extra: dict[str, object] = {
+        "agent": agent_name,
+        "phase": thread.get("current_phase"),
+        "session_id": codex_payload.session_id if codex_payload is not None else None,
+        "turn_id": codex_payload.turn_id if codex_payload is not None else None,
+        "hook_event_name": event,
+    }
+    if event == "UserPromptSubmit":
+        _append_workflow_event(
+            resolved_thread_id,
+            event_type="phase_attempt_started",
+            source="codex.hook" if codex_payload is not None else "btwin.workflow.hook",
+            summary=result.overlay or "Phase attempt started.",
+            **trace_fields,
+            **canonical_extra,
+        )
+    elif event == "Stop":
+        _append_workflow_event(
+            resolved_thread_id,
+            event_type="phase_exit_check_requested",
+            source="codex.hook" if codex_payload is not None else "btwin.workflow.hook",
+            summary="Stop exit check requested.",
+            **trace_fields,
+            **canonical_extra,
+        )
+        if result.decision == "block":
             _append_workflow_event(
                 resolved_thread_id,
-                event_type="phase_attempt_started",
-                source="codex.hook",
-                summary=result.overlay or "Phase attempt started.",
+                event_type="phase_exit_blocked",
+                source="btwin.workflow.hook",
+                scope="local_recovery",
+                cycle_finished=False,
+                decision=result.decision,
+                reason=result.reason,
+                baseline_guard=_baseline_guard_identity(result.reason),
+                summary=result.overlay or result.reason or "Stop blocked by workflow constraints.",
                 **trace_fields,
                 **canonical_extra,
             )
-        elif event == "Stop":
-            _append_workflow_event(
-                resolved_thread_id,
-                event_type="phase_exit_check_requested",
-                source="codex.hook",
-                summary="Stop exit check requested.",
-                **trace_fields,
-                **canonical_extra,
-            )
-            if result.decision == "block":
-                _append_workflow_event(
-                    resolved_thread_id,
-                    event_type="phase_exit_blocked",
-                    source="btwin.workflow.hook",
-                    scope="local_recovery",
-                    cycle_finished=False,
-                    decision=result.decision,
-                    reason=result.reason,
-                    baseline_guard=_baseline_guard_identity(result.reason),
-                    summary=result.overlay or result.reason or "Stop blocked by workflow constraints.",
-                    **trace_fields,
-                    **canonical_extra,
-                )
     if codex_payload is not None and not as_json:
         raw_response = build_codex_hook_response(codex_payload, result)
         if raw_response is not None:
