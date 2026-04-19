@@ -1034,6 +1034,46 @@ def _detail_validation_snapshot(
     }
 
 
+def _append_detail_section(lines: list[str], title: str) -> None:
+    lines.extend(["", title, "-" * len(title)])
+
+
+def _append_detail_bullets(lines: list[str], label: str, items: list[str]) -> None:
+    if not items:
+        lines.append(f"{label}: -")
+        return
+    lines.append(f"{label}:")
+    for item in items:
+        lines.append(f"  - {item}")
+
+
+def _render_detail_agent_session_rows(
+    agents: list[dict[str, object]] | object,
+    runtime_sessions: dict[str, dict[str, object]],
+) -> list[str]:
+    rows: list[str] = []
+    if isinstance(agents, list):
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            agent_name = str(agent.get("name") or "").strip()
+            if not agent_name:
+                continue
+            status = str(agent.get("status") or "-").strip() or "-"
+            transport = _runtime_session_summary(runtime_sessions.get(agent_name)) or "-"
+            rows.append(f"{agent_name:<4} {status:<11} {transport}")
+    if rows:
+        return rows
+
+    for agent_name, session in runtime_sessions.items():
+        if not isinstance(session, dict):
+            continue
+        status = str(session.get("status") or "-").strip() or "-"
+        transport = _runtime_session_summary(session) or "-"
+        rows.append(f"{agent_name:<4} {status:<11} {transport}")
+    return rows
+
+
 def _render_thread_detail(
     thread: dict[str, object],
     status_summary: dict[str, object],
@@ -1130,6 +1170,7 @@ def _render_thread_detail(
             if session_summary:
                 actor_part += f" ({session_summary})"
             actor_parts.append(actor_part)
+    agent_session_rows = _render_detail_agent_session_rows(agents, runtime_sessions)
 
     expected_bits: list[str] = []
     outcome_policy = compiled.get("outcome_policy")
@@ -1146,6 +1187,14 @@ def _render_thread_detail(
         expected_bits.append(f"cycle={cycle_index}")
     if next_hint:
         expected_bits.append(f"next={next_hint}")
+
+    compiled_bits: list[str] = []
+    if outcome_policy:
+        compiled_bits.append(f"policy={outcome_policy}")
+    if isinstance(policy_outcomes, list) and policy_outcomes:
+        compiled_bits.append(f"outcomes={', '.join(str(item) for item in policy_outcomes)}")
+    if isinstance(current_gate, str) and current_gate:
+        compiled_bits.append(f"gate={current_gate}")
 
     actual_bits: list[str] = [status_text]
     if isinstance(primary_row, dict):
@@ -1166,35 +1215,70 @@ def _render_thread_detail(
         f"Phase     {phase}"
         + (f"  cycle={cycle_index}" if isinstance(cycle_index, int) else "")
         + (f"  step={step_label}" if isinstance(step_label, str) and step_label.strip() else ""),
+        f"Status    {status_text}",
+        f"Compiled  {'; '.join(compiled_bits) if compiled_bits else '-'}",
         f"Next action  {next_hint}",
-        "",
-        "Current Status",
     ]
 
-    current_status_bits: list[str] = []
+    procedure_path_items: list[str] = []
+    if isinstance(phase_cycle_payload, dict):
+        visual = phase_cycle_payload.get("visual")
+        procedure_nodes = visual.get("procedure") if isinstance(visual, dict) else None
+        if isinstance(procedure_nodes, list):
+            for node in procedure_nodes:
+                if not isinstance(node, dict):
+                    continue
+                label = str(node.get("label") or node.get("key") or "").strip()
+                if not label:
+                    continue
+                status = str(node.get("status") or "").strip()
+                if status == "active":
+                    label = f"{label} [now]"
+                elif status == "completed":
+                    label = f"{label} [done]"
+                procedure_path_items.append(label)
+
+    _append_detail_section(lines, "Protocol / Phase")
+    lines.append(f"phase: {phase}")
     if isinstance(current_procedure, str) and current_procedure:
-        current_status_bits.append(f"procedure: {current_procedure}")
+        lines.append(f"procedure: {current_procedure}")
     elif isinstance(procedure_summary, str) and procedure_summary:
-        current_status_bits.append(f"procedure: {procedure_summary}")
-    if isinstance(current_gate, str) and current_gate:
-        current_status_bits.append(f"gate: {current_gate}")
-    elif isinstance(gates_summary, str) and gates_summary:
-        current_status_bits.append(f"gate: {gates_summary}")
+        lines.append(f"procedure: {procedure_summary}")
     if isinstance(cycle_index, int):
         cycle_status = f"cycle: {cycle_index}"
         if isinstance(completed_cycles, int):
             cycle_status += f" (completed {completed_cycles})"
-        current_status_bits.append(cycle_status)
+        lines.append(cycle_status)
     if isinstance(step_label, str) and step_label.strip():
-        current_status_bits.append(f"step: {step_label}")
-    if actor_parts:
-        current_status_bits.append(f"actors: {', '.join(actor_parts)}")
-    else:
-        current_status_bits.append("actors: none")
-    current_status_bits.append(f"status: {status_text}")
-    lines.extend(current_status_bits)
+        lines.append(f"step: {step_label}")
+    if procedure_path_items:
+        _append_detail_bullets(lines, "procedure_path", procedure_path_items)
 
-    lines.extend(["", "Validation", f"verdict: {validation['verdict']}"])
+    _append_detail_section(lines, "Gate & Outcome Policy")
+    if isinstance(current_gate, str) and current_gate:
+        lines.append(f"gate: {current_gate}")
+    elif isinstance(gates_summary, str) and gates_summary:
+        lines.append(f"gate: {gates_summary}")
+    if outcome_policy:
+        lines.append(f"outcome_policy: {outcome_policy}")
+    outcome_emitters = compiled.get("outcome_emitters")
+    if isinstance(outcome_emitters, list) and outcome_emitters:
+        lines.append(f"outcome_emitters: {', '.join(str(item) for item in outcome_emitters)}")
+    outcome_actions = compiled.get("outcome_actions")
+    if isinstance(outcome_actions, list) and outcome_actions:
+        lines.append(f"outcome_actions: {', '.join(str(item) for item in outcome_actions)}")
+    if isinstance(policy_outcomes, list) and policy_outcomes:
+        lines.append(f"policy_outcomes: {', '.join(str(item) for item in policy_outcomes)}")
+    lines.append(f"gate_hint: {next_hint}")
+
+    _append_detail_section(lines, "Agent Sessions")
+    if agent_session_rows:
+        lines.extend(agent_session_rows)
+    else:
+        lines.append("No agent sessions")
+
+    _append_detail_section(lines, "Validation")
+    lines.append(f"verdict: {validation['verdict']}")
     for check_name, check_status in validation["checks"]:
         lines.append(f"{check_name}: {check_status}")
     if validation["verdict"] != "PASS":
@@ -1202,17 +1286,17 @@ def _render_thread_detail(
         lines.append(f"reason: {reason_text}")
     lines.append(f"next expected action: {validation['next_expected_action']}")
 
-    lines.extend(["", "Expected vs Actual"])
+    _append_detail_section(lines, "Expected vs Actual")
     if expected_bits:
-        lines.append(f"expected: {'; '.join(expected_bits)}")
+        _append_detail_bullets(lines, "expected", expected_bits)
     else:
         lines.append("expected: protocol / thread context only")
     if actual_bits:
-        lines.append(f"actual: {'; '.join(actual_bits)}")
+        _append_detail_bullets(lines, "actual", actual_bits)
     else:
         lines.append("actual: no recent workflow activity")
 
-    lines.extend(["", "Recent Activity"])
+    _append_detail_section(lines, "Recent Activity")
     if trace_rows:
         activity_rows: list[dict[str, object]] = []
         if isinstance(primary_row, dict):
@@ -1232,6 +1316,10 @@ def _render_thread_detail(
                 lines.append(f"summary: {_truncate_hud_text(summary)}")
     else:
         lines.append("No recent workflow events")
+
+    _append_detail_section(lines, "Quick Actions")
+    lines.append("[l] live trace   [c] close thread")
+    lines.append("[b] back         [t] threads   [q] quit")
     return "\n".join(lines)
 
 

@@ -1555,10 +1555,18 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     assert "Design Review" in rendered
     assert "review-loop" in rendered
     assert "Phase     review" in rendered
+    assert "Status    BLOCKED" in rendered
+    assert "Compiled  policy=review-outcomes; outcomes=retry, accept, close; gate=Retry Gate" in rendered
     assert "Next action  submit contribution" in rendered
-    assert "Current Status" in rendered
+    assert "Protocol / Phase" in rendered
+    assert "Gate & Outcome Policy" in rendered
+    assert "Agent Sessions" in rendered
     assert "cycle: 3" in rendered
     assert "step: collect-feedback" in rendered
+    assert "procedure_path:" in rendered
+    assert "  - Announce" in rendered
+    assert "outcome_emitters: reviewer, author" in rendered
+    assert "jun  waiting" in rendered
     assert "BLOCKED" in rendered
     assert "Collect Feedback" in rendered
     assert "Validation" in rendered
@@ -1574,6 +1582,8 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     assert "policy=review-outcomes" in rendered
     assert "outcomes=retry, accept, close" in rendered
     assert "Recent Activity" in rendered
+    assert "Quick Actions" in rendered
+    assert "[l] live trace" in rendered
     assert "Exit blocked" in rendered
     assert "LGTM with small nits" in rendered
 
@@ -1630,8 +1640,8 @@ def test_hud_thread_detail_shows_agent_sessions_and_runtime_summary(monkeypatch,
 
     rendered = main._render_hud_navigator(state, config, limit=5)
 
-    assert "Current Status" in rendered
-    assert "jun=waiting (app-server)" in rendered
+    assert "Agent Sessions" in rendered
+    assert "jun  waiting     app-server" in rendered
 
 
 def test_hud_direct_thread_entry_uses_thread_detail_renderer(monkeypatch, tmp_path):
@@ -1803,7 +1813,15 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
 
     assert lines[0] == "B-TWIN HUD"
     assert index_of("Topic") < index_of("Protocol") < index_of("Phase") < index_of("Next action")
-    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
+    assert index_of("Agent Sessions") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity") < index_of("Quick Actions")
+    assert lines[index_of("Protocol / Phase") + 1] == "----------------"
+    assert lines[index_of("Gate & Outcome Policy") + 1] == "---------------------"
+    assert lines[index_of("Agent Sessions") + 1] == "--------------"
+    assert lines[index_of("Validation") + 1] == "----------"
+    assert lines[index_of("Expected vs Actual") + 1] == "------------------"
+    assert lines[index_of("Recent Activity") + 1] == "---------------"
+    assert lines[index_of("Quick Actions") + 1] == "-------------"
     assert any(line.startswith("verdict:") for line in lines[index_of("Validation") : index_of("Expected vs Actual")])
     assert "thread-1" not in lines[1]
     assert "binding=" not in rendered
@@ -1975,7 +1993,8 @@ def test_hud_thread_detail_validation_section_contract(monkeypatch, tmp_path):
     def index_of(prefix: str) -> int:
         return next(i for i, line in enumerate(lines) if line.startswith(prefix))
 
-    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
+    assert index_of("Agent Sessions") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
     assert "verdict: PASS" in rendered
     assert "protocol_match: PASS" in rendered
     assert "trajectory_match: PASS" in rendered
