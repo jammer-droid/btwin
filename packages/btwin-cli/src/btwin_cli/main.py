@@ -1206,6 +1206,144 @@ def _detail_primary_validation_reason(validation: dict[str, object]) -> str:
     return "validation warning"
 
 
+_VALIDATION_CHECK_DEFINITIONS: dict[str, tuple[str, str]] = {
+    "protocol_match": ("Protocol match", "thread has known protocol + phase"),
+    "trajectory_match": ("Trajectory match", "recent workflow trace exists"),
+    "session_health": ("Session health", "no degraded or recovering sessions"),
+    "required_contribution": ("Required contribution", "all expected contributions recorded"),
+    "trace_completeness": ("Trace completeness", "≥1 workflow event captured"),
+}
+
+_VALIDATION_CASE_DEFINITIONS: dict[str, tuple[str, str]] = {
+    "happy_path_accept": ("Happy path accept", "accept → advance phase"),
+    "retry_same_phase": ("Retry same phase", "retry → stay in same phase"),
+    "missing_contribution_blocked": (
+        "Missing contribution blocked",
+        "apply-next returns applied=false",
+    ),
+    "close_requires_summary": ("Close requires summary", "close gate needs summary"),
+}
+
+
+def _check_actual_for_status(check_name: str, status: str, runtime_sessions: dict[str, dict[str, object]] | None, trace_rows: list[dict[str, object]]) -> str:
+    if check_name == "protocol_match":
+        return "protocol + phase present" if status == "PASS" else "protocol context incomplete"
+    if check_name == "trajectory_match":
+        return f"{len(trace_rows)} trace row(s)" if trace_rows else "no recent trace"
+    if check_name == "session_health":
+        if status == "PASS":
+            return "all sessions nominal"
+        degraded: list[str] = []
+        recovering: list[str] = []
+        fallback: list[str] = []
+        if runtime_sessions:
+            for name, session in runtime_sessions.items():
+                if not isinstance(session, dict):
+                    continue
+                if session.get("recovery_pending"):
+                    recovering.append(name)
+                elif session.get("degraded"):
+                    degraded.append(name)
+                elif session.get("fallback_transport_involved"):
+                    fallback.append(name)
+        parts: list[str] = []
+        if recovering:
+            parts.append(f"{', '.join(recovering)} recovering")
+        if degraded:
+            parts.append(f"{', '.join(degraded)} degraded")
+        if fallback:
+            parts.append(f"{', '.join(fallback)} on fallback")
+        return " · ".join(parts) if parts else "session issue"
+    if check_name == "required_contribution":
+        return "all contributions recorded" if status == "PASS" else "contribution missing"
+    if check_name == "trace_completeness":
+        return f"{len(trace_rows)} event(s) captured" if trace_rows else "no events captured"
+    return status.lower()
+
+
+def _case_expected_actual(
+    case_name: str,
+    case_value: str,
+) -> tuple[str, str]:
+    """Map the legacy case row value into (actual, verdict)."""
+    value = (case_value or "").strip().lower()
+    expected = _VALIDATION_CASE_DEFINITIONS.get(case_name, (case_name, "-"))[1]
+    if value == "pass":
+        return "matched", "PASS"
+    if value == "ready":
+        return "ready to evaluate", "SKIP"
+    if value == "not triggered":
+        return "not triggered", "SKIP"
+    if value in {"fail", "failed"}:
+        return "did not match", "FAIL"
+    if value in {"warn", "warning"}:
+        return "partial match", "WARN"
+    return value or "-", "SKIP"
+
+
+def _validation_compliance_rows(
+    validation: dict[str, object],
+    validation_cases: list[str],
+    runtime_sessions: dict[str, dict[str, object]],
+    trace_rows: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    checks = validation.get("checks") or []
+    if isinstance(checks, list):
+        for check in checks:
+            if not isinstance(check, tuple) or len(check) != 2:
+                continue
+            name, status = check
+            display, expected = _VALIDATION_CHECK_DEFINITIONS.get(
+                str(name), (str(name), "-")
+            )
+            actual = _check_actual_for_status(str(name), str(status), runtime_sessions, trace_rows)
+            rows.append(
+                {
+                    "group": "check",
+                    "key": str(name),
+                    "name": display,
+                    "expected": expected,
+                    "actual": actual,
+                    "verdict": str(status).upper(),
+                }
+            )
+    for case_line in validation_cases:
+        if ":" not in case_line:
+            continue
+        raw_name, raw_value = case_line.split(":", 1)
+        key = raw_name.strip()
+        display, expected = _VALIDATION_CASE_DEFINITIONS.get(key, (key, "-"))
+        actual, verdict = _case_expected_actual(key, raw_value.strip())
+        rows.append(
+            {
+                "group": "case",
+                "key": key,
+                "name": display,
+                "expected": expected,
+                "actual": actual,
+                "verdict": verdict,
+            }
+        )
+    return rows
+
+
+_VERDICT_STYLE = {
+    "PASS": ("●", "green"),
+    "WARN": ("▲", "yellow"),
+    "FAIL": ("✕", "red"),
+    "SKIP": ("○", "dim"),
+}
+
+
+def _verdict_text(verdict: str) -> Text:
+    symbol, style = _VERDICT_STYLE.get(verdict.upper(), ("·", "dim"))
+    text = Text()
+    text.append(f"{symbol} ", style=style)
+    text.append(verdict.upper(), style=style)
+    return text
+
+
 def _detail_progress_label(value: object) -> str:
     text = str(value or "").strip()
     if not text:
@@ -3151,85 +3289,128 @@ def _render_hud_validation_focus_renderable(state: _HudNavigatorState, limit: in
         status_summary,
         _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
     )
-    body_lines = _render_validation_focus(
+    phase_cycle_payload = trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None
+    trace_rows = trace_payload.get("trace", []) if isinstance(trace_payload, dict) else []
+    runtime_sessions = {
+        agent_name: session
+        for agent_name, session in _runtime_sessions_for_thread(state.selected_thread_id, config)
+    }
+    protocol_plan = _try_protocol_next_snapshot(state.selected_thread_id, config)
+    validation = _detail_validation_snapshot(
         thread,
-        status_summary,
-        trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
-        trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
-    ).splitlines()
-    intro_lines, sections = _parse_hud_sections(body_lines)
-    section_map = {title: lines for title, lines in sections}
+        phase_cycle_payload,
+        trace_rows,
+        runtime_sessions,
+        protocol_plan,
+    )
+    validation_cases = _detail_validation_cases(thread, trace_rows, protocol_plan)
+    primary_reason = _detail_primary_validation_reason(validation)
+    verdict = str(validation.get("verdict") or "PASS").upper()
+    next_action_token = str(validation.get("next_expected_action") or "").strip()
+    _, next_hint = _detail_status_summary(trace_rows, phase_cycle_payload)
+    next_action_display = (
+        _humanize_hud_action(next_action_token)
+        if next_action_token and next_action_token != "none"
+        else next_hint or "-"
+    )
+    state_payload = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else None
+    cycle_index = state_payload.get("cycle_index") if isinstance(state_payload, dict) else None
+    phase = str(thread.get("current_phase") or "-")
+    topic = str(thread.get("topic") or state.selected_thread_id)
+    protocol = str(thread.get("protocol") or "-")
 
-    why_lines = section_map.get("Why this verdict", ["-"])
-    decision_lines = [
-        line
-        for line in why_lines
-        if line.startswith("verdict:") or line.startswith("primary_reason:") or line.startswith("next expected action:")
-    ] or ["-"]
-    validation_lines = [
-        line
-        for line in why_lines
-        if line not in decision_lines
-    ] or ["-"]
+    rows = _validation_compliance_rows(validation, validation_cases, runtime_sessions, trace_rows)
 
-    trace_lines = section_map.get("Trace / Reason Excerpt", ["No validation trace excerpts"])
-    visible_trace = trace_lines
-    if trace_lines and state.thread_log_offset:
-        window_size = max(_hud_thread_view_window_size() - 18, 4)
-        visible_trace = trace_lines[state.thread_log_offset : state.thread_log_offset + window_size] or trace_lines[-window_size:]
-    if trace_lines:
-        window_size = max(_hud_thread_view_window_size() - 18, 4)
-        max_offset = max(0, len(trace_lines) - window_size)
-        state.thread_log_offset = min(max(state.thread_log_offset, 0), max_offset)
-        start = state.thread_log_offset + 1
-        end = min(state.thread_log_offset + len(visible_trace), len(trace_lines))
-        visible_trace = [
-            *visible_trace,
-            "",
-            f"Scroll  {start}-{end} of {len(trace_lines)}",
-        ]
+    header_row = Text()
+    header_row.append("verdict  ", style="bold")
+    header_row.append_text(_verdict_text(verdict))
+    header_row.append("     primary  ", style="bold")
+    header_row.append(primary_reason, style="" if verdict == "PASS" else "yellow")
+    phase_row = Text()
+    phase_row.append("phase    ", style="bold")
+    phase_row.append(phase)
+    if isinstance(cycle_index, int):
+        phase_row.append(f"/{cycle_index}", style="dim")
+    phase_row.append("     next     ", style="bold")
+    phase_row.append(next_action_display, style="cyan")
+    topic_row = Text()
+    topic_row.append(topic, style="bold")
+    topic_row.append("  ")
+    topic_row.append(protocol, style="dim")
 
-    summary_lines = [
-        line
-        for line in intro_lines
-        if line.startswith("Topic") or line.startswith("Phase") or line.startswith("Validation verdict") or line.startswith("Primary reason") or line.startswith("Next action")
-    ] or intro_lines
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        expand=True,
+        show_header=True,
+        header_style="bold",
+        pad_edge=False,
+    )
+    table.add_column("Rule", ratio=3, no_wrap=False)
+    table.add_column("Expected", ratio=4, no_wrap=False)
+    table.add_column("Actual", ratio=4, no_wrap=False)
+    table.add_column("Verdict", width=9, no_wrap=True)
 
-    return Group(
-        Panel(
-            Text("B-TWIN HUD :: Validation Focus", style="bold"),
-            subtitle=f"mode={config.runtime.mode}",
-            border_style="bright_blue",
-            box=box.ROUNDED,
-            padding=(0, 1),
-        ),
-        _hud_panel("Validation Cockpit", summary_lines, border_style="bright_blue"),
-        _hud_panel_row(
-            [
-                _hud_panel("Decision", decision_lines, border_style="bright_magenta"),
-                _hud_panel("Validation", validation_lines, border_style="cyan"),
-            ],
-            ratios=[1, 1],
-        ),
-        _hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"),
-        _hud_panel_row(
-            [
-                _hud_panel("Validation Cases", section_map.get("Validation Cases", ["-"]), border_style="yellow"),
-                _hud_panel("Trace / Reason Excerpt", visible_trace, border_style="bright_yellow"),
-            ],
-            ratios=[5, 7],
-        ),
-        Panel(
-            _hud_renderable_lines(
-                [
-                    "Hint      up/down scroll  pgup/pgdn page  home/end jump",
-                    "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
-                ]
+    for row in rows:
+        verdict_cell = _verdict_text(row["verdict"])
+        if row["verdict"] in {"PASS", "SKIP"}:
+            name_style = "dim italic" if row["group"] == "case" else ""
+        else:
+            name_style = "bold italic" if row["group"] == "case" else "bold"
+        table.add_row(
+            Text(row["name"], style=name_style),
+            Text(row["expected"], style="dim"),
+            Text(row["actual"]),
+            verdict_cell,
+        )
+
+    reasons = validation.get("reasons") if isinstance(validation.get("reasons"), list) else []
+    reasons_renderables: list[RenderableType | str] = []
+    if verdict != "PASS" and reasons:
+        for reason in reasons:
+            text = str(reason or "").strip()
+            if not text:
+                continue
+            line = Text()
+            line.append("• ", style="yellow" if verdict == "WARN" else "red")
+            line.append(text)
+            reasons_renderables.append(line)
+
+    body = Layout(name="validation-body")
+    body_sections: list[Layout] = [
+        Layout(
+            _hud_panel(
+                "Validation",
+                [topic_row, header_row, phase_row],
+                border_style="bright_blue",
             ),
-            border_style="bright_black",
-            box=box.ROUNDED,
-            padding=(0, 1),
+            name="validation-header",
+            size=5,
         ),
+        Layout(
+            _hud_panel("Rule Compliance", [table], border_style="cyan"),
+            name="validation-table",
+            ratio=1,
+        ),
+    ]
+    if reasons_renderables:
+        body_sections.append(
+            Layout(
+                _hud_panel(
+                    "Reasons",
+                    reasons_renderables,
+                    border_style="yellow" if verdict == "WARN" else "red",
+                ),
+                name="validation-reasons",
+                size=min(len(reasons_renderables) + 2, 8),
+            )
+        )
+    body.split_column(*body_sections)
+
+    return _render_hud_shell_renderable(
+        "Validation Focus",
+        body,
+        "[T] threads  [D] detail  [L] live  [:] cmd",
+        config=config,
     )
 
 

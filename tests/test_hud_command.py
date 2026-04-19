@@ -35,9 +35,9 @@ def _attached_config(data_dir: Path) -> BTwinConfig:
     return BTwinConfig(runtime=RuntimeConfig(mode="attached"), data_dir=data_dir)
 
 
-def _renderable_to_text(renderable, width: int = 120) -> str:
+def _renderable_to_text(renderable, width: int = 120, height: int = 40) -> str:
     buffer = io.StringIO()
-    Console(file=buffer, force_terminal=False, color_system=None, width=width).print(renderable)
+    Console(file=buffer, force_terminal=False, color_system=None, width=width, height=height).print(renderable)
     return buffer.getvalue()
 
 
@@ -1643,15 +1643,15 @@ def test_hud_validation_renderable_shows_validation_sections(monkeypatch, tmp_pa
 
     renderable = main._render_hud_navigator_renderable(state, config, limit=5)
 
-    rendered = _renderable_to_text(renderable)
+    rendered = _renderable_to_text(renderable, width=160)
     assert "Validation Focus" in rendered
-    assert "Decision" in rendered
-    assert "Validation verdict" in rendered
-    assert "Primary reason" in rendered
-    assert "Validation" in rendered
-    assert "Expected vs Actual" in rendered
-    assert "Validation Cases" in rendered
-    assert "Trace / Reason Excerpt" in rendered
+    assert "Rule Compliance" in rendered
+    assert "Protocol match" in rendered
+    assert "Required contribution" in rendered
+    assert "verdict" in rendered
+    assert "Expected" in rendered
+    assert "Actual" in rendered
+    assert "Missing contribution blocked" in rendered
 
 
 def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch, tmp_path):
@@ -2648,14 +2648,11 @@ def test_hud_validation_focus_warns_on_session_recovery(monkeypatch, tmp_path):
 
     rendered = _renderable_to_text(main._render_hud_navigator_renderable(state, config, limit=5))
 
-    assert "Validation verdict  WARN" in rendered
-    assert "Decision" in rendered
-    assert "Validation" in rendered
-    assert "verdict: WARN" in rendered
-    assert "session_health: WARN" in rendered
-    assert "Primary reason  runtime session recovery pending" in rendered
-    assert "primary_reason: runtime session recovery pending" in rendered
-    assert "next expected action: none" in rendered
+    assert "Rule Compliance" in rendered
+    assert "WARN" in rendered
+    assert "Session health" in rendered
+    assert "runtime session recovery pending" in rendered
+    assert "Reasons" in rendered
 
 
 def test_hud_validation_focus_section_contract(monkeypatch, tmp_path):
@@ -2743,33 +2740,31 @@ def test_hud_validation_focus_section_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, current_config: [])
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
-    rendered = _renderable_to_text(main._render_hud_navigator_renderable(state, config, limit=5))
+    rendered = _renderable_to_text(main._render_hud_navigator_renderable(state, config, limit=5), width=160)
     lines = rendered.splitlines()
 
     def panel_index(title: str) -> int:
         return next(
             i
             for i, line in enumerate(lines)
-            if line.startswith("╭")
-            and title in line
-            and (title != "Validation" or "Validation Cockpit" not in line)
+            if line.startswith("╭") and title in line
         )
 
-    assert panel_index("Decision") == panel_index("Validation")
-    assert panel_index("Decision") < panel_index("Expected vs Actual")
-    assert panel_index("Validation Cases") == panel_index("Trace / Reason Excerpt")
-    assert panel_index("Expected vs Actual") < panel_index("Validation Cases")
-    assert "Validation verdict  PASS" in rendered
-    assert "Primary reason  all checks aligned" in rendered
-    assert "verdict: PASS" in rendered
-    assert "protocol_match: PASS" in rendered
-    assert "trajectory_match: PASS" in rendered
-    assert "session_health: PASS" in rendered
-    assert "required_contribution: PASS" in rendered
-    assert "trace_completeness: PASS" in rendered
-    assert "missing_contribution_blocked: not triggered" in rendered
-    assert "primary_reason: all checks aligned" in rendered
-    assert "next expected action: record_outcome" in rendered
+    assert panel_index("Validation") < panel_index("Rule Compliance")
+    assert "PASS" in rendered
+    assert "all checks aligned" in rendered
+    assert "Protocol match" in rendered
+    assert "Trajectory match" in rendered
+    assert "Session health" in rendered
+    assert "Required contribution" in rendered
+    assert "Trace completeness" in rendered
+    assert "Happy path accept" in rendered
+    assert "Retry same phase" in rendered
+    assert "Missing contribution blocked" in rendered
+    assert "Close requires summary" in rendered
+    # PASS verdict => no Reasons panel
+    assert "Reasons" not in rendered
+    assert "record outcome" in rendered
 
 
 def test_hud_thread_scroll_bounds_use_detail_renderer_body(monkeypatch, tmp_path):
