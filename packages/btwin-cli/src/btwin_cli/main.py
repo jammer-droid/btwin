@@ -1145,7 +1145,7 @@ def _render_hud_thread_detail_screen(thread_id: str | None, limit: int) -> str:
     config = _get_config()
     thread, status_summary, lookup_error = _try_load_thread_snapshot(thread_id, config)
     if lookup_error is not None:
-        return _render_hud(thread_id, limit)
+        return _render_hud_thread_detail_lookup_error(thread_id, lookup_error)
     trace_payload = _thread_watch_payload(
         thread,
         status_summary,
@@ -1927,6 +1927,26 @@ def _hud_thread_view_window_size() -> int:
         return 12
 
 
+def _render_hud_thread_detail_lookup_error(thread_id: str, lookup_error: str) -> str:
+    return "\n".join(
+        [
+            "B-TWIN HUD",
+            "",
+            "Thread Detail",
+            "",
+            f"Thread   {thread_id}",
+            f"Status   {lookup_error}",
+            "",
+            "Controls  t threads  q quit",
+        ]
+    )
+
+
+def _render_hud_thread_detail_body_lines(thread_id: str, limit: int) -> list[str]:
+    screen_lines = _render_hud_thread_detail_screen(thread_id, limit).splitlines()
+    return screen_lines[4:] if len(screen_lines) >= 4 else []
+
+
 def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
     if state.selected_thread_id is None:
         lines = ["B-TWIN HUD", "", "Thread Detail", "", "No thread selected.", "", "Controls  t threads  q quit"]
@@ -1934,16 +1954,7 @@ def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
     config = _get_config()
     thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
     if lookup_error is not None:
-        lines = ["B-TWIN HUD", "", "Thread Detail", ""]
-        lines.extend(
-            [
-                f"Thread   {state.selected_thread_id}",
-                f"Status   {lookup_error}",
-                "",
-                "Controls  t threads  q quit",
-            ]
-        )
-        return "\n".join(lines)
+        return _render_hud_thread_detail_lookup_error(state.selected_thread_id, lookup_error)
 
     screen_lines = _render_hud_thread_detail_screen(state.selected_thread_id, limit).splitlines()
     body_lines = screen_lines[4:] if len(screen_lines) >= 4 else []
@@ -2103,7 +2114,7 @@ def _apply_hud_key(
             state.thread_index = _clamp_index(state.thread_index, len(remaining))
             return False
         if state.selected_thread_id is not None:
-            body_lines = _render_hud(state.selected_thread_id, 10).splitlines()[1:]
+            body_lines = _render_hud_thread_detail_body_lines(state.selected_thread_id, 10)
             window_size = _hud_thread_view_window_size()
             max_offset = max(0, len(body_lines) - window_size)
             if key == "up":

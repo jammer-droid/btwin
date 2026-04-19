@@ -1280,8 +1280,16 @@ def test_hud_thread_view_scrolls_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
     monkeypatch.setattr(
         main,
-        "_render_hud",
-        lambda thread_id, limit: "B-TWIN HUD\n" + "\n".join(f"line {i}" for i in range(12)),
+        "_render_hud_thread_detail_screen",
+        lambda thread_id, limit: "\n".join(
+            [
+                "B-TWIN HUD",
+                "",
+                "Thread Detail",
+                "",
+                *[f"line {i}" for i in range(12)],
+            ]
+        ),
     )
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 4)
 
@@ -1636,6 +1644,34 @@ def test_hud_direct_thread_entry_uses_thread_detail_renderer(monkeypatch, tmp_pa
     assert "Direct entry" in result.output
 
 
+def test_hud_direct_thread_entry_uses_thread_detail_lookup_error_stub(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+    monkeypatch.setattr(main, "_hud_is_interactive", lambda: False)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (None, None, "thread lookup error: missing thread"),
+    )
+    monkeypatch.setattr(
+        main,
+        "_render_hud",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback HUD should not be used")),
+    )
+
+    result = runner.invoke(app, ["hud", "--thread", "thread-missing"])
+
+    assert result.exit_code == 0, result.output
+    assert "Thread Detail" in result.output
+    assert "Status   thread lookup error: missing thread" in result.output
+    assert "missing thread" in result.output
+    assert "fallback HUD" not in result.output
+
+
 def test_hud_thread_detail_navigator_uses_same_render_path(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
@@ -1764,6 +1800,42 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
     assert any("Task 2" in line or "placeholder" in line.lower() for line in lines[index_of("Validation Summary") : index_of("Expected vs Actual")])
     assert "thread-1" not in lines[1]
     assert "binding=" not in rendered
+
+
+def test_hud_thread_scroll_bounds_use_detail_renderer_body(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _standalone_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_render_hud",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("scroll bounds should use detail renderer")),
+    )
+    monkeypatch.setattr(
+        main,
+        "_render_hud_thread_detail_screen",
+        lambda thread_id, limit: "\n".join(
+            [
+                "B-TWIN HUD",
+                "",
+                "Thread Detail",
+                "",
+                *[f"line {i}" for i in range(12)],
+            ]
+        ),
+    )
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 4)
+
+    assert main._apply_hud_key(state, "end", config) is False
+    assert state.thread_log_offset == 8
+
+    assert main._apply_hud_key(state, "home", config) is False
+    assert state.thread_log_offset == 0
 
 
 def test_hud_close_key_closes_selected_standalone_thread_and_hides_it(tmp_path, monkeypatch):
