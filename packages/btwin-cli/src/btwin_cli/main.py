@@ -36,10 +36,15 @@ from datetime import datetime, timezone
 
 import typer
 import yaml
-from rich.console import Console
+from rich import box
+from rich.console import Console, Group, RenderableType
+from rich.layout import Layout
 from rich.live import Live
 from rich.markup import escape
 from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from btwin_core.agent_store import AgentStore, sanitize_agent_for_output
 from btwin_core.config import BTwinConfig, load_config, resolve_config_path
@@ -955,6 +960,7 @@ def _detail_validation_snapshot(
     phase_cycle_payload: dict[str, object] | None,
     trace_rows: list[dict[str, object]],
     runtime_sessions: dict[str, dict[str, object]],
+    protocol_plan: dict[str, object] | None = None,
 ) -> dict[str, object]:
     primary_row = _detail_primary_trace_row(trace_rows)
     protocol = str(thread.get("protocol") or "").strip()
@@ -991,6 +997,23 @@ def _detail_validation_snapshot(
     checks.append(("session_health", session_health))
 
     required_contribution = "PASS"
+    if isinstance(protocol_plan, dict):
+        suggested_action = str(protocol_plan.get("suggested_action") or "").strip()
+        if suggested_action:
+            next_expected_action = suggested_action
+        missing_items = protocol_plan.get("missing")
+        if protocol_plan.get("passed") is False and isinstance(missing_items, list) and missing_items:
+            required_contribution = "WARN"
+            for item in missing_items:
+                if not isinstance(item, dict):
+                    continue
+                agent_name = str(item.get("agent") or "participant").strip() or "participant"
+                missing_sections = item.get("missing_sections")
+                if isinstance(missing_sections, list) and missing_sections:
+                    section_list = ", ".join(str(section) for section in missing_sections if section)
+                    reasons.append(f"{agent_name} missing {section_list}")
+                else:
+                    reasons.append(f"{agent_name} missing contribution")
     if isinstance(primary_row, dict):
         reason = str(primary_row.get("reason") or "").strip()
         summary = str(primary_row.get("summary") or "").strip()
@@ -1034,6 +1057,51 @@ def _detail_validation_snapshot(
     }
 
 
+def _try_protocol_next_snapshot(
+    thread_id: str,
+    config: BTwinConfig | None = None,
+) -> dict[str, object] | None:
+    current_config = config or _get_config()
+    try:
+        if _use_attached_api(current_config):
+            thread = _api_get(f"/api/threads/{thread_id}")
+            if not isinstance(thread, dict):
+                return None
+            protocol_name = thread.get("protocol")
+            if not isinstance(protocol_name, str) or not protocol_name.strip():
+                return None
+            protocol_payload = _api_get(f"/api/protocols/{protocol_name}")
+            if not isinstance(protocol_payload, dict):
+                return None
+            protocol = Protocol.model_validate(protocol_payload)
+            current_phase = thread.get("current_phase")
+            contributions_payload = []
+            if isinstance(current_phase, str) and current_phase:
+                contributions_payload = _api_get(
+                    f"/api/threads/{thread_id}/contributions",
+                    params={"phase": current_phase},
+                )
+            contributions = contributions_payload if isinstance(contributions_payload, list) else []
+        else:
+            thread_store = _get_thread_store()
+            thread = thread_store.get_thread(thread_id)
+            if thread is None:
+                return None
+            protocol_name = thread.get("protocol")
+            protocol = _get_protocol_store().get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+            if protocol is None:
+                return None
+            current_phase = thread.get("current_phase")
+            contributions = (
+                thread_store.list_contributions(thread_id, phase=current_phase)
+                if isinstance(current_phase, str) and current_phase
+                else []
+            )
+        return describe_next(thread, protocol, contributions).model_dump(exclude={"manual_outcome_required"})
+    except Exception:
+        return None
+
+
 def _append_detail_section(lines: list[str], title: str) -> None:
     lines.extend(["", title, "-" * len(title)])
 
@@ -1072,6 +1140,10 @@ def _render_detail_agent_session_rows(
         transport = _runtime_session_summary(session) or "-"
         rows.append(f"{agent_name:<4} {status:<11} {transport}")
     return rows
+
+
+def _humanize_hud_action(action: object) -> str:
+    return str(action or "").strip().replace("_", " ")
 
 
 def _render_thread_detail(
@@ -1150,11 +1222,19 @@ def _render_thread_detail(
         agent_name: session
         for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
     }
+    protocol_plan = _try_protocol_next_snapshot(thread_id, config)
     validation = _detail_validation_snapshot(
         thread,
         phase_cycle_payload,
         trace_rows,
         runtime_sessions,
+        protocol_plan,
+    )
+    next_action_token = str(validation["next_expected_action"] or "").strip()
+    next_action_display = (
+        _humanize_hud_action(next_action_token)
+        if next_action_token and next_action_token != "none"
+        else next_hint
     )
     agents = status_summary.get("agents", [])
     actor_parts: list[str] = []
@@ -1185,8 +1265,8 @@ def _render_thread_detail(
         expected_bits.append(f"procedure={procedure_summary}")
     if isinstance(cycle_index, int):
         expected_bits.append(f"cycle={cycle_index}")
-    if next_hint:
-        expected_bits.append(f"next={next_hint}")
+    if next_action_display:
+        expected_bits.append(f"next={next_action_display}")
 
     compiled_bits: list[str] = []
     if outcome_policy:
@@ -1217,7 +1297,7 @@ def _render_thread_detail(
         + (f"  step={step_label}" if isinstance(step_label, str) and step_label.strip() else ""),
         f"Status    {status_text}",
         f"Compiled  {'; '.join(compiled_bits) if compiled_bits else '-'}",
-        f"Next action  {next_hint}",
+        f"Next action  {next_action_display}",
     ]
 
     procedure_path_items: list[str] = []
@@ -1269,7 +1349,7 @@ def _render_thread_detail(
         lines.append(f"outcome_actions: {', '.join(str(item) for item in outcome_actions)}")
     if isinstance(policy_outcomes, list) and policy_outcomes:
         lines.append(f"policy_outcomes: {', '.join(str(item) for item in policy_outcomes)}")
-    lines.append(f"gate_hint: {next_hint}")
+    lines.append(f"gate_hint: {next_action_display}")
 
     _append_detail_section(lines, "Agent Sessions")
     if agent_session_rows:
@@ -2199,6 +2279,435 @@ def _render_hud_screen(title: str, body_lines: list[str], hint_line: str, config
     return "\n".join(lines)
 
 
+def _hud_renderable_line(text: str) -> Text:
+    if not text:
+        return Text("")
+    try:
+        return Text.from_markup(text)
+    except Exception:
+        return Text(text)
+
+
+def _hud_renderable_item(item: RenderableType | str) -> RenderableType:
+    if isinstance(item, str):
+        return _hud_renderable_line(item)
+    return item
+
+
+def _hud_renderable_lines(lines: list[RenderableType | str]) -> RenderableType:
+    if not lines:
+        return Text("-")
+    return Group(*(_hud_renderable_item(line) for line in lines))
+
+
+def _hud_panel(
+    title: str,
+    lines: list[RenderableType | str],
+    *,
+    border_style: str = "cyan",
+) -> Panel:
+    return Panel(
+        _hud_renderable_lines(lines),
+        title=title,
+        border_style=border_style,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def _parse_hud_sections(lines: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    intro: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_lines: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if (
+            line
+            and index + 1 < len(lines)
+            and lines[index + 1] == "-" * len(line)
+        ):
+            if current_title is not None:
+                sections.append((current_title, current_lines))
+            current_title = line
+            current_lines = []
+            index += 2
+            continue
+        if current_title is None:
+            intro.append(line)
+        else:
+            current_lines.append(line)
+        index += 1
+    if current_title is not None:
+        sections.append((current_title, current_lines))
+    return intro, sections
+
+
+def _render_hud_shell_renderable(
+    title: str,
+    body: RenderableType,
+    hint_line: str,
+    *,
+    config: BTwinConfig | None = None,
+) -> RenderableType:
+    current_config = config or _get_config()
+    root = Layout(name="hud-root")
+    root.split_column(
+        Layout(name="hud-header", size=3),
+        Layout(name="hud-body", ratio=1),
+        Layout(name="hud-footer", size=4),
+    )
+    root["hud-header"].update(
+        Panel(
+            Text(f"B-TWIN HUD :: {title}", style="bold"),
+            subtitle=f"mode={current_config.runtime.mode}",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    )
+    root["hud-body"].update(body)
+    root["hud-footer"].update(
+        Panel(
+            _hud_renderable_lines(
+                [
+                    f"Hint      {hint_line}",
+                    "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                ]
+            ),
+            border_style="bright_black",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+    )
+    return root
+
+
+def _render_hud_menu_renderable(state: _HudNavigatorState) -> RenderableType:
+    items = _hud_menu_items()
+    lines = []
+    for index, item in enumerate(items):
+        prefix = ">" if index == state.menu_index else " "
+        lines.append(f"{prefix} {item}")
+    return _render_hud_shell_renderable(
+        "Menu",
+        _hud_panel("Views", lines, border_style="cyan"),
+        "up/down move  enter select",
+    )
+
+
+def _render_hud_threads_renderable(
+    state: _HudNavigatorState,
+    config: BTwinConfig,
+    limit: int,
+) -> RenderableType:
+    threads = _list_hud_threads(config)
+    state.thread_index = _clamp_index(state.thread_index, len(threads))
+    if not threads:
+        return _render_hud_shell_renderable(
+            "Threads / Sessions",
+            _hud_panel("Threads / Sessions", ["No active threads"], border_style="yellow"),
+            "up/down select  enter open",
+            config=config,
+        )
+
+    table = Table(box=box.SIMPLE_HEAD, expand=True, show_header=True, header_style="bold")
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Topic", ratio=3)
+    table.add_column("Protocol", ratio=2)
+    table.add_column("Phase", ratio=2)
+    for index, thread in enumerate(threads):
+        prefix = ">" if index == state.thread_index else " "
+        topic = str(thread.get("topic") or thread.get("thread_id") or "-")
+        protocol = str(thread.get("protocol") or "-")
+        phase = str(thread.get("current_phase") or "-")
+        row_style = "bold cyan" if index == state.thread_index else None
+        table.add_row(prefix, topic, protocol, phase, style=row_style)
+
+    preview_lines = ["Filter: all"]
+    focused = threads[state.thread_index]
+    focused_thread_id = focused.get("thread_id")
+    if isinstance(focused_thread_id, str):
+        thread, status_summary, lookup_error = _try_load_thread_snapshot(focused_thread_id, config)
+        if lookup_error is None and isinstance(thread, dict) and isinstance(status_summary, dict):
+            trace_payload = _thread_watch_payload(
+                thread,
+                status_summary,
+                _workflow_event_log(focused_thread_id).list_events(limit=min(limit, 5)),
+            )
+            trace_rows = trace_payload.get("trace", []) if isinstance(trace_payload, dict) else []
+            phase_cycle_payload = trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None
+            phase = str(thread.get("current_phase") or "-")
+            cycle_index = None
+            step_label = None
+            if isinstance(phase_cycle_payload, dict):
+                state_payload = phase_cycle_payload.get("state")
+                if isinstance(state_payload, dict):
+                    cycle_index = state_payload.get("cycle_index")
+                    step_label = state_payload.get("current_step_label")
+            primary_row = _detail_primary_trace_row(trace_rows)
+            gate_label = ""
+            if isinstance(primary_row, dict):
+                gate_label = str(primary_row.get("gate_alias") or primary_row.get("gate_key") or "").strip()
+            runtime_sessions = {
+                agent_name: session
+                for agent_name, session in _runtime_sessions_for_thread(focused_thread_id, config)
+            }
+            agent_parts: list[str] = []
+            agents = status_summary.get("agents", [])
+            if isinstance(agents, list):
+                for agent in agents:
+                    if not isinstance(agent, dict):
+                        continue
+                    agent_name = str(agent.get("name") or "").strip()
+                    if not agent_name:
+                        continue
+                    status = str(agent.get("status") or "-").strip() or "-"
+                    runtime_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
+                    if runtime_summary:
+                        agent_parts.append(f"{agent_name}={status}({runtime_summary})")
+                    else:
+                        agent_parts.append(f"{agent_name}={status}")
+            latest_summary = ""
+            if trace_rows and isinstance(trace_rows[-1], dict):
+                latest_summary = str(trace_rows[-1].get("summary") or "").strip()
+
+            preview_lines.extend(
+                [
+                    "",
+                    f"{thread.get('topic') or focused_thread_id} · {thread.get('protocol') or '-'}",
+                    f"thread_id: {focused_thread_id}",
+                ]
+            )
+            phase_line = f"phase: {phase}"
+            if isinstance(cycle_index, int):
+                phase_line += f" (cycle {cycle_index})"
+            if isinstance(step_label, str) and step_label.strip():
+                phase_line += f" · step={step_label}"
+            preview_lines.append(phase_line)
+            if gate_label:
+                preview_lines.append(f"gate: {gate_label}")
+            if agent_parts:
+                preview_lines.append(f"agents: {'  '.join(agent_parts)}")
+            if latest_summary:
+                preview_lines.append(f"last: {latest_summary}")
+
+    body = Layout(name="threads-body")
+    body.split_row(
+        Layout(_hud_panel("Threads / Sessions", [_hud_renderable_line("Filter: all"), Text(""), table], border_style="cyan"), name="threads-list", ratio=3),
+        Layout(_hud_panel("Selected Workflow", preview_lines, border_style="magenta"), name="threads-preview", ratio=2),
+    )
+    return _render_hud_shell_renderable(
+        "Threads / Sessions",
+        body,
+        "up/down select  enter open  d detail  l live  c close",
+        config=config,
+    )
+
+
+def _render_hud_thread_detail_renderable(state: _HudNavigatorState, limit: int) -> RenderableType:
+    if state.selected_thread_id is None:
+        return _render_hud_shell_renderable(
+            "Thread Detail",
+            _hud_panel("Thread Detail", ["No thread selected."], border_style="yellow"),
+            "t threads  q quit",
+        )
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+    if lookup_error is not None:
+        return _render_hud_shell_renderable(
+            "Thread Detail",
+            _hud_panel(
+                "Thread Detail",
+                [f"Thread   {state.selected_thread_id}", f"Status   {lookup_error}"],
+                border_style="red",
+            ),
+            "t threads  q quit",
+            config=config,
+        )
+
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+    )
+    detail_lines = _render_thread_detail(
+        thread,
+        status_summary,
+        trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
+        trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
+    ).splitlines()
+    intro_lines, sections = _parse_hud_sections(detail_lines)
+    section_map = {title: lines for title, lines in sections}
+
+    activity_lines = section_map.get("Recent Activity", ["No recent workflow events"])
+    visible_activity = activity_lines
+    if activity_lines and state.thread_log_offset:
+        window_size = max(_hud_thread_view_window_size() - 6, 5)
+        visible_activity = activity_lines[state.thread_log_offset : state.thread_log_offset + window_size] or activity_lines[-window_size:]
+
+    body = Layout(name="thread-detail-body")
+    body.split_row(
+        Layout(name="thread-detail-main", ratio=3),
+        Layout(name="thread-detail-side", ratio=2),
+    )
+    body["thread-detail-main"].split_column(
+        Layout(_hud_panel("Current Status", intro_lines, border_style="bright_blue"), name="thread-summary", ratio=1),
+        Layout(_hud_panel("Protocol / Phase", section_map.get("Protocol / Phase", ["-"])), name="thread-protocol", ratio=1),
+        Layout(_hud_panel("Gate & Outcome Policy", section_map.get("Gate & Outcome Policy", ["-"])), name="thread-policy", ratio=1),
+        Layout(_hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"), name="thread-expected", ratio=1),
+        Layout(_hud_panel("Recent Activity", visible_activity, border_style="yellow"), name="thread-activity", ratio=2),
+    )
+    body["thread-detail-side"].split_column(
+        Layout(_hud_panel("Validation", section_map.get("Validation", ["-"]), border_style="magenta"), name="thread-validation", ratio=1),
+        Layout(_hud_panel("Agent Sessions", section_map.get("Agent Sessions", ["No agent sessions"])), name="thread-sessions", ratio=1),
+        Layout(_hud_panel("Quick Actions", section_map.get("Quick Actions", ["[b] back  [q] quit"]), border_style="bright_black"), name="thread-actions", size=6),
+    )
+    return _render_hud_shell_renderable(
+        "Thread Detail",
+        body,
+        "up/down scroll  pgup/pgdn page  home/end jump",
+        config=config,
+    )
+
+
+def _render_hud_live_trace_renderable(state: _HudNavigatorState, limit: int) -> RenderableType:
+    if state.selected_thread_id is None:
+        return _render_hud_shell_renderable(
+            "Live Trace / Diagnostics",
+            _hud_panel("Live Trace / Diagnostics", ["No thread selected."], border_style="yellow"),
+            "d detail  t threads  q quit",
+        )
+
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+    if lookup_error is not None:
+        return _render_hud_shell_renderable(
+            "Live Trace / Diagnostics",
+            _hud_panel(
+                "Live Trace / Diagnostics",
+                [f"Thread   {state.selected_thread_id}", f"Status   {lookup_error}"],
+                border_style="red",
+            ),
+            "d detail  t threads  q quit",
+            config=config,
+        )
+
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+    )
+    trace_rows = trace_payload["trace"]
+    runtime_sessions = {
+        agent_name: session
+        for agent_name, session in _runtime_sessions_for_thread(state.selected_thread_id, config)
+    }
+    mailbox_reports = _list_system_mailbox_reports(thread_id=state.selected_thread_id, limit=limit, config=config)
+    display_rows = [row for row in reversed(trace_rows) if isinstance(row, dict)]
+    table_window = max(_hud_thread_view_window_size() - 6, 5)
+    visible_rows = display_rows[state.thread_log_offset : state.thread_log_offset + table_window]
+    selected_row = visible_rows[0] if visible_rows else (display_rows[0] if display_rows else None)
+
+    trace_table = Table(box=box.SIMPLE_HEAD, expand=True, show_header=True, header_style="bold")
+    trace_table.add_column("TIME", width=8, no_wrap=True)
+    trace_table.add_column("KIND", width=10, no_wrap=True)
+    trace_table.add_column("PHASE", width=10, no_wrap=True)
+    trace_table.add_column("ACTOR", width=12, no_wrap=True)
+    trace_table.add_column("PAYLOAD", ratio=1)
+    for row in visible_rows:
+        timestamp = str(row.get("timestamp") or "")
+        time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp or "--:--:--"
+        trace_table.add_row(
+            time_label,
+            str(row.get("kind") or "-"),
+            str(row.get("phase") or "-"),
+            _hud_live_trace_actor(row),
+            _hud_live_trace_payload_text(row),
+        )
+
+    inspector_lines = []
+    if isinstance(selected_row, dict):
+        inspector_lines.append(f"kind: {selected_row.get('kind') or '-'}")
+        compiled_items = [
+            ("outcome_policy", selected_row.get("outcome_policy")),
+            (
+                "outcome_emitters",
+                ", ".join(str(item) for item in selected_row.get("outcome_emitters", []))
+                if isinstance(selected_row.get("outcome_emitters"), list)
+                else None,
+            ),
+            (
+                "policy_outcomes",
+                ", ".join(str(item) for item in selected_row.get("policy_outcomes", []))
+                if isinstance(selected_row.get("policy_outcomes"), list)
+                else None,
+            ),
+        ]
+        for key, value in compiled_items:
+            if value:
+                inspector_lines.append(f"{key}: {value}")
+        raw_payload = {
+            key: value
+            for key, value in selected_row.items()
+            if key in {"agent", "baseline_guard", "gate_key", "kind", "outcome", "phase", "reason", "summary", "target_phase", "timestamp"}
+            and value not in (None, "", [])
+        }
+        inspector_lines.append(f"raw: {json.dumps(raw_payload, sort_keys=True)}")
+    else:
+        inspector_lines.append("No trace rows")
+
+    session_parts: list[str] = []
+    agents = status_summary.get("agents", [])
+    if isinstance(agents, list):
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            agent_name = str(agent.get("name") or "").strip()
+            if not agent_name:
+                continue
+            status = str(agent.get("status") or "-").strip() or "-"
+            runtime_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
+            if runtime_summary:
+                session_parts.append(f"{agent_name}={status}({runtime_summary})")
+            else:
+                session_parts.append(f"{agent_name}={status}")
+    session_lines = [f"Sessions  {'  '.join(session_parts)}" if session_parts else "Sessions  none"]
+    if mailbox_reports:
+        session_lines.append(f"Mailbox   {len(mailbox_reports)}")
+
+    body = Layout(name="live-trace-body")
+    body.split_row(
+        Layout(_hud_panel("Live Trace / Diagnostics", [Text(""), trace_table], border_style="cyan"), name="live-trace-main", ratio=3),
+        Layout(name="live-trace-side", ratio=2),
+    )
+    body["live-trace-side"].split_column(
+        Layout(_hud_panel("Row Inspector", inspector_lines, border_style="magenta"), name="live-inspector", ratio=2),
+        Layout(_hud_panel("Sessions", session_lines, border_style="yellow"), name="live-sessions", ratio=1),
+    )
+    return _render_hud_shell_renderable(
+        "Live Trace / Diagnostics",
+        body,
+        "up/down scroll  pgup/pgdn page  home/end jump",
+        config=config,
+    )
+
+
+def _render_hud_navigator_renderable(
+    state: _HudNavigatorState,
+    config: BTwinConfig,
+    limit: int,
+) -> RenderableType:
+    if state.screen == "threads":
+        return _render_hud_threads_renderable(state, config, limit)
+    if state.screen == "thread":
+        return _render_hud_thread_detail_renderable(state, limit)
+    if state.screen == "live":
+        return _render_hud_live_trace_renderable(state, limit)
+    return _render_hud_menu_renderable(state)
+
+
 def _render_hud_threads(state: _HudNavigatorState, config: BTwinConfig, limit: int) -> str:
     threads = _list_hud_threads(config)
     state.thread_index = _clamp_index(state.thread_index, len(threads))
@@ -2529,7 +3038,22 @@ def _apply_hud_key(
                 status_summary,
                 _workflow_event_log(state.selected_thread_id).list_events(limit=10),
             )
-            body_lines = _render_thread_watch(thread, status_summary, trace_payload["trace"]).splitlines()[1:]
+            runtime_sessions = {
+                agent_name: session
+                for agent_name, session in _runtime_sessions_for_thread(state.selected_thread_id, config)
+            }
+            mailbox_reports = _list_system_mailbox_reports(
+                thread_id=state.selected_thread_id,
+                limit=10,
+                config=config,
+            )
+            body_lines = _render_hud_live_trace_body(
+                thread,
+                status_summary,
+                trace_payload["trace"],
+                runtime_sessions,
+                len(mailbox_reports),
+            )
             window_size = _hud_thread_view_window_size()
             max_offset = max(0, len(body_lines) - window_size)
             if key == "up":
@@ -2553,13 +3077,13 @@ def _run_hud_navigator(limit: int, interval: float) -> None:
     state = _HudNavigatorState()
     try:
         with _HudRawInput(), Live(
-            _render_hud_navigator(state, config, limit),
+            _render_hud_navigator_renderable(state, config, limit),
             console=console,
             auto_refresh=False,
             screen=True,
         ) as live:
             while True:
-                live.update(_render_hud_navigator(state, config, limit), refresh=True)
+                live.update(_render_hud_navigator_renderable(state, config, limit), refresh=True)
                 key = _read_hud_key(interval)
                 if _apply_hud_key(state, key, config):
                     return
