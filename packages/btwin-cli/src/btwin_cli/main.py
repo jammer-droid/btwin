@@ -2189,18 +2189,76 @@ def _render_hud_threads(state: _HudNavigatorState, config: BTwinConfig, limit: i
         lines.extend(["  [dim]No active threads[/dim]", "", "Controls  b back  t threads  q quit"])
         return "\n".join(lines)
 
+    lines.append("Filter: all")
+    lines.append("")
     for index, thread in enumerate(threads):
         prefix = ">" if index == state.thread_index else " "
-        lines.append(
-            f"{prefix} {thread.get('thread_id')}  {thread.get('topic')}  "
-            f"{thread.get('protocol')}  phase={thread.get('current_phase')}"
-        )
+        topic = str(thread.get("topic") or thread.get("thread_id") or "-")
+        protocol = str(thread.get("protocol") or "-")
+        phase = str(thread.get("current_phase") or "-")
+        lines.append(f"{prefix} {topic}  {protocol}  phase={phase}")
 
     focused = threads[state.thread_index]
     focused_thread_id = focused.get("thread_id")
-    lines.extend(["", "Preview", ""])
     if isinstance(focused_thread_id, str):
-        lines.append(_render_hud(focused_thread_id, min(limit, 5)))
+        thread, status_summary, lookup_error = _try_load_thread_snapshot(focused_thread_id, config)
+        if lookup_error is None and isinstance(thread, dict) and isinstance(status_summary, dict):
+            trace_payload = _thread_watch_payload(
+                thread,
+                status_summary,
+                _workflow_event_log(focused_thread_id).list_events(limit=min(limit, 5)),
+            )
+            trace_rows = trace_payload.get("trace", []) if isinstance(trace_payload, dict) else []
+            phase_cycle_payload = trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None
+            phase = str(thread.get("current_phase") or "-")
+            cycle_index = None
+            step_label = None
+            if isinstance(phase_cycle_payload, dict):
+                state_payload = phase_cycle_payload.get("state")
+                if isinstance(state_payload, dict):
+                    cycle_index = state_payload.get("cycle_index")
+                    step_label = state_payload.get("current_step_label")
+            primary_row = _detail_primary_trace_row(trace_rows)
+            gate_label = ""
+            if isinstance(primary_row, dict):
+                gate_label = str(primary_row.get("gate_alias") or primary_row.get("gate_key") or "").strip()
+            runtime_sessions = {
+                agent_name: session
+                for agent_name, session in _runtime_sessions_for_thread(focused_thread_id, config)
+            }
+            agent_parts: list[str] = []
+            agents = status_summary.get("agents", [])
+            if isinstance(agents, list):
+                for agent in agents:
+                    if not isinstance(agent, dict):
+                        continue
+                    agent_name = str(agent.get("name") or "").strip()
+                    if not agent_name:
+                        continue
+                    status = str(agent.get("status") or "-").strip() or "-"
+                    runtime_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
+                    if runtime_summary:
+                        agent_parts.append(f"{agent_name}={status}({runtime_summary})")
+                    else:
+                        agent_parts.append(f"{agent_name}={status}")
+            latest_summary = ""
+            if trace_rows and isinstance(trace_rows[-1], dict):
+                latest_summary = str(trace_rows[-1].get("summary") or "").strip()
+
+            lines.extend(["", "Selected Workflow", ""])
+            lines.append(f"{thread.get('topic') or focused_thread_id} · {thread.get('protocol') or '-'}")
+            phase_line = f"phase: {phase}"
+            if isinstance(cycle_index, int):
+                phase_line += f" (cycle {cycle_index})"
+            if isinstance(step_label, str) and step_label.strip():
+                phase_line += f" · step={step_label}"
+            lines.append(phase_line)
+            if gate_label:
+                lines.append(f"gate: {gate_label}")
+            if agent_parts:
+                lines.append(f"agents: {'  '.join(agent_parts)}")
+            if latest_summary:
+                lines.append(f"last: {latest_summary}")
     lines.extend(["", "Controls  up/down move  enter open  d detail  l live  c close  b back  q quit"])
     return "\n".join(lines)
 

@@ -1347,6 +1347,91 @@ def test_hud_navigator_can_jump_between_threads_detail_and_live(monkeypatch, tmp
     assert state.screen == "threads"
 
 
+def test_hud_threads_view_uses_wireframe_list_and_selected_preview(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="threads", thread_index=0)
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(
+        main,
+        "_list_hud_threads",
+        lambda current_config: [
+            {
+                "thread_id": "thread-1",
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            {
+                "thread_id": "thread-2",
+                "topic": "Onboarding",
+                "protocol": "onboarding",
+                "current_phase": "intro",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            {"agents": [{"name": "jun", "status": "waiting"}, {"name": "ari", "status": "joined"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "trace": [
+                {
+                    "timestamp": "2026-04-19T12:03:55Z",
+                    "kind": "gate",
+                    "phase": "review",
+                    "gate_alias": "Retry Gate",
+                    "summary": "Retry loop completed.",
+                }
+            ],
+            "phase_cycle": {
+                "state": {"cycle_index": 3, "current_step_label": "collect-feedback"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_runtime_sessions_for_thread",
+        lambda thread_id, current_config: [
+            ("jun", {"transport_mode": "live_process_transport", "status": "waiting"}),
+            ("ari", {"transport_mode": "live_process_transport", "status": "done"}),
+        ],
+    )
+
+    rendered = main._render_hud_threads(state, config, limit=5)
+
+    assert "Threads / Sessions" in rendered
+    assert "Filter: all" in rendered
+    assert "> Design Review" in rendered
+    assert "Onboarding" in rendered
+    assert "Selected Workflow" in rendered
+    assert "phase: review (cycle 3)" in rendered
+    assert "gate: Retry Gate" in rendered
+    assert "agents: jun=waiting(app-server)  ari=joined(app-server)" in rendered
+    assert "last: Retry loop completed." in rendered
+
+
 def test_hud_live_trace_view_renders_diagnostics_title(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
