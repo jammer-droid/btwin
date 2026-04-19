@@ -950,6 +950,90 @@ def _detail_status_summary(
     return "WAITING · no recent protocol activity", "inspect live trace"
 
 
+def _detail_validation_snapshot(
+    thread: dict[str, object],
+    phase_cycle_payload: dict[str, object] | None,
+    trace_rows: list[dict[str, object]],
+    runtime_sessions: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    primary_row = _detail_primary_trace_row(trace_rows)
+    protocol = str(thread.get("protocol") or "").strip()
+    phase = str(thread.get("current_phase") or "").strip()
+    reasons: list[str] = []
+    checks: list[tuple[str, str]] = []
+    next_expected_action = "none"
+
+    protocol_match = "PASS"
+    if not protocol or not phase:
+        protocol_match = "FAIL"
+        reasons.append("thread protocol context incomplete")
+    checks.append(("protocol_match", protocol_match))
+
+    trajectory_match = "PASS" if trace_rows else "WARN"
+    if not trace_rows:
+        reasons.append("no recent workflow trace")
+    checks.append(("trajectory_match", trajectory_match))
+
+    session_health = "PASS"
+    for session in runtime_sessions.values():
+        if not isinstance(session, dict):
+            continue
+        if bool(session.get("degraded")) and not bool(session.get("recovery_pending")):
+            session_health = "FAIL"
+            reasons.append("runtime session degraded")
+            break
+        if bool(session.get("recovery_pending")):
+            session_health = "WARN"
+            reasons.append("runtime session recovery pending")
+        elif bool(session.get("fallback_transport_involved")):
+            session_health = "WARN"
+            reasons.append("runtime session fallback active")
+    checks.append(("session_health", session_health))
+
+    required_contribution = "PASS"
+    if isinstance(primary_row, dict):
+        reason = str(primary_row.get("reason") or "").strip()
+        summary = str(primary_row.get("summary") or "").strip()
+        if reason == "missing_contribution":
+            required_contribution = "WARN"
+            next_expected_action = "submit_contribution"
+            reasons.append(summary or "Missing contribution for current phase.")
+    checks.append(("required_contribution", required_contribution))
+
+    trace_completeness = "PASS" if trace_rows else "WARN"
+    if not trace_rows:
+        reasons.append("no recent workflow events")
+    checks.append(("trace_completeness", trace_completeness))
+
+    if next_expected_action == "none" and session_health == "PASS" and isinstance(primary_row, dict):
+        if primary_row.get("kind") == "gate" and not str(primary_row.get("outcome") or "").strip():
+            next_expected_action = "record_outcome"
+        elif primary_row.get("kind") == "result":
+            context_core = phase_cycle_payload.get("context_core") if isinstance(phase_cycle_payload, dict) else None
+            policy_outcomes = context_core.get("policy_outcomes") if isinstance(context_core, dict) else None
+            if isinstance(policy_outcomes, list) and policy_outcomes:
+                next_expected_action = "record_outcome"
+
+    verdict = "PASS"
+    statuses = {status for _check_name, status in checks}
+    if "FAIL" in statuses:
+        verdict = "FAIL"
+    elif "WARN" in statuses:
+        verdict = "WARN"
+
+    deduped_reasons: list[str] = []
+    for reason in reasons:
+        if reason and reason not in deduped_reasons:
+            deduped_reasons.append(reason)
+
+    return {
+        "verdict": verdict,
+        "checks": checks,
+        "reasons": deduped_reasons,
+        "next_expected_action": next_expected_action,
+    }
+
+
 def _render_thread_detail(
     thread: dict[str, object],
     status_summary: dict[str, object],
@@ -1026,6 +1110,12 @@ def _render_thread_detail(
         agent_name: session
         for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
     }
+    validation = _detail_validation_snapshot(
+        thread,
+        phase_cycle_payload,
+        trace_rows,
+        runtime_sessions,
+    )
     agents = status_summary.get("agents", [])
     actor_parts: list[str] = []
     if isinstance(agents, list) and agents:
@@ -1104,7 +1194,13 @@ def _render_thread_detail(
     current_status_bits.append(f"status: {status_text}")
     lines.extend(current_status_bits)
 
-    lines.extend(["", "Validation Summary", "placeholder: verdict engine lands in Task 2", "checks: protocol match / trajectory match / session health / trace completeness"])
+    lines.extend(["", "Validation", f"verdict: {validation['verdict']}"])
+    for check_name, check_status in validation["checks"]:
+        lines.append(f"{check_name}: {check_status}")
+    if validation["verdict"] != "PASS":
+        reason_text = "; ".join(str(reason) for reason in validation["reasons"]) or "validation warning"
+        lines.append(f"reason: {reason_text}")
+    lines.append(f"next expected action: {validation['next_expected_action']}")
 
     lines.extend(["", "Expected vs Actual"])
     if expected_bits:

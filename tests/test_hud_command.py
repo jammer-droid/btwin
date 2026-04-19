@@ -1561,8 +1561,15 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     assert "step: collect-feedback" in rendered
     assert "BLOCKED" in rendered
     assert "Collect Feedback" in rendered
-    assert "Validation Summary" in rendered
-    assert "placeholder: verdict engine lands in Task 2" in rendered
+    assert "Validation" in rendered
+    assert "verdict: WARN" in rendered
+    assert "protocol_match: PASS" in rendered
+    assert "trajectory_match: PASS" in rendered
+    assert "session_health: PASS" in rendered
+    assert "required_contribution: WARN" in rendered
+    assert "trace_completeness: PASS" in rendered
+    assert "reason: Missing contribution for current phase." in rendered
+    assert "next expected action: submit_contribution" in rendered
     assert "Expected vs Actual" in rendered
     assert "policy=review-outcomes" in rendered
     assert "outcomes=retry, accept, close" in rendered
@@ -1796,10 +1803,187 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
 
     assert lines[0] == "B-TWIN HUD"
     assert index_of("Topic") < index_of("Protocol") < index_of("Phase") < index_of("Next action")
-    assert index_of("Current Status") < index_of("Validation Summary") < index_of("Expected vs Actual") < index_of("Recent Activity")
-    assert any("Task 2" in line or "placeholder" in line.lower() for line in lines[index_of("Validation Summary") : index_of("Expected vs Actual")])
+    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert any(line.startswith("verdict:") for line in lines[index_of("Validation") : index_of("Expected vs Actual")])
     assert "thread-1" not in lines[1]
     assert "binding=" not in rendered
+
+
+def test_hud_thread_detail_validation_warns_on_session_recovery(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            {"agents": [{"name": "ari", "status": "joined"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {"cycle_index": 2, "current_step_label": "collect-feedback"},
+                "context_core": {"policy_outcomes": ["retry", "accept", "close"]},
+            },
+            "trace": [
+                {
+                    "timestamp": "2026-04-19T12:04:28Z",
+                    "kind": "result",
+                    "phase": "review",
+                    "agent": "ari",
+                    "summary": "Ari result recorded.",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_runtime_sessions_for_thread",
+        lambda thread_id, current_config: [
+            (
+                "ari",
+                {
+                    "transport_mode": "exec_fallback_transport",
+                    "status": "waiting",
+                    "fallback_transport_involved": True,
+                    "recoverable": True,
+                    "recovery_pending": True,
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, current_config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+
+    assert "Validation" in rendered
+    assert "verdict: WARN" in rendered
+    assert "session_health: WARN" in rendered
+    assert "reason: runtime session recovery pending" in rendered
+    assert "next expected action: none" in rendered
+
+
+def test_hud_thread_detail_validation_section_contract(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            {"agents": [{"name": "jun", "status": "waiting"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {
+                    "phase_name": "review",
+                    "cycle_index": 3,
+                    "current_step_label": "collect-feedback",
+                    "status": "active",
+                },
+                "context_core": {
+                    "outcome_policy": "review-outcomes",
+                    "outcome_emitters": ["reviewer", "author"],
+                    "outcome_actions": ["advance", "stay", "end"],
+                    "policy_outcomes": ["retry", "accept", "close"],
+                },
+                "visual": {
+                    "procedure": [
+                        {"key": "announce", "label": "Announce", "status": "completed"},
+                        {"key": "collect-feedback", "label": "Collect Feedback", "status": "active"},
+                        {"key": "resolve", "label": "Resolve", "status": "pending"},
+                    ],
+                    "gates": [
+                        {"key": "retry", "label": "Retry Gate", "status": "completed", "target_phase": "review"},
+                        {"key": "accept", "label": "Accept Gate", "status": "pending", "target_phase": "decision"},
+                    ],
+                },
+            },
+            "trace": [
+                {
+                    "timestamp": "2026-04-19T12:04:28Z",
+                    "kind": "result",
+                    "phase": "review",
+                    "agent": "jun",
+                    "summary": "LGTM with small nits",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_runtime_sessions_for_thread",
+        lambda thread_id, current_config: [
+            (
+                "jun",
+                {
+                    "transport_mode": "live_process_transport",
+                    "status": "done",
+                    "fallback_transport_involved": False,
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, current_config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+    lines = rendered.splitlines()
+
+    def index_of(prefix: str) -> int:
+        return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert "verdict: PASS" in rendered
+    assert "protocol_match: PASS" in rendered
+    assert "trajectory_match: PASS" in rendered
+    assert "session_health: PASS" in rendered
+    assert "required_contribution: PASS" in rendered
+    assert "trace_completeness: PASS" in rendered
+    assert "reason:" not in rendered
+    assert "next expected action: record_outcome" in rendered
 
 
 def test_hud_thread_scroll_bounds_use_detail_renderer_body(monkeypatch, tmp_path):
