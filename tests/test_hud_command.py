@@ -1539,28 +1539,28 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     )
     monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, config: [])
     monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
     rendered = main._render_hud_navigator(state, config, limit=5)
 
     assert "Thread Detail" in rendered
     assert "Design Review" in rendered
     assert "review-loop" in rendered
-    assert "phase=review" in rendered
-    assert "cycle=3" in rendered
-    assert "step=collect-feedback" in rendered
-    assert "Status" in rendered
+    assert "Phase     review" in rendered
+    assert "Next action  submit contribution" in rendered
+    assert "Current Status" in rendered
+    assert "cycle: 3" in rendered
+    assert "step: collect-feedback" in rendered
     assert "BLOCKED" in rendered
-    assert "submit contribution" in rendered
-    assert "Protocol / Phase" in rendered
     assert "Collect Feedback" in rendered
-    assert "Outcome / Policy" in rendered
-    assert "review-outcomes" in rendered
-    assert "reviewer, author" in rendered
-    assert "retry, accept, close" in rendered
+    assert "Validation Summary" in rendered
+    assert "placeholder: verdict engine lands in Task 2" in rendered
+    assert "Expected vs Actual" in rendered
+    assert "policy=review-outcomes" in rendered
+    assert "outcomes=retry, accept, close" in rendered
     assert "Recent Activity" in rendered
     assert "Exit blocked" in rendered
     assert "LGTM with small nits" in rendered
-    assert "Quick Hints" in rendered
 
 
 def test_hud_thread_detail_shows_agent_sessions_and_runtime_summary(monkeypatch, tmp_path):
@@ -1611,10 +1611,11 @@ def test_hud_thread_detail_shows_agent_sessions_and_runtime_summary(monkeypatch,
         ],
     )
     monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
     rendered = main._render_hud_navigator(state, config, limit=5)
 
-    assert "Agent Sessions" in rendered
+    assert "Current Status" in rendered
     assert "jun=waiting (app-server)" in rendered
 
 
@@ -1633,6 +1634,136 @@ def test_hud_direct_thread_entry_uses_thread_detail_renderer(monkeypatch, tmp_pa
     assert result.exit_code == 0, result.output
     assert "Thread Detail" in result.output
     assert "Direct entry" in result.output
+
+
+def test_hud_thread_detail_navigator_uses_same_render_path(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(main, "_hud_is_interactive", lambda: False)
+    monkeypatch.setattr(main, "_try_load_thread_snapshot", lambda thread_id, current_config: ({}, {}, None))
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
+    monkeypatch.setattr(main, "_render_hud_thread_detail_screen", lambda thread_id, limit: f"Thread Detail\nshared:{thread_id}:{limit}")
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+
+    assert "Thread Detail" in rendered
+    assert "shared:thread-1:5" in rendered
+
+
+def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            {
+                "agents": [
+                    {"name": "jun", "status": "waiting"},
+                    {"name": "ari", "status": "joined"},
+                ]
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {
+                    "cycle_index": 3,
+                    "current_step_label": "collect-feedback",
+                    "current_step_index": 1,
+                    "status": "active",
+                },
+                "context_core": {
+                    "outcome_policy": "review-outcomes",
+                    "outcome_emitters": ["reviewer", "author"],
+                    "outcome_actions": ["advance", "stay", "end"],
+                    "policy_outcomes": ["retry", "accept", "close"],
+                },
+                "visual": {
+                    "procedure": [
+                        {"key": "announce", "label": "Announce", "status": "completed"},
+                        {"key": "collect-feedback", "label": "Collect Feedback", "status": "active"},
+                        {"key": "resolve", "label": "Resolve", "status": "pending"},
+                    ],
+                    "gates": [
+                        {"key": "retry", "label": "Retry Gate", "status": "completed", "target_phase": "review"},
+                        {"key": "accept", "label": "Accept Gate", "status": "pending", "target_phase": "decision"},
+                    ],
+                },
+            },
+            "trace": [
+                {
+                    "timestamp": "2026-04-19T12:03:55Z",
+                    "kind": "guard",
+                    "hook_event_name": "Stop",
+                    "decision": "block",
+                    "phase": "review",
+                    "reason": "missing_contribution",
+                    "baseline_guard": "contribution_required",
+                    "summary": "Missing contribution for current phase.",
+                    "procedure_alias": "Collect Feedback",
+                    "procedure_key": "collect-feedback",
+                    "gate_alias": "Retry Gate",
+                    "gate_key": "retry-loop",
+                    "target_phase": "review",
+                    "outcome_policy": "review-outcomes",
+                    "outcome_emitters": ["reviewer", "author"],
+                    "outcome_actions": ["advance", "stay", "end"],
+                    "policy_outcomes": ["retry", "accept", "close"],
+                },
+                {
+                    "timestamp": "2026-04-19T12:04:28Z",
+                    "kind": "result",
+                    "phase": "review",
+                    "agent": "jun",
+                    "summary": "LGTM with small nits",
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+    lines = rendered.splitlines()
+
+    def index_of(prefix: str) -> int:
+        return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+    assert lines[0] == "B-TWIN HUD"
+    assert index_of("Topic") < index_of("Protocol") < index_of("Phase") < index_of("Next action")
+    assert index_of("Current Status") < index_of("Validation Summary") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert any("Task 2" in line or "placeholder" in line.lower() for line in lines[index_of("Validation Summary") : index_of("Expected vs Actual")])
+    assert "thread-1" not in lines[1]
+    assert "binding=" not in rendered
 
 
 def test_hud_close_key_closes_selected_standalone_thread_and_hides_it(tmp_path, monkeypatch):

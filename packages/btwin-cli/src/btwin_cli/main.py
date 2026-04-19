@@ -964,12 +964,15 @@ def _render_thread_detail(
     state = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else {}
     compiled = _detail_compiled_policy(phase_cycle_payload, trace_rows)
     status_text, next_hint = _detail_status_summary(trace_rows, phase_cycle_payload)
+    primary_row = _detail_primary_trace_row(trace_rows)
 
     cycle_index = state.get("cycle_index") if isinstance(state, dict) else None
     step_label = state.get("current_step_label") if isinstance(state, dict) else None
 
     procedure_summary = None
+    current_procedure = None
     gates_summary = None
+    current_gate = None
     completed_cycles = None
     if isinstance(phase_cycle_payload, dict):
         visual = phase_cycle_payload.get("visual")
@@ -978,95 +981,142 @@ def _render_thread_detail(
         if isinstance(visual, dict):
             procedure_nodes = visual.get("procedure")
             if isinstance(procedure_nodes, list) and procedure_nodes:
+                procedure_labels: list[str] = []
                 procedure_summary = " -> ".join(
                     str(node.get("label", node.get("key", "")))
                     for node in procedure_nodes
                     if isinstance(node, dict)
                 )
+                for node in procedure_nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("label") or node.get("key") or "").strip()
+                    if not label:
+                        continue
+                    procedure_labels.append(label)
+                    if node.get("status") == "active" or (isinstance(step_label, str) and step_label and node.get("key") == step_label):
+                        current_procedure = label
+                if current_procedure is None and procedure_labels:
+                    current_procedure = procedure_labels[0]
             gate_nodes = visual.get("gates")
             if isinstance(gate_nodes, list) and gate_nodes:
+                gate_labels: list[str] = []
                 gates_summary = " -> ".join(
                     str(node.get("label", node.get("key", "")))
                     for node in gate_nodes
                     if isinstance(node, dict)
                 )
+                for node in gate_nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("label") or node.get("key") or "").strip()
+                    if not label:
+                        continue
+                    gate_labels.append(label)
+                    if node.get("status") == "active":
+                        current_gate = label
+                if current_gate is None and isinstance(primary_row, dict):
+                    gate_alias = str(primary_row.get("gate_alias") or "").strip()
+                    gate_key = str(primary_row.get("gate_key") or "").strip()
+                    current_gate = gate_alias or gate_key or None
+                if current_gate is None and gate_labels:
+                    current_gate = gate_labels[0]
 
-    lines = [
-        f"Topic     {topic}",
-        f"Protocol  {protocol}  phase={phase}"
-        + (f"  cycle={cycle_index}" if isinstance(cycle_index, int) else "")
-        + (f"  step={step_label}" if isinstance(step_label, str) and step_label.strip() else ""),
-        f"Status    {status_text}  · next: {next_hint}",
-        "Protocol / Phase",
-    ]
-
-    progress_bits: list[str] = []
-    if isinstance(cycle_index, int):
-        progress_bits.append(f"cycle={cycle_index}")
-    if isinstance(completed_cycles, int):
-        progress_bits.append(f"completed={completed_cycles}")
-    if isinstance(step_label, str) and step_label.strip():
-        progress_bits.append(f"active_step={step_label}")
-    if progress_bits:
-        lines.append("  ".join(progress_bits))
-    if procedure_summary:
-        lines.append(f"procedure: {procedure_summary}")
-    elif gates_summary:
-        lines.append("Protocol progress unavailable")
-
-    lines.append("Outcome / Policy")
-    outcome_policy = compiled.get("outcome_policy")
-    emitters = compiled.get("outcome_emitters")
-    policy_outcomes = compiled.get("policy_outcomes")
-    outcome_actions = compiled.get("outcome_actions")
-    primary_row = _detail_primary_trace_row(trace_rows)
-    policy_line = []
-    if outcome_policy:
-        policy_line.append(f"policy={outcome_policy}")
-    if isinstance(emitters, list) and emitters:
-        policy_line.append(f"emitters={', '.join(str(item) for item in emitters)}")
-    if policy_line:
-        lines.append("  ".join(policy_line))
-    route_line = []
-    if isinstance(policy_outcomes, list) and policy_outcomes:
-        route_line.append(f"outcomes={', '.join(str(item) for item in policy_outcomes)}")
-    if isinstance(outcome_actions, list) and outcome_actions:
-        route_line.append(f"actions={', '.join(str(item) for item in outcome_actions)}")
-    if isinstance(primary_row, dict):
-        gate_label = primary_row.get("gate_alias") or primary_row.get("gate_key")
-        if gate_label:
-            route_line.append(f"gate={gate_label}")
-        target_phase = primary_row.get("target_phase")
-        if target_phase:
-            route_line.append(f"target={target_phase}")
-    if route_line:
-        lines.append("  ".join(route_line))
-
-    lines.append("Agent Sessions")
     runtime_sessions = {
         agent_name: session
         for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
     }
     agents = status_summary.get("agents", [])
+    actor_parts: list[str] = []
     if isinstance(agents, list) and agents:
-        agent_parts: list[str] = []
         for agent in agents:
             if not isinstance(agent, dict):
                 continue
-            agent_name = str(agent.get("name") or "")
+            agent_name = str(agent.get("name") or "").strip()
             if not agent_name:
                 continue
             session_summary = _runtime_session_summary(runtime_sessions.get(agent_name))
-            line = f"{agent_name}={agent.get('status')}"
+            actor_part = f"{agent_name}={agent.get('status')}"
             if session_summary:
-                line += f" ({session_summary})"
-            agent_parts.append(line)
-        if agent_parts:
-            lines.append("  ".join(agent_parts))
-    else:
-        lines.append("No active agent session summary")
+                actor_part += f" ({session_summary})"
+            actor_parts.append(actor_part)
 
-    lines.append("Recent Activity")
+    expected_bits: list[str] = []
+    outcome_policy = compiled.get("outcome_policy")
+    policy_outcomes = compiled.get("policy_outcomes")
+    if outcome_policy:
+        expected_bits.append(f"policy={outcome_policy}")
+    if isinstance(policy_outcomes, list) and policy_outcomes:
+        expected_bits.append(f"outcomes={', '.join(str(item) for item in policy_outcomes)}")
+    if isinstance(current_procedure, str) and current_procedure:
+        expected_bits.append(f"procedure={current_procedure}")
+    elif isinstance(procedure_summary, str) and procedure_summary:
+        expected_bits.append(f"procedure={procedure_summary}")
+    if isinstance(cycle_index, int):
+        expected_bits.append(f"cycle={cycle_index}")
+    if next_hint:
+        expected_bits.append(f"next={next_hint}")
+
+    actual_bits: list[str] = [status_text]
+    if isinstance(primary_row, dict):
+        primary_headline = _workflow_event_heading(primary_row)[1]
+        if primary_headline:
+            actual_bits.append(primary_headline)
+        primary_summary = str(primary_row.get("summary") or "").strip()
+        if primary_summary:
+            actual_bits.append(primary_summary)
+    elif trace_rows:
+        latest_summary = str(trace_rows[-1].get("summary") or "").strip()
+        if latest_summary:
+            actual_bits.append(latest_summary)
+
+    lines = [
+        f"Topic     {topic}",
+        f"Protocol  {protocol}",
+        f"Phase     {phase}"
+        + (f"  cycle={cycle_index}" if isinstance(cycle_index, int) else "")
+        + (f"  step={step_label}" if isinstance(step_label, str) and step_label.strip() else ""),
+        f"Next action  {next_hint}",
+        "",
+        "Current Status",
+    ]
+
+    current_status_bits: list[str] = []
+    if isinstance(current_procedure, str) and current_procedure:
+        current_status_bits.append(f"procedure: {current_procedure}")
+    elif isinstance(procedure_summary, str) and procedure_summary:
+        current_status_bits.append(f"procedure: {procedure_summary}")
+    if isinstance(current_gate, str) and current_gate:
+        current_status_bits.append(f"gate: {current_gate}")
+    elif isinstance(gates_summary, str) and gates_summary:
+        current_status_bits.append(f"gate: {gates_summary}")
+    if isinstance(cycle_index, int):
+        cycle_status = f"cycle: {cycle_index}"
+        if isinstance(completed_cycles, int):
+            cycle_status += f" (completed {completed_cycles})"
+        current_status_bits.append(cycle_status)
+    if isinstance(step_label, str) and step_label.strip():
+        current_status_bits.append(f"step: {step_label}")
+    if actor_parts:
+        current_status_bits.append(f"actors: {', '.join(actor_parts)}")
+    else:
+        current_status_bits.append("actors: none")
+    current_status_bits.append(f"status: {status_text}")
+    lines.extend(current_status_bits)
+
+    lines.extend(["", "Validation Summary", "placeholder: verdict engine lands in Task 2", "checks: protocol match / trajectory match / session health / trace completeness"])
+
+    lines.extend(["", "Expected vs Actual"])
+    if expected_bits:
+        lines.append(f"expected: {'; '.join(expected_bits)}")
+    else:
+        lines.append("expected: protocol / thread context only")
+    if actual_bits:
+        lines.append(f"actual: {'; '.join(actual_bits)}")
+    else:
+        lines.append("actual: no recent workflow activity")
+
+    lines.extend(["", "Recent Activity"])
     if trace_rows:
         activity_rows: list[dict[str, object]] = []
         if isinstance(primary_row, dict):
@@ -1086,8 +1136,6 @@ def _render_thread_detail(
                 lines.append(f"summary: {_truncate_hud_text(summary)}")
     else:
         lines.append("No recent workflow events")
-
-    lines.extend(["Quick Hints", f"status: {status_text}", f"next: {next_hint}"])
     return "\n".join(lines)
 
 
@@ -1880,13 +1928,13 @@ def _hud_thread_view_window_size() -> int:
 
 
 def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
-    lines = ["B-TWIN HUD", "", "Thread Detail", ""]
     if state.selected_thread_id is None:
-        lines.extend(["No thread selected.", "", "Controls  t threads  q quit"])
+        lines = ["B-TWIN HUD", "", "Thread Detail", "", "No thread selected.", "", "Controls  t threads  q quit"]
         return "\n".join(lines)
     config = _get_config()
     thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
     if lookup_error is not None:
+        lines = ["B-TWIN HUD", "", "Thread Detail", ""]
         lines.extend(
             [
                 f"Thread   {state.selected_thread_id}",
@@ -1897,21 +1945,13 @@ def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
         )
         return "\n".join(lines)
 
-    trace_payload = _thread_watch_payload(
-        thread,
-        status_summary,
-        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
-    )
-    body_lines = _render_thread_detail(
-        thread,
-        status_summary,
-        trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
-        trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
-    ).splitlines()
+    screen_lines = _render_hud_thread_detail_screen(state.selected_thread_id, limit).splitlines()
+    body_lines = screen_lines[4:] if len(screen_lines) >= 4 else []
     window_size = _hud_thread_view_window_size()
     max_offset = max(0, len(body_lines) - window_size)
     state.thread_log_offset = _clamp_index(state.thread_log_offset, max_offset + 1 if max_offset else 1)
     visible = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
+    lines = list(screen_lines[:4])
     lines.extend(visible)
     if body_lines:
         start = state.thread_log_offset + 1
