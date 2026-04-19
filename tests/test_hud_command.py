@@ -1212,6 +1212,9 @@ def test_hud_key_parser_understands_arrow_and_control_keys():
     assert main._hud_key_from_bytes(b"k") == "up"
     assert main._hud_key_from_bytes(b"f") == "end"
     assert main._hud_key_from_bytes(b"q") == "quit"
+    assert main._hud_key_from_bytes(b"t") == "threads"
+    assert main._hud_key_from_bytes(b"d") == "detail"
+    assert main._hud_key_from_bytes(b"l") == "live"
 
 
 def test_hud_menu_escapes_literal_brackets_for_rich():
@@ -1293,6 +1296,153 @@ def test_hud_thread_view_scrolls_logs(monkeypatch, tmp_path):
 
     assert main._apply_hud_key(state, "home", config) is False
     assert state.thread_log_offset == 0
+
+
+def test_hud_navigator_can_jump_between_threads_detail_and_live(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState()
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+
+    def fake_api_get(path: str, params: dict | None = None):
+        if path == "/api/threads":
+            return [
+                {
+                    "thread_id": "thread-1",
+                    "topic": "First thread",
+                    "protocol": "debate",
+                    "current_phase": "context",
+                    "status": "active",
+                }
+            ]
+        raise AssertionError(f"unexpected path: {path} params={params}")
+
+    monkeypatch.setattr(main, "_api_get", fake_api_get)
+
+    assert main._apply_hud_key(state, "enter", config) is False
+    assert state.screen == "threads"
+
+    assert main._apply_hud_key(state, "detail", config) is False
+    assert state.screen == "thread"
+    assert state.selected_thread_id == "thread-1"
+
+    assert main._apply_hud_key(state, "live", config) is False
+    assert state.screen == "live"
+
+    assert main._apply_hud_key(state, "detail", config) is False
+    assert state.screen == "thread"
+
+    assert main._apply_hud_key(state, "threads", config) is False
+    assert state.screen == "threads"
+
+
+def test_hud_live_trace_view_renders_diagnostics_title(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="live", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Trace thread",
+                "protocol": "debate",
+                "current_phase": "review",
+            },
+            {"agents": []},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(main, "_thread_watch_payload", lambda thread, status, events: {"trace": []})
+    monkeypatch.setattr(
+        main,
+        "_render_thread_watch",
+        lambda thread, status, trace: "Thread Watch\nTrace body",
+    )
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+
+    assert "Live Trace / Diagnostics" in rendered
+    assert "Trace body" in rendered
+
+
+def test_hud_live_trace_view_surfaces_guard_and_gate_rows(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="live", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Trace thread",
+                "protocol": "debate",
+                "current_phase": "review",
+            },
+            {"agents": []},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "trace": [
+                {
+                    "timestamp": "2026-04-19T04:07:26Z",
+                    "kind": "guard",
+                    "hook_event_name": "Stop",
+                    "decision": "block",
+                    "phase": "review",
+                    "reason": "missing_contribution",
+                    "baseline_guard": "contribution_required",
+                    "summary": "Missing contribution for current phase.",
+                },
+                {
+                    "timestamp": "2026-04-19T04:07:27Z",
+                    "kind": "gate",
+                    "phase": "review",
+                    "gate_alias": "Retry Gate",
+                    "gate_key": "retry-loop",
+                    "target_phase": "review",
+                    "outcome": "retry",
+                    "summary": "Retry loop completed.",
+                },
+            ]
+        },
+    )
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+
+    assert "Exit blocked" in rendered
+    assert "baseline guard: contribution_required" in rendered
+    assert "Retry Gate completed" in rendered
+    assert "gate: Retry Gate [retry-loop]" in rendered
 
 
 def test_hud_close_key_closes_selected_standalone_thread_and_hides_it(tmp_path, monkeypatch):

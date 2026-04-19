@@ -276,6 +276,66 @@ def test_agent_inbox_attached_reports_missing_path_diagnostics(tmp_path, monkeyp
     ]
 
 
+def test_agent_edit_updates_selected_fields(tmp_path, monkeypatch):
+    agent_data_dir = tmp_path / "global-btwin"
+    agent_store = AgentStore(agent_data_dir)
+    agent_store.register(
+        name="alice",
+        model="gpt-5",
+        alias="alice",
+        provider="codex",
+        role="implementer",
+        memo="before",
+    )
+
+    monkeypatch.setattr(main, "_get_agent_store", lambda: agent_store)
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "edit",
+            "alice",
+            "--model",
+            "gpt-5.4",
+            "--role",
+            "reviewer",
+            "--memo",
+            "after",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["name"] == "alice"
+    assert payload["model"] == "gpt-5.4"
+    assert payload["role"] == "reviewer"
+    assert payload["memo"] == "after"
+    assert payload["provider"] == "codex"
+
+
+def test_agent_delete_removes_agent(tmp_path, monkeypatch):
+    agent_data_dir = tmp_path / "global-btwin"
+    agent_store = AgentStore(agent_data_dir)
+    agent_store.register(
+        name="alice",
+        model="gpt-5",
+        alias="alice",
+        provider="codex",
+        role="implementer",
+    )
+
+    monkeypatch.setattr(main, "_get_agent_store", lambda: agent_store)
+
+    result = runner.invoke(app, ["agent", "delete", "alice", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload == {"deleted": True, "name": "alice"}
+    assert agent_store.get_agent("alice") is None
+
+
 def test_agent_inbox_attached_uses_shared_api_for_thread_summary(tmp_path, monkeypatch):
     agent_data_dir = tmp_path / "global-btwin"
     config_data_dir = tmp_path / "config-btwin"

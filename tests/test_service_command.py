@@ -170,3 +170,52 @@ def test_service_stop_runs_bootout(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert calls == [["launchctl", "bootout", "gui/501/com.btwin.serve-api"]]
+
+
+def test_runtime_launch_bootstraps_launchagent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(main.os, "getuid", lambda: 501)
+
+    btwin_bin = tmp_path / "bin" / "btwin"
+    btwin_bin.parent.mkdir(parents=True, exist_ok=True)
+    btwin_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(main.shutil, "which", lambda name: str(btwin_bin))
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    result = runner.invoke(app, ["runtime", "launch"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        ["launchctl", "bootout", "gui/501/com.btwin.serve-api"],
+        ["launchctl", "bootstrap", "gui/501", str(tmp_path / "Library" / "LaunchAgents" / "com.btwin.serve-api.plist")],
+    ]
+    assert (tmp_path / ".btwin" / "com.btwin.serve-api.plist").exists()
+
+
+def test_runtime_stop_stops_launchagent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(main.os, "getuid", lambda: 501)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    result = runner.invoke(app, ["runtime", "stop"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [["launchctl", "bootout", "gui/501/com.btwin.serve-api"]]

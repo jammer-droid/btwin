@@ -41,7 +41,7 @@ from rich.live import Live
 from rich.markup import escape
 from rich.markdown import Markdown
 
-from btwin_core.agent_store import AgentStore
+from btwin_core.agent_store import AgentStore, sanitize_agent_for_output
 from btwin_core.config import BTwinConfig, load_config, resolve_config_path
 from btwin_core.context_core import ContextCore
 from btwin_core.handoff_archive import get_handoff_record, list_handoff_records, write_handoff_record
@@ -1564,6 +1564,12 @@ def _hud_key_from_bytes(data: bytes) -> str | None:
         return "up"
     if text.lower() == "f":
         return "end"
+    if text.lower() == "t":
+        return "threads"
+    if text.lower() == "d":
+        return "detail"
+    if text.lower() == "l":
+        return "live"
     return None
 
 
@@ -1613,16 +1619,16 @@ def _render_hud_menu(state: _HudNavigatorState) -> str:
     for index, item in enumerate(items):
         prefix = ">" if index == state.menu_index else " "
         lines.append(f"{prefix} {escape(f'[{item}]')}")
-    lines.extend(["", "Controls  up/down move  enter select  q quit"])
+    lines.extend(["", "Controls  up/down move  enter select  t threads  q quit"])
     return "\n".join(lines)
 
 
 def _render_hud_threads(state: _HudNavigatorState, config: BTwinConfig, limit: int) -> str:
     threads = _list_hud_threads(config)
     state.thread_index = _clamp_index(state.thread_index, len(threads))
-    lines = ["B-TWIN HUD", "", "Threads", ""]
+    lines = ["B-TWIN HUD", "", "Threads / Sessions", ""]
     if not threads:
-        lines.extend(["  [dim]No active threads[/dim]", "", "Controls  b back  q quit"])
+        lines.extend(["  [dim]No active threads[/dim]", "", "Controls  b back  t threads  q quit"])
         return "\n".join(lines)
 
     for index, thread in enumerate(threads):
@@ -1637,7 +1643,7 @@ def _render_hud_threads(state: _HudNavigatorState, config: BTwinConfig, limit: i
     lines.extend(["", "Preview", ""])
     if isinstance(focused_thread_id, str):
         lines.append(_render_hud(focused_thread_id, min(limit, 5)))
-    lines.extend(["", "Controls  up/down move  enter open  c close  b back  q quit"])
+    lines.extend(["", "Controls  up/down move  enter open  d detail  l live  c close  b back  q quit"])
     return "\n".join(lines)
 
 
@@ -1649,9 +1655,9 @@ def _hud_thread_view_window_size() -> int:
 
 
 def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
-    lines = ["B-TWIN HUD", ""]
+    lines = ["B-TWIN HUD", "", "Thread Detail", ""]
     if state.selected_thread_id is None:
-        lines.extend(["No thread selected.", "", "Controls  b back  q quit"])
+        lines.extend(["No thread selected.", "", "Controls  t threads  q quit"])
         return "\n".join(lines)
     body_lines = _render_hud(state.selected_thread_id, limit).splitlines()[1:]
     window_size = _hud_thread_view_window_size()
@@ -1663,7 +1669,55 @@ def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
         start = state.thread_log_offset + 1
         end = min(state.thread_log_offset + len(visible), len(body_lines))
         lines.extend(["", f"Scroll  {start}-{end} of {len(body_lines)}"])
-    lines.extend(["", "Controls  up/down scroll  pgup/pgdn page  home/end jump  c close  b back  q quit"])
+    lines.extend(
+        [
+            "",
+            "Controls  up/down scroll  pgup/pgdn page  home/end jump  l live  c close  b back  t threads  q quit",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _render_hud_live_trace(state: _HudNavigatorState, limit: int) -> str:
+    lines = ["B-TWIN HUD", "", "Live Trace / Diagnostics", ""]
+    if state.selected_thread_id is None:
+        lines.extend(["No thread selected.", "", "Controls  d detail  t threads  q quit"])
+        return "\n".join(lines)
+
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+    if lookup_error is not None:
+        lines.extend(
+            [
+                f"Thread   {state.selected_thread_id}",
+                f"Status   {lookup_error}",
+                "",
+                "Controls  d detail  t threads  q quit",
+            ]
+        )
+        return "\n".join(lines)
+
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+    )
+    body_lines = _render_thread_watch(thread, status_summary, trace_payload["trace"]).splitlines()[1:]
+    window_size = _hud_thread_view_window_size()
+    max_offset = max(0, len(body_lines) - window_size)
+    state.thread_log_offset = _clamp_index(state.thread_log_offset, max_offset + 1 if max_offset else 1)
+    visible = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
+    lines.extend(visible)
+    if body_lines:
+        start = state.thread_log_offset + 1
+        end = min(state.thread_log_offset + len(visible), len(body_lines))
+        lines.extend(["", f"Scroll  {start}-{end} of {len(body_lines)}"])
+    lines.extend(
+        [
+            "",
+            "Controls  up/down scroll  pgup/pgdn page  home/end jump  d detail  c close  b back  t threads  q quit",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1672,7 +1726,25 @@ def _render_hud_navigator(state: _HudNavigatorState, config: BTwinConfig, limit:
         return _render_hud_threads(state, config, limit)
     if state.screen == "thread":
         return _render_hud_thread_live(state, limit)
+    if state.screen == "live":
+        return _render_hud_live_trace(state, limit)
     return _render_hud_menu(state)
+
+
+def _hud_open_selected_thread(
+    state: _HudNavigatorState,
+    threads: list[dict[str, object]],
+    *,
+    screen: str,
+) -> None:
+    if not threads:
+        return
+    state.thread_index = _clamp_index(state.thread_index, len(threads))
+    selected = threads[state.thread_index].get("thread_id")
+    if isinstance(selected, str) and selected:
+        state.selected_thread_id = selected
+        state.thread_log_offset = 0
+        state.screen = screen
 
 
 def _apply_hud_key(
@@ -1687,6 +1759,10 @@ def _apply_hud_key(
 
     if state.screen == "menu":
         items = _hud_menu_items()
+        if key == "threads":
+            state.screen = "threads"
+            state.thread_index = 0
+            return False
         if key == "up":
             state.menu_index = _clamp_index(state.menu_index - 1, len(items))
         elif key == "down":
@@ -1701,17 +1777,16 @@ def _apply_hud_key(
         if key == "back":
             state.screen = "menu"
             return False
+        if key == "threads":
+            return False
         if key == "up":
             state.thread_index = _clamp_index(state.thread_index - 1, len(threads))
         elif key == "down":
             state.thread_index = _clamp_index(state.thread_index + 1, len(threads))
-        elif key == "enter" and threads:
-            state.thread_index = _clamp_index(state.thread_index, len(threads))
-            selected = threads[state.thread_index].get("thread_id")
-            if isinstance(selected, str) and selected:
-                state.selected_thread_id = selected
-                state.thread_log_offset = 0
-                state.screen = "thread"
+        elif key in {"enter", "detail"} and threads:
+            _hud_open_selected_thread(state, threads, screen="thread")
+        elif key == "live" and threads:
+            _hud_open_selected_thread(state, threads, screen="live")
         elif key == "close" and threads:
             state.thread_index = _clamp_index(state.thread_index, len(threads))
             selected = threads[state.thread_index].get("thread_id")
@@ -1722,8 +1797,15 @@ def _apply_hud_key(
         return False
 
     if state.screen == "thread":
+        if key == "threads":
+            state.screen = "threads"
+            return False
         if key == "back":
             state.screen = "threads"
+            return False
+        if key == "live":
+            state.screen = "live"
+            state.thread_log_offset = 0
             return False
         if key == "close" and state.selected_thread_id is not None:
             _close_hud_thread(state.selected_thread_id, config)
@@ -1734,6 +1816,47 @@ def _apply_hud_key(
             return False
         if state.selected_thread_id is not None:
             body_lines = _render_hud(state.selected_thread_id, 10).splitlines()[1:]
+            window_size = _hud_thread_view_window_size()
+            max_offset = max(0, len(body_lines) - window_size)
+            if key == "up":
+                state.thread_log_offset = max(0, state.thread_log_offset - 1)
+            elif key == "down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + 1)
+            elif key == "page_up":
+                state.thread_log_offset = max(0, state.thread_log_offset - window_size)
+            elif key == "page_down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + window_size)
+            elif key == "home":
+                state.thread_log_offset = 0
+            elif key == "end":
+                state.thread_log_offset = max_offset
+        return False
+
+    if state.screen == "live":
+        if key == "threads":
+            state.screen = "threads"
+            return False
+        if key in {"back", "detail"}:
+            state.screen = "thread"
+            return False
+        if key == "close" and state.selected_thread_id is not None:
+            _close_hud_thread(state.selected_thread_id, config)
+            state.selected_thread_id = None
+            state.screen = "threads"
+            remaining = _list_hud_threads(config)
+            state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            return False
+        if state.selected_thread_id is not None:
+            config = _get_config()
+            thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+            if lookup_error is not None:
+                return False
+            trace_payload = _thread_watch_payload(
+                thread,
+                status_summary,
+                _workflow_event_log(state.selected_thread_id).list_events(limit=10),
+            )
+            body_lines = _render_thread_watch(thread, status_summary, trace_payload["trace"]).splitlines()[1:]
             window_size = _hud_thread_view_window_size()
             max_offset = max(0, len(body_lines) - window_size)
             if key == "up":
@@ -3647,6 +3770,140 @@ def _run_service_command(args: list[str], *, check: bool = True) -> subprocess.C
         raise typer.Exit(exc.returncode or 1)
 
 
+def _doctor_current_btwin_check() -> dict[str, object]:
+    current_btwin = _current_btwin_command_path()
+    return {
+        "status": "ok" if current_btwin is not None else "error",
+        "ok": current_btwin is not None,
+        "path": str(current_btwin) if current_btwin is not None else None,
+    }
+
+
+def _doctor_path_btwin_check(current_btwin: Path | None) -> dict[str, object]:
+    path_btwin = shutil.which("btwin")
+    path_btwin_resolved: Path | None = None
+    if path_btwin is not None:
+        try:
+            path_btwin_resolved = Path(path_btwin).expanduser().resolve()
+        except OSError:
+            path_btwin_resolved = Path(path_btwin).expanduser()
+
+    matches_current = (
+        path_btwin_resolved == current_btwin
+        if path_btwin_resolved is not None and current_btwin is not None
+        else None
+    )
+    return {
+        "status": "ok" if path_btwin is not None else "error",
+        "ok": path_btwin is not None,
+        "path": path_btwin,
+        "path_resolved": str(path_btwin_resolved) if path_btwin_resolved is not None else None,
+        "matches_current": matches_current,
+    }
+
+
+def _doctor_attached_api_check(config: BTwinConfig) -> dict[str, object]:
+    if not _use_attached_api(config):
+        return {
+            "status": "skipped",
+            "ok": True,
+            "detail": "runtime.mode is standalone",
+            "url": None,
+        }
+
+    import httpx
+
+    api_url = _api_base_url()
+    try:
+        payload = _api_get("/api/sessions/status")
+    except httpx.HTTPStatusError as exc:
+        return {
+            "status": "error",
+            "ok": False,
+            "url": api_url,
+            "error": f"HTTP {exc.response.status_code}",
+        }
+    except httpx.RequestError as exc:
+        return {
+            "status": "error",
+            "ok": False,
+            "url": api_url,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+    return {
+        "status": "ok",
+        "ok": True,
+        "url": api_url,
+        "response": payload,
+    }
+
+
+def _doctor_launchd_service_check() -> dict[str, object]:
+    if sys.platform != "darwin":
+        return {
+            "status": "skipped",
+            "ok": True,
+            "detail": "launchd checks only run on macOS",
+            "target": None,
+        }
+
+    result = _run_service_command(["launchctl", "print", _service_target()], check=False)
+    output = (result.stdout or result.stderr).strip()
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "ok": result.returncode == 0,
+        "target": _service_target(),
+        "detail": output or None,
+    }
+
+
+def _doctor_payload() -> dict[str, object]:
+    config = _get_config()
+    current_btwin = _current_btwin_command_path()
+    checks = {
+        "current_btwin": _doctor_current_btwin_check(),
+        "path_btwin": _doctor_path_btwin_check(current_btwin),
+        "attached_api": _doctor_attached_api_check(config),
+        "launchd_service": _doctor_launchd_service_check(),
+    }
+    ok = all(check.get("ok", False) for check in checks.values() if check.get("status") != "skipped")
+    return {
+        "ok": ok,
+        "runtime_mode": config.runtime.mode,
+        "config_path": str(_config_path()),
+        "data_dir": str(_get_active_data_dir(config)),
+        "checks": checks,
+    }
+
+
+def _runtime_launch_payload() -> dict[str, object]:
+    _require_macos_service_support()
+    btwin_executable = _resolve_btwin_executable()
+    plist_path = _write_service_plist(btwin_executable)
+    link_path = _ensure_service_link(plist_path)
+    _run_service_command(["launchctl", "bootout", _service_target()], check=False)
+    _run_service_command(["launchctl", "bootstrap", _service_domain(), str(link_path)])
+    return {
+        "launched": True,
+        "target": _service_target(),
+        "plist": str(plist_path),
+        "launch_agent": str(link_path),
+        "logs": str(_service_logs_dir()),
+    }
+
+
+def _runtime_stop_payload() -> dict[str, object]:
+    _require_macos_service_support()
+    result = _run_service_command(["launchctl", "bootout", _service_target()], check=False)
+    output = (result.stderr or result.stdout).strip()
+    return {
+        "stopped": result.returncode == 0,
+        "target": _service_target(),
+        "detail": output or None,
+    }
+
+
 def _detect_project_name() -> str:
     """Auto-detect project name from git remote or current directory name."""
     try:
@@ -3837,6 +4094,55 @@ def agent_create(
         role=role,
     )
     _emit_payload(agent, as_json=as_json)
+
+
+@agent_app.command("edit")
+def agent_edit(
+    name: str = typer.Argument(..., help="Agent name"),
+    alias: str | None = typer.Option(None, "--alias", help="Override agent alias"),
+    model: str | None = typer.Option(None, "--model", help="Override model name"),
+    provider: str | None = typer.Option(None, "--provider", help="Override provider name"),
+    role: str | None = typer.Option(None, "--role", help="Override agent role"),
+    memo: str | None = typer.Option(None, "--memo", help="Update operator note"),
+    capabilities: str | None = typer.Option(None, "--capabilities", help="Comma-separated capabilities"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Partially update one registered agent definition."""
+    updates: dict[str, object] = {}
+    if alias is not None:
+        updates["alias"] = alias
+    if model is not None:
+        updates["model"] = model
+    if provider is not None:
+        updates["provider"] = provider
+    if role is not None:
+        updates["role"] = role
+    if memo is not None:
+        updates["memo"] = memo
+    if capabilities is not None:
+        updates["capabilities"] = [item.strip() for item in capabilities.split(",") if item.strip()]
+
+    if not updates:
+        raise typer.BadParameter("Provide at least one field to update.")
+
+    agent = _get_agent_store().update_agent(name, **updates)
+    if agent is None:
+        console.print(f"[red]Agent not found:[/red] {name}")
+        raise typer.Exit(4)
+    _emit_payload(sanitize_agent_for_output(agent), as_json=as_json)
+
+
+@agent_app.command("delete")
+def agent_delete(
+    name: str = typer.Argument(..., help="Agent name"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Delete one registered agent definition."""
+    deleted = _get_agent_store().unregister(name)
+    if not deleted:
+        console.print(f"[red]Agent not found:[/red] {name}")
+        raise typer.Exit(4)
+    _emit_payload({"deleted": True, "name": name}, as_json=as_json)
 
 
 @agent_app.command("inbox")
@@ -5789,6 +6095,22 @@ def runtime_show():
         console.print("Recall adapter target: standalone-journal")
 
 
+@runtime_app.command("launch")
+def runtime_launch(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Launch the shared background runtime service."""
+    _emit_payload(_runtime_launch_payload(), as_json=as_json)
+
+
+@runtime_app.command("stop")
+def runtime_stop(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Stop the shared background runtime service."""
+    _emit_payload(_runtime_stop_payload(), as_json=as_json)
+
+
 @runtime_app.command("bind")
 def runtime_bind(
     thread_id: str = typer.Option(..., "--thread", help="Thread id"),
@@ -6208,6 +6530,14 @@ def validate(
             f"Reconcile: processed={result['processed']} indexed={result['indexed']} "
             f"deleted={result['deleted']} failed={result['failed']}"
         )
+
+
+@app.command("doctor")
+def doctor(
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Summarize local B-TWIN runtime readiness and integration health."""
+    _emit_payload(_doctor_payload(), as_json=as_json)
 
 
 if __name__ == "__main__":

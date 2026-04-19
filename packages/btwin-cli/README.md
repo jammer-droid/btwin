@@ -38,11 +38,14 @@ The `btwin` CLI is defined by the package entrypoint in `pyproject.toml`.
 Common commands include:
 
 - `btwin init`
+- `btwin doctor`
 - `btwin handoff --record-id ...`
 - `btwin handoff list`
 - `btwin handoff show`
 - `btwin serve-api`
 - `btwin mcp-proxy`
+- `btwin runtime launch`
+- `btwin runtime stop`
 - `btwin service install`
 - `btwin install-skills --platform codex` (compatibility refresh path)
 
