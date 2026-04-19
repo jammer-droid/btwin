@@ -1220,6 +1220,7 @@ def test_hud_key_parser_understands_arrow_and_control_keys():
     assert main._hud_key_from_bytes(b"q") == "quit"
     assert main._hud_key_from_bytes(b"t") == "threads"
     assert main._hud_key_from_bytes(b"d") == "detail"
+    assert main._hud_key_from_bytes(b"v") == "validation"
     assert main._hud_key_from_bytes(b"l") == "live"
 
 
@@ -1294,7 +1295,7 @@ def test_hud_thread_view_scrolls_logs(monkeypatch, tmp_path):
                 *[f"line {i}" for i in range(12)],
                 "",
                 "Hint      up/down scroll  pgup/pgdn page  home/end jump",
-                "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
             ]
         ),
     )
@@ -1458,7 +1459,7 @@ def test_hud_threads_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
 
     assert rendered.splitlines()[0] == "B-TWIN HUD :: Threads / Sessions :: mode=attached"
     assert "Hint      up/down select  enter open  d detail  l live  c close" in rendered
-    assert "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit" in rendered
+    assert "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit" in rendered
 
 
 def test_hud_threads_renderable_uses_real_panels(monkeypatch, tmp_path):
@@ -1529,18 +1530,65 @@ def test_hud_thread_detail_renderable_shows_validation_panel(monkeypatch, tmp_pa
         },
     )
     monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
     renderable = main._render_hud_navigator_renderable(state, config, limit=5)
 
     rendered = _renderable_to_text(renderable)
     assert "Thread Detail" in rendered
-    assert "Current Status" in rendered
+    assert "Protocol / Phase" in rendered
+    assert "Gate / Guard Focus" in rendered
+    assert "Recent Activity" in rendered
+    assert "Validation" not in rendered
+
+
+def test_hud_validation_renderable_shows_validation_sections(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="validation", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {"thread_id": thread_id, "topic": "Design Review", "protocol": "review-loop", "current_phase": "review"},
+            {"agents": [{"name": "jun", "status": "waiting"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {"cycle_index": 3, "current_step_label": "collect-feedback"},
+                "context_core": {"outcome_policy": "review-outcomes", "policy_outcomes": ["retry", "accept", "close"]},
+                "visual": {"procedure": [{"key": "collect-feedback", "label": "Collect Feedback", "status": "active"}], "gates": [{"key": "retry", "label": "Retry Gate", "status": "active"}]},
+            },
+            "trace": [
+                {"timestamp": "2026-04-19T12:03:55Z", "kind": "guard", "decision": "block", "phase": "review", "reason": "missing_contribution", "summary": "Missing contribution for current phase."}
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    renderable = main._render_hud_navigator_renderable(state, config, limit=5)
+
+    rendered = _renderable_to_text(renderable)
+    assert "Validation Focus" in rendered
     assert "Validation" in rendered
-    assert "Validation Cases" in rendered
     assert "Expected vs Actual" in rendered
+    assert "Validation Cases" in rendered
+    assert "Trace / Reason Excerpt" in rendered
 
 
-def test_hud_thread_detail_uses_protocol_next_for_validation_gap(monkeypatch, tmp_path):
+def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
     project_root.mkdir()
@@ -1571,7 +1619,7 @@ def test_hud_thread_detail_uses_protocol_next_for_validation_gap(monkeypatch, tm
         raising=False,
     )
 
-    rendered = main._render_hud_thread_detail_screen("thread-1", limit=5)
+    rendered = main._render_hud_validation_focus_screen("thread-1", limit=5)
 
     assert "required_contribution: WARN" in rendered
     assert "jun missing scope, findings" in rendered
@@ -1608,6 +1656,22 @@ def test_run_hud_navigator_uses_renderable_builder(monkeypatch, tmp_path):
     main._run_hud_navigator(limit=5, interval=0.01)
 
     assert updates == [{"kind": "rich-hud"}, {"kind": "rich-hud"}]
+
+
+def test_apply_hud_key_opens_validation_from_thread(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+
+    handled = main._apply_hud_key(state, "validation", config)
+
+    assert handled is False
+    assert state.screen == "validation"
+    assert state.thread_log_offset == 0
 
 
 def test_hud_live_trace_view_renders_diagnostics_title(monkeypatch, tmp_path):
@@ -1824,7 +1888,7 @@ def test_hud_thread_detail_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
                 "Topic     Design Review",
                 "",
                 "Hint      up/down scroll  pgup/pgdn page  home/end jump",
-                "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
             ]
         ),
     )
@@ -1834,7 +1898,7 @@ def test_hud_thread_detail_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
 
     assert rendered.splitlines()[0] == "B-TWIN HUD :: Thread Detail :: mode=attached"
     assert "Hint      up/down scroll  pgup/pgdn page  home/end jump" in rendered
-    assert "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit" in rendered
+    assert "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit" in rendered
 
 
 def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch, tmp_path):
@@ -1943,35 +2007,23 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     assert "Compiled  policy=review-outcomes; outcomes=retry, accept, close; gate=Retry Gate" in rendered
     assert "Next action  submit contribution" in rendered
     assert "Protocol / Phase" in rendered
-    assert "Gate & Outcome Policy" in rendered
+    assert "Gate / Guard Focus" in rendered
     assert "Agent Sessions" in rendered
     assert "cycle: 3" in rendered
     assert "step: collect-feedback" in rendered
     assert "procedure_path:" in rendered
     assert "  - Announce" in rendered
-    assert "outcome_emitters: reviewer, author" in rendered
+    assert "guard: contribution_required" in rendered
+    assert "gate: Retry Gate" in rendered
     assert "jun  waiting" in rendered
     assert "BLOCKED" in rendered
     assert "Collect Feedback" in rendered
-    assert "Validation" in rendered
-    assert "verdict: WARN" in rendered
-    assert "protocol_match: PASS" in rendered
-    assert "trajectory_match: PASS" in rendered
-    assert "session_health: PASS" in rendered
-    assert "required_contribution: WARN" in rendered
-    assert "trace_completeness: PASS" in rendered
-    assert "reason: Missing contribution for current phase." in rendered
-    assert "next expected action: submit_contribution" in rendered
-    assert "Expected vs Actual" in rendered
-    assert "Validation Cases" in rendered
-    assert "missing_contribution_blocked: PASS" in rendered
-    assert "policy=review-outcomes" in rendered
-    assert "outcomes=retry, accept, close" in rendered
     assert "Recent Activity" in rendered
     assert "Quick Actions" in rendered
     assert "[l] live trace" in rendered
     assert "Exit blocked" in rendered
     assert "LGTM with small nits" in rendered
+    assert "[v] validation" in rendered
 
 
 def test_hud_thread_detail_shows_agent_sessions_and_runtime_summary(monkeypatch, tmp_path):
@@ -2097,7 +2149,7 @@ def test_hud_thread_detail_navigator_uses_same_render_path(monkeypatch, tmp_path
                 f"shared:{thread_id}:{limit}",
                 "",
                 "Hint      up/down scroll  pgup/pgdn page  home/end jump",
-                "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
             ]
         ),
     )
@@ -2212,30 +2264,24 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
 
     assert lines[0] == "B-TWIN HUD :: Thread Detail :: mode=attached"
     assert index_of("Topic") < index_of("Protocol") < index_of("Phase") < index_of("Next action")
-    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual")
-    assert index_of("Expected vs Actual") < index_of("Validation Cases") < index_of("Recent Activity")
-    assert index_of("Recent Activity") < index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions") < index_of("Quick Actions")
-    assert lines[index_of("Current Status") + 1] == "--------------"
-    assert lines[index_of("Validation") + 1] == "----------"
-    assert lines[index_of("Expected vs Actual") + 1] == "------------------"
-    assert lines[index_of("Validation Cases") + 1] == "----------------"
+    assert index_of("Protocol / Phase") < index_of("Gate / Guard Focus") < index_of("Recent Activity")
+    assert index_of("Recent Activity") < index_of("Agent Sessions") < index_of("Quick Actions")
     assert lines[index_of("Recent Activity") + 1] == "---------------"
     assert lines[index_of("Protocol / Phase") + 1] == "----------------"
-    assert lines[index_of("Gate & Outcome Policy") + 1] == "---------------------"
+    assert lines[index_of("Gate / Guard Focus") + 1] == "------------------"
     assert lines[index_of("Agent Sessions") + 1] == "--------------"
     assert lines[index_of("Quick Actions") + 1] == "-------------"
-    assert any(line.startswith("verdict:") for line in lines[index_of("Validation") : index_of("Expected vs Actual")])
-    assert any(line.startswith("missing_contribution_blocked:") for line in lines[index_of("Validation Cases") : index_of("Recent Activity")])
+    assert any(line.startswith("guard:") for line in lines[index_of("Gate / Guard Focus") : index_of("Recent Activity")])
     assert "thread-1" not in lines[1]
     assert "binding=" not in rendered
 
 
-def test_hud_thread_detail_validation_warns_on_session_recovery(monkeypatch, tmp_path):
+def test_hud_validation_focus_warns_on_session_recovery(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
     project_root.mkdir()
     config = _attached_config(data_dir)
-    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+    state = main._HudNavigatorState(screen="validation", selected_thread_id="thread-1")
 
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
     monkeypatch.setattr(main, "_get_config", lambda: config)
@@ -2296,7 +2342,7 @@ def test_hud_thread_detail_validation_warns_on_session_recovery(monkeypatch, tmp
     monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, current_config: [])
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
-    rendered = main._render_hud_navigator(state, config, limit=5)
+    rendered = _renderable_to_text(main._render_hud_navigator_renderable(state, config, limit=5))
 
     assert "Validation" in rendered
     assert "verdict: WARN" in rendered
@@ -2305,12 +2351,12 @@ def test_hud_thread_detail_validation_warns_on_session_recovery(monkeypatch, tmp
     assert "next expected action: none" in rendered
 
 
-def test_hud_thread_detail_validation_section_contract(monkeypatch, tmp_path):
+def test_hud_validation_focus_section_contract(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
     project_root.mkdir()
     config = _attached_config(data_dir)
-    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+    state = main._HudNavigatorState(screen="validation", selected_thread_id="thread-1")
 
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
     monkeypatch.setattr(main, "_get_config", lambda: config)
@@ -2390,15 +2436,13 @@ def test_hud_thread_detail_validation_section_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, current_config: [])
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
-    rendered = main._render_hud_navigator(state, config, limit=5)
+    rendered = _renderable_to_text(main._render_hud_navigator_renderable(state, config, limit=5))
     lines = rendered.splitlines()
 
     def index_of(prefix: str) -> int:
         return next(i for i, line in enumerate(lines) if line.startswith(prefix))
 
-    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual")
-    assert index_of("Expected vs Actual") < index_of("Validation Cases") < index_of("Recent Activity")
-    assert index_of("Recent Activity") < index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
+    assert index_of("Validation") < index_of("Expected vs Actual") < index_of("Validation Cases") < index_of("Trace / Reason Excerpt")
     assert "verdict: PASS" in rendered
     assert "protocol_match: PASS" in rendered
     assert "trajectory_match: PASS" in rendered
@@ -2434,7 +2478,7 @@ def test_hud_thread_scroll_bounds_use_detail_renderer_body(monkeypatch, tmp_path
                 *[f"line {i}" for i in range(12)],
                 "",
                 "Hint      up/down scroll  pgup/pgdn page  home/end jump",
-                "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
             ]
         ),
     )

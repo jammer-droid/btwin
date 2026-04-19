@@ -1340,6 +1340,10 @@ def _render_thread_detail(
         f"Next action  {next_action_display}",
     ]
 
+    current_guard = ""
+    if isinstance(primary_row, dict):
+        current_guard = str(primary_row.get("baseline_guard") or primary_row.get("reason") or "").strip()
+
     procedure_path_items: list[str] = []
     if isinstance(phase_cycle_payload, dict):
         visual = phase_cycle_payload.get("visual")
@@ -1358,22 +1362,217 @@ def _render_thread_detail(
                     label = f"{label} [done]"
                 procedure_path_items.append(label)
 
-    _append_detail_section(lines, "Current Status")
-    lines.append(f"topic: {topic}")
+    _append_detail_section(lines, "Protocol / Phase")
+    lines.append(f"phase: {phase}")
     if isinstance(current_procedure, str) and current_procedure:
         lines.append(f"procedure: {current_procedure}")
     elif isinstance(procedure_summary, str) and procedure_summary:
         lines.append(f"procedure: {procedure_summary}")
+    if isinstance(cycle_index, int):
+        cycle_status = f"cycle: {cycle_index}"
+        if isinstance(completed_cycles, int):
+            cycle_status += f" (completed {completed_cycles})"
+        lines.append(cycle_status)
+    if isinstance(step_label, str) and step_label.strip():
+        lines.append(f"step: {step_label}")
+    if procedure_path_items:
+        _append_detail_bullets(lines, "procedure_path", procedure_path_items)
+
+    _append_detail_section(lines, "Gate / Guard Focus")
+    lines.append(f"status: {status_text}")
+    if current_guard:
+        lines.append(f"guard: {current_guard}")
     if isinstance(current_gate, str) and current_gate:
         lines.append(f"gate: {current_gate}")
     elif isinstance(gates_summary, str) and gates_summary:
         lines.append(f"gate: {gates_summary}")
-    if isinstance(cycle_index, int):
-        lines.append(f"cycle: {cycle_index}")
-    if actor_parts:
-        lines.append(f"actors: {', '.join(actor_parts)}")
+    if outcome_policy:
+        lines.append(f"policy: {outcome_policy}")
+    if outcome_policy:
+        lines.append(f"validation: {validation['verdict']} (press [v])")
+    outcome_emitters = compiled.get("outcome_emitters")
+    if isinstance(outcome_emitters, list) and outcome_emitters:
+        lines.append(f"outcome_emitters: {', '.join(str(item) for item in outcome_emitters)}")
+    outcome_actions = compiled.get("outcome_actions")
+    if isinstance(outcome_actions, list) and outcome_actions:
+        lines.append(f"outcome_actions: {', '.join(str(item) for item in outcome_actions)}")
+    if isinstance(policy_outcomes, list) and policy_outcomes:
+        lines.append(f"policy_outcomes: {', '.join(str(item) for item in policy_outcomes)}")
+    lines.append(f"gate_hint: {next_action_display}")
+
+    _append_detail_section(lines, "Recent Activity")
+    if trace_rows:
+        activity_rows: list[dict[str, object]] = []
+        if isinstance(primary_row, dict):
+            activity_rows.append(primary_row)
+        for row in reversed(trace_rows[-5:]):
+            if row is primary_row:
+                continue
+            if isinstance(row, dict):
+                activity_rows.append(row)
+        for row in activity_rows[:3]:
+            timestamp = str(row.get("timestamp", ""))
+            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
+            _lane, headline, _headline_style = _workflow_event_heading(row)
+            lines.append(f"{time_label}  {headline}")
+            summary = row.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                lines.append(f"summary: {_truncate_hud_text(summary)}")
     else:
-        lines.append("actors: -")
+        lines.append("No recent workflow events")
+
+    _append_detail_section(lines, "Agent Sessions")
+    if agent_session_rows:
+        lines.extend(agent_session_rows)
+    else:
+        lines.append("No agent sessions")
+
+    _append_detail_section(lines, "Quick Actions")
+    lines.append("[v] validation   [l] live trace   [c] close thread")
+    lines.append("[b] back         [t] threads      [q] quit")
+    return "\n".join(lines)
+
+
+def _render_hud_thread_detail_screen(thread_id: str | None, limit: int) -> str:
+    if thread_id is None:
+        return _render_hud(thread_id, limit)
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(thread_id, config)
+    if lookup_error is not None:
+        return _render_hud_thread_detail_lookup_error(thread_id, lookup_error)
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(thread_id).list_events(limit=limit),
+    )
+    return _render_hud_screen(
+        "Thread Detail",
+        _render_thread_detail(
+            thread,
+            status_summary,
+            trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
+            trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
+        ).splitlines(),
+        "up/down scroll  pgup/pgdn page  home/end jump",
+        config=config,
+    )
+
+
+def _render_validation_focus(
+    thread: dict[str, object],
+    status_summary: dict[str, object],
+    phase_cycle_payload: dict[str, object] | None,
+    trace_rows: list[dict[str, object]],
+) -> str:
+    config = _get_config()
+    thread_id = str(thread.get("thread_id", ""))
+    topic = str(thread.get("topic") or thread_id)
+    protocol = str(thread.get("protocol") or "-")
+    phase = str(thread.get("current_phase") or "-")
+    state = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else {}
+    compiled = _detail_compiled_policy(phase_cycle_payload, trace_rows)
+    status_text, next_hint = _detail_status_summary(trace_rows, phase_cycle_payload)
+    primary_row = _detail_primary_trace_row(trace_rows)
+    cycle_index = state.get("cycle_index") if isinstance(state, dict) else None
+    step_label = state.get("current_step_label") if isinstance(state, dict) else None
+
+    procedure_summary = None
+    current_procedure = None
+    current_gate = None
+    if isinstance(phase_cycle_payload, dict):
+        visual = phase_cycle_payload.get("visual")
+        if isinstance(visual, dict):
+            procedure_nodes = visual.get("procedure")
+            if isinstance(procedure_nodes, list) and procedure_nodes:
+                procedure_summary = " -> ".join(
+                    str(node.get("label", node.get("key", "")))
+                    for node in procedure_nodes
+                    if isinstance(node, dict)
+                )
+                for node in procedure_nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("label") or node.get("key") or "").strip()
+                    if not label:
+                        continue
+                    if node.get("status") == "active" or (
+                        isinstance(step_label, str) and step_label and node.get("key") == step_label
+                    ):
+                        current_procedure = label
+                        break
+            gate_nodes = visual.get("gates")
+            if isinstance(gate_nodes, list) and gate_nodes:
+                for node in gate_nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("label") or node.get("key") or "").strip()
+                    if not label:
+                        continue
+                    if node.get("status") == "active":
+                        current_gate = label
+                        break
+    if current_gate is None and isinstance(primary_row, dict):
+        current_gate = str(primary_row.get("gate_alias") or primary_row.get("gate_key") or "").strip() or None
+
+    runtime_sessions = {
+        agent_name: session
+        for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
+    }
+    protocol_plan = _try_protocol_next_snapshot(thread_id, config)
+    validation = _detail_validation_snapshot(
+        thread,
+        phase_cycle_payload,
+        trace_rows,
+        runtime_sessions,
+        protocol_plan,
+    )
+    validation_cases = _detail_validation_cases(thread, trace_rows, protocol_plan)
+    next_action_token = str(validation["next_expected_action"] or "").strip()
+    next_action_display = (
+        _humanize_hud_action(next_action_token)
+        if next_action_token and next_action_token != "none"
+        else next_hint
+    )
+
+    expected_bits: list[str] = []
+    outcome_policy = compiled.get("outcome_policy")
+    policy_outcomes = compiled.get("policy_outcomes")
+    if outcome_policy:
+        expected_bits.append(f"policy={outcome_policy}")
+    if isinstance(policy_outcomes, list) and policy_outcomes:
+        expected_bits.append(f"outcomes={', '.join(str(item) for item in policy_outcomes)}")
+    if isinstance(current_procedure, str) and current_procedure:
+        expected_bits.append(f"procedure={current_procedure}")
+    elif isinstance(procedure_summary, str) and procedure_summary:
+        expected_bits.append(f"procedure={procedure_summary}")
+    if isinstance(cycle_index, int):
+        expected_bits.append(f"cycle={cycle_index}")
+    if next_action_display:
+        expected_bits.append(f"next={next_action_display}")
+
+    actual_bits: list[str] = [status_text]
+    if isinstance(primary_row, dict):
+        primary_headline = _workflow_event_heading(primary_row)[1]
+        if primary_headline:
+            actual_bits.append(primary_headline)
+        primary_summary = str(primary_row.get("summary") or "").strip()
+        if primary_summary:
+            actual_bits.append(primary_summary)
+    elif trace_rows:
+        latest_summary = str(trace_rows[-1].get("summary") or "").strip()
+        if latest_summary:
+            actual_bits.append(latest_summary)
+
+    lines = [
+        f"Topic     {topic}",
+        f"Protocol  {protocol}",
+        f"Phase     {phase}"
+        + (f"  cycle={cycle_index}" if isinstance(cycle_index, int) else "")
+        + (f"  step={step_label}" if isinstance(step_label, str) and step_label.strip() else ""),
+        f"Status    {status_text}",
+        f"Validation verdict  {validation['verdict']}",
+        f"Next action  {next_action_display}",
+    ]
 
     _append_detail_section(lines, "Validation")
     lines.append(f"verdict: {validation['verdict']}")
@@ -1397,87 +1596,61 @@ def _render_thread_detail(
     _append_detail_section(lines, "Validation Cases")
     lines.extend(validation_cases)
 
-    _append_detail_section(lines, "Recent Activity")
+    _append_detail_section(lines, "Trace / Reason Excerpt")
     if trace_rows:
-        activity_rows: list[dict[str, object]] = []
+        excerpt_rows: list[dict[str, object]] = []
         if isinstance(primary_row, dict):
-            activity_rows.append(primary_row)
+            excerpt_rows.append(primary_row)
         for row in reversed(trace_rows[-5:]):
             if row is primary_row:
                 continue
             if isinstance(row, dict):
-                activity_rows.append(row)
-        for row in activity_rows[:3]:
+                excerpt_rows.append(row)
+        for row in excerpt_rows[:3]:
             timestamp = str(row.get("timestamp", ""))
             time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
             _lane, headline, _headline_style = _workflow_event_heading(row)
             lines.append(f"{time_label}  {headline}")
-            summary = row.get("summary")
-            if isinstance(summary, str) and summary.strip():
+            summary = str(row.get("summary") or "").strip()
+            if summary:
                 lines.append(f"summary: {_truncate_hud_text(summary)}")
+            reason = str(row.get("reason") or "").strip()
+            if reason:
+                lines.append(f"reason: {reason}")
+            if isinstance(current_gate, str) and current_gate:
+                lines.append(f"gate: {current_gate}")
+    elif validation["reasons"]:
+        for reason in validation["reasons"]:
+            lines.append(f"reason: {reason}")
     else:
-        lines.append("No recent workflow events")
+        lines.append("No validation trace excerpts")
 
-    _append_detail_section(lines, "Protocol / Phase")
-    lines.append(f"phase: {phase}")
-    if isinstance(current_procedure, str) and current_procedure:
-        lines.append(f"procedure: {current_procedure}")
-    elif isinstance(procedure_summary, str) and procedure_summary:
-        lines.append(f"procedure: {procedure_summary}")
-    if isinstance(cycle_index, int):
-        cycle_status = f"cycle: {cycle_index}"
-        if isinstance(completed_cycles, int):
-            cycle_status += f" (completed {completed_cycles})"
-        lines.append(cycle_status)
-    if isinstance(step_label, str) and step_label.strip():
-        lines.append(f"step: {step_label}")
-    if procedure_path_items:
-        _append_detail_bullets(lines, "procedure_path", procedure_path_items)
-
-    _append_detail_section(lines, "Gate & Outcome Policy")
-    if isinstance(current_gate, str) and current_gate:
-        lines.append(f"gate: {current_gate}")
-    elif isinstance(gates_summary, str) and gates_summary:
-        lines.append(f"gate: {gates_summary}")
-    if outcome_policy:
-        lines.append(f"outcome_policy: {outcome_policy}")
-    outcome_emitters = compiled.get("outcome_emitters")
-    if isinstance(outcome_emitters, list) and outcome_emitters:
-        lines.append(f"outcome_emitters: {', '.join(str(item) for item in outcome_emitters)}")
-    outcome_actions = compiled.get("outcome_actions")
-    if isinstance(outcome_actions, list) and outcome_actions:
-        lines.append(f"outcome_actions: {', '.join(str(item) for item in outcome_actions)}")
-    if isinstance(policy_outcomes, list) and policy_outcomes:
-        lines.append(f"policy_outcomes: {', '.join(str(item) for item in policy_outcomes)}")
-    lines.append(f"gate_hint: {next_action_display}")
-
-    _append_detail_section(lines, "Agent Sessions")
-    if agent_session_rows:
-        lines.extend(agent_session_rows)
-    else:
-        lines.append("No agent sessions")
-
-    _append_detail_section(lines, "Quick Actions")
-    lines.append("[l] live trace   [c] close thread")
-    lines.append("[b] back         [t] threads   [q] quit")
     return "\n".join(lines)
 
 
-def _render_hud_thread_detail_screen(thread_id: str | None, limit: int) -> str:
+def _render_hud_validation_focus_screen(thread_id: str | None, limit: int) -> str:
     if thread_id is None:
-        return _render_hud(thread_id, limit)
+        return _render_hud_screen("Validation Focus", ["No thread selected."], "d detail  t threads  q quit")
     config = _get_config()
     thread, status_summary, lookup_error = _try_load_thread_snapshot(thread_id, config)
     if lookup_error is not None:
-        return _render_hud_thread_detail_lookup_error(thread_id, lookup_error)
+        return _render_hud_screen(
+            "Validation Focus",
+            [
+                f"Thread   {thread_id}",
+                f"Status   {lookup_error}",
+            ],
+            "d detail  t threads  q quit",
+            config=config,
+        )
     trace_payload = _thread_watch_payload(
         thread,
         status_summary,
         _workflow_event_log(thread_id).list_events(limit=limit),
     )
     return _render_hud_screen(
-        "Thread Detail",
-        _render_thread_detail(
+        "Validation Focus",
+        _render_validation_focus(
             thread,
             status_summary,
             trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
@@ -2267,6 +2440,8 @@ def _hud_key_from_bytes(data: bytes) -> str | None:
         return "threads"
     if text.lower() == "d":
         return "detail"
+    if text.lower() == "v":
+        return "validation"
     if text.lower() == "l":
         return "live"
     return None
@@ -2333,7 +2508,7 @@ def _render_hud_screen(title: str, body_lines: list[str], hint_line: str, config
         [
             "",
             f"Hint      {hint_line}",
-            "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+            "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
         ]
     )
     return "\n".join(lines)
@@ -2433,7 +2608,7 @@ def _render_hud_shell_renderable(
             _hud_renderable_lines(
                 [
                     f"Hint      {hint_line}",
-                    "Nav       [T]hreads  [D]etail  [L]ive  [:] cmd  [q] quit",
+                    "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
                 ]
             ),
             border_style="bright_black",
@@ -2609,31 +2784,93 @@ def _render_hud_thread_detail_renderable(state: _HudNavigatorState, limit: int) 
 
     body = Layout(name="thread-detail-body")
     body.split_column(
-        Layout(_hud_panel("Thread Summary", intro_lines, border_style="bright_blue"), name="thread-summary", size=max(len(intro_lines) + 2, 8)),
-        Layout(name="thread-top-row", ratio=2),
-        Layout(_hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"), name="thread-expected", ratio=2),
-        Layout(name="thread-validation-row", ratio=2),
+        Layout(_hud_panel("Thread Pulse", intro_lines, border_style="bright_blue"), name="thread-summary", size=max(len(intro_lines) + 2, 8)),
+        Layout(name="thread-focus-row", ratio=2),
+        Layout(_hud_panel("Recent Activity", visible_activity, border_style="bright_yellow"), name="thread-activity", ratio=3),
         Layout(name="thread-support-row", ratio=2),
         Layout(_hud_panel("Quick Actions", section_map.get("Quick Actions", ["[b] back  [q] quit"]), border_style="bright_black"), name="thread-actions", size=6),
     )
-    body["thread-top-row"].split_row(
-        Layout(_hud_panel("Current Status", section_map.get("Current Status", ["-"]), border_style="cyan"), name="thread-current-status", ratio=1),
-        Layout(_hud_panel("Validation", section_map.get("Validation", ["-"]), border_style="magenta"), name="thread-validation", ratio=1),
-    )
-    body["thread-validation-row"].split_row(
-        Layout(_hud_panel("Validation Cases", section_map.get("Validation Cases", ["-"]), border_style="yellow"), name="thread-validation-cases", ratio=1),
-        Layout(_hud_panel("Recent Activity", visible_activity, border_style="yellow"), name="thread-activity", ratio=1),
+    body["thread-focus-row"].split_row(
+        Layout(_hud_panel("Protocol / Phase", section_map.get("Protocol / Phase", ["-"]), border_style="cyan"), name="thread-protocol", ratio=1),
+        Layout(_hud_panel("Gate / Guard Focus", section_map.get("Gate / Guard Focus", ["-"]), border_style="bright_magenta"), name="thread-gate", ratio=1),
     )
     body["thread-support-row"].split_row(
-        Layout(_hud_panel("Protocol / Phase", section_map.get("Protocol / Phase", ["-"])), name="thread-protocol", ratio=1),
-        Layout(_hud_panel("Gate & Outcome Policy", section_map.get("Gate & Outcome Policy", ["-"])), name="thread-policy", ratio=1),
         Layout(_hud_panel("Agent Sessions", section_map.get("Agent Sessions", ["No agent sessions"])), name="thread-sessions", ratio=1),
+        Layout(_hud_panel("Protocol Notes", ["Validation moved to [v] focus", "Use live trace for raw event inspection"], border_style="bright_black"), name="thread-notes", ratio=1),
     )
     return _render_hud_shell_renderable(
         "Thread Detail",
         body,
         "up/down scroll  pgup/pgdn page  home/end jump",
         config=config,
+    )
+
+
+def _render_hud_validation_focus_renderable(state: _HudNavigatorState, limit: int) -> RenderableType:
+    if state.selected_thread_id is None:
+        return _render_hud_shell_renderable(
+            "Validation Focus",
+            _hud_panel("Validation Focus", ["No thread selected."], border_style="yellow"),
+            "d detail  t threads  q quit",
+        )
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+    if lookup_error is not None:
+        return _render_hud_shell_renderable(
+            "Validation Focus",
+            _hud_panel(
+                "Validation Focus",
+                [f"Thread   {state.selected_thread_id}", f"Status   {lookup_error}"],
+                border_style="red",
+            ),
+            "d detail  t threads  q quit",
+            config=config,
+        )
+
+    trace_payload = _thread_watch_payload(
+        thread,
+        status_summary,
+        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+    )
+    body_lines = _render_validation_focus(
+        thread,
+        status_summary,
+        trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
+        trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
+    ).splitlines()
+    window_size = max(_hud_thread_view_window_size(), 6)
+    max_offset = max(0, len(body_lines) - window_size)
+    state.thread_log_offset = min(max(state.thread_log_offset, 0), max_offset)
+    visible_lines = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
+    if body_lines:
+        start = state.thread_log_offset + 1
+        end = min(state.thread_log_offset + len(visible_lines), len(body_lines))
+        visible_lines = [
+            *visible_lines,
+            "",
+            f"Scroll  {start}-{end} of {len(body_lines)}",
+        ]
+
+    return Group(
+        Panel(
+            Text("B-TWIN HUD :: Validation Focus", style="bold"),
+            subtitle=f"mode={config.runtime.mode}",
+            border_style="bright_blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        ),
+        _hud_renderable_lines(visible_lines),
+        Panel(
+            _hud_renderable_lines(
+                [
+                    "Hint      up/down scroll  pgup/pgdn page  home/end jump",
+                    "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
+                ]
+            ),
+            border_style="bright_black",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        ),
     )
 
 
@@ -2768,6 +3005,8 @@ def _render_hud_navigator_renderable(
         return _render_hud_threads_renderable(state, config, limit)
     if state.screen == "thread":
         return _render_hud_thread_detail_renderable(state, limit)
+    if state.screen == "validation":
+        return _render_hud_validation_focus_renderable(state, limit)
     if state.screen == "live":
         return _render_hud_live_trace_renderable(state, limit)
     return _render_hud_menu_renderable(state)
@@ -2891,6 +3130,15 @@ def _render_hud_thread_detail_body_lines(thread_id: str, limit: int) -> list[str
     )
 
 
+def _render_hud_validation_focus_body_lines(thread_id: str, limit: int) -> list[str]:
+    screen_lines = _render_hud_validation_focus_screen(thread_id, limit).splitlines()
+    return (
+        screen_lines[_HUD_SCREEN_HEADER_LINES:-_HUD_SCREEN_FOOTER_LINES]
+        if len(screen_lines) >= (_HUD_SCREEN_HEADER_LINES + _HUD_SCREEN_FOOTER_LINES)
+        else []
+    )
+
+
 def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
     if state.selected_thread_id is None:
         return _render_hud_screen("Thread Detail", ["No thread selected."], "t threads  q quit")
@@ -2911,6 +3159,40 @@ def _render_hud_thread_live(state: _HudNavigatorState, limit: int) -> str:
         lines.extend(["", f"Scroll  {start}-{end} of {len(body_lines)}"])
     return _render_hud_screen(
         "Thread Detail",
+        lines,
+        "up/down scroll  pgup/pgdn page  home/end jump",
+        config=config,
+    )
+
+
+def _render_hud_validation_focus_live(state: _HudNavigatorState, limit: int) -> str:
+    if state.selected_thread_id is None:
+        return _render_hud_screen("Validation Focus", ["No thread selected."], "d detail  t threads  q quit")
+    config = _get_config()
+    thread, status_summary, lookup_error = _try_load_thread_snapshot(state.selected_thread_id, config)
+    if lookup_error is not None:
+        return _render_hud_screen(
+            "Validation Focus",
+            [
+                f"Thread   {state.selected_thread_id}",
+                f"Status   {lookup_error}",
+            ],
+            "d detail  t threads  q quit",
+            config=config,
+        )
+
+    body_lines = _render_hud_validation_focus_body_lines(state.selected_thread_id, limit)
+    window_size = _hud_thread_view_window_size()
+    max_offset = max(0, len(body_lines) - window_size)
+    state.thread_log_offset = _clamp_index(state.thread_log_offset, max_offset + 1 if max_offset else 1)
+    visible = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
+    lines = list(visible)
+    if body_lines:
+        start = state.thread_log_offset + 1
+        end = min(state.thread_log_offset + len(visible), len(body_lines))
+        lines.extend(["", f"Scroll  {start}-{end} of {len(body_lines)}"])
+    return _render_hud_screen(
+        "Validation Focus",
         lines,
         "up/down scroll  pgup/pgdn page  home/end jump",
         config=config,
@@ -2973,6 +3255,8 @@ def _render_hud_navigator(state: _HudNavigatorState, config: BTwinConfig, limit:
         return _render_hud_threads(state, config, limit)
     if state.screen == "thread":
         return _render_hud_thread_live(state, limit)
+    if state.screen == "validation":
+        return _render_hud_validation_focus_live(state, limit)
     if state.screen == "live":
         return _render_hud_live_trace(state, limit)
     return _render_hud_menu(state)
@@ -3032,6 +3316,8 @@ def _apply_hud_key(
             state.thread_index = _clamp_index(state.thread_index + 1, len(threads))
         elif key in {"enter", "detail"} and threads:
             _hud_open_selected_thread(state, threads, screen="thread")
+        elif key == "validation" and threads:
+            _hud_open_selected_thread(state, threads, screen="validation")
         elif key == "live" and threads:
             _hud_open_selected_thread(state, threads, screen="live")
         elif key == "close" and threads:
@@ -3049,6 +3335,10 @@ def _apply_hud_key(
             return False
         if key == "back":
             state.screen = "threads"
+            return False
+        if key == "validation":
+            state.screen = "validation"
+            state.thread_log_offset = 0
             return False
         if key == "live":
             state.screen = "live"
@@ -3079,12 +3369,55 @@ def _apply_hud_key(
                 state.thread_log_offset = max_offset
         return False
 
+    if state.screen == "validation":
+        if key == "threads":
+            state.screen = "threads"
+            return False
+        if key in {"back", "detail"}:
+            state.screen = "thread"
+            state.thread_log_offset = 0
+            return False
+        if key == "validation":
+            return False
+        if key == "live":
+            state.screen = "live"
+            state.thread_log_offset = 0
+            return False
+        if key == "close" and state.selected_thread_id is not None:
+            _close_hud_thread(state.selected_thread_id, config)
+            state.selected_thread_id = None
+            state.screen = "threads"
+            remaining = _list_hud_threads(config)
+            state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            return False
+        if state.selected_thread_id is not None:
+            body_lines = _render_hud_validation_focus_body_lines(state.selected_thread_id, 10)
+            window_size = _hud_thread_view_window_size()
+            max_offset = max(0, len(body_lines) - window_size)
+            if key == "up":
+                state.thread_log_offset = max(0, state.thread_log_offset - 1)
+            elif key == "down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + 1)
+            elif key == "page_up":
+                state.thread_log_offset = max(0, state.thread_log_offset - window_size)
+            elif key == "page_down":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + window_size)
+            elif key == "home":
+                state.thread_log_offset = 0
+            elif key == "end":
+                state.thread_log_offset = max_offset
+        return False
+
     if state.screen == "live":
         if key == "threads":
             state.screen = "threads"
             return False
         if key in {"back", "detail"}:
             state.screen = "thread"
+            return False
+        if key == "validation":
+            state.screen = "validation"
+            state.thread_log_offset = 0
             return False
         if key == "close" and state.selected_thread_id is not None:
             _close_hud_thread(state.selected_thread_id, config)
