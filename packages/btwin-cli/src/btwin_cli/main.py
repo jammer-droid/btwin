@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 import typer
 import yaml
 from rich import box
+from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
 from rich.layout import Layout
 from rich.live import Live
@@ -2860,18 +2861,43 @@ def _render_hud_validation_focus_renderable(state: _HudNavigatorState, limit: in
         trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
         trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
     ).splitlines()
-    window_size = max(_hud_thread_view_window_size(), 6)
-    max_offset = max(0, len(body_lines) - window_size)
-    state.thread_log_offset = min(max(state.thread_log_offset, 0), max_offset)
-    visible_lines = body_lines[state.thread_log_offset : state.thread_log_offset + window_size]
-    if body_lines:
+    intro_lines, sections = _parse_hud_sections(body_lines)
+    section_map = {title: lines for title, lines in sections}
+
+    why_lines = section_map.get("Why this verdict", ["-"])
+    decision_lines = [
+        line
+        for line in why_lines
+        if line.startswith("verdict:") or line.startswith("primary_reason:") or line.startswith("next expected action:")
+    ] or ["-"]
+    validation_lines = [
+        line
+        for line in why_lines
+        if line not in decision_lines
+    ] or ["-"]
+
+    trace_lines = section_map.get("Trace / Reason Excerpt", ["No validation trace excerpts"])
+    visible_trace = trace_lines
+    if trace_lines and state.thread_log_offset:
+        window_size = max(_hud_thread_view_window_size() - 18, 4)
+        visible_trace = trace_lines[state.thread_log_offset : state.thread_log_offset + window_size] or trace_lines[-window_size:]
+    if trace_lines:
+        window_size = max(_hud_thread_view_window_size() - 18, 4)
+        max_offset = max(0, len(trace_lines) - window_size)
+        state.thread_log_offset = min(max(state.thread_log_offset, 0), max_offset)
         start = state.thread_log_offset + 1
-        end = min(state.thread_log_offset + len(visible_lines), len(body_lines))
-        visible_lines = [
-            *visible_lines,
+        end = min(state.thread_log_offset + len(visible_trace), len(trace_lines))
+        visible_trace = [
+            *visible_trace,
             "",
-            f"Scroll  {start}-{end} of {len(body_lines)}",
+            f"Scroll  {start}-{end} of {len(trace_lines)}",
         ]
+
+    summary_lines = [
+        line
+        for line in intro_lines
+        if line.startswith("Topic") or line.startswith("Phase") or line.startswith("Validation verdict") or line.startswith("Primary reason") or line.startswith("Next action")
+    ] or intro_lines
 
     return Group(
         Panel(
@@ -2881,7 +2907,24 @@ def _render_hud_validation_focus_renderable(state: _HudNavigatorState, limit: in
             box=box.ROUNDED,
             padding=(0, 1),
         ),
-        _hud_renderable_lines(visible_lines),
+        _hud_panel("Validation Cockpit", summary_lines, border_style="bright_blue"),
+        Columns(
+            [
+                _hud_panel("Decision", decision_lines, border_style="bright_magenta"),
+                _hud_panel("Validation", validation_lines, border_style="cyan"),
+            ],
+            equal=True,
+            expand=True,
+        ),
+        _hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"),
+        Columns(
+            [
+                _hud_panel("Validation Cases", section_map.get("Validation Cases", ["-"]), border_style="yellow"),
+                _hud_panel("Trace / Reason Excerpt", visible_trace, border_style="bright_yellow"),
+            ],
+            equal=True,
+            expand=True,
+        ),
         Panel(
             _hud_renderable_lines(
                 [
