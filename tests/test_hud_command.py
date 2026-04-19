@@ -1534,7 +1534,9 @@ def test_hud_thread_detail_renderable_shows_validation_panel(monkeypatch, tmp_pa
 
     rendered = _renderable_to_text(renderable)
     assert "Thread Detail" in rendered
+    assert "Current Status" in rendered
     assert "Validation" in rendered
+    assert "Validation Cases" in rendered
     assert "Expected vs Actual" in rendered
 
 
@@ -1961,6 +1963,8 @@ def test_hud_thread_detail_renders_status_policy_activity_and_hints(monkeypatch,
     assert "reason: Missing contribution for current phase." in rendered
     assert "next expected action: submit_contribution" in rendered
     assert "Expected vs Actual" in rendered
+    assert "Validation Cases" in rendered
+    assert "missing_contribution_blocked: PASS" in rendered
     assert "policy=review-outcomes" in rendered
     assert "outcomes=retry, accept, close" in rendered
     assert "Recent Activity" in rendered
@@ -2208,16 +2212,20 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
 
     assert lines[0] == "B-TWIN HUD :: Thread Detail :: mode=attached"
     assert index_of("Topic") < index_of("Protocol") < index_of("Phase") < index_of("Next action")
-    assert index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
-    assert index_of("Agent Sessions") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity") < index_of("Quick Actions")
+    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual")
+    assert index_of("Expected vs Actual") < index_of("Validation Cases") < index_of("Recent Activity")
+    assert index_of("Recent Activity") < index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions") < index_of("Quick Actions")
+    assert lines[index_of("Current Status") + 1] == "--------------"
+    assert lines[index_of("Validation") + 1] == "----------"
+    assert lines[index_of("Expected vs Actual") + 1] == "------------------"
+    assert lines[index_of("Validation Cases") + 1] == "----------------"
+    assert lines[index_of("Recent Activity") + 1] == "---------------"
     assert lines[index_of("Protocol / Phase") + 1] == "----------------"
     assert lines[index_of("Gate & Outcome Policy") + 1] == "---------------------"
     assert lines[index_of("Agent Sessions") + 1] == "--------------"
-    assert lines[index_of("Validation") + 1] == "----------"
-    assert lines[index_of("Expected vs Actual") + 1] == "------------------"
-    assert lines[index_of("Recent Activity") + 1] == "---------------"
     assert lines[index_of("Quick Actions") + 1] == "-------------"
     assert any(line.startswith("verdict:") for line in lines[index_of("Validation") : index_of("Expected vs Actual")])
+    assert any(line.startswith("missing_contribution_blocked:") for line in lines[index_of("Validation Cases") : index_of("Recent Activity")])
     assert "thread-1" not in lines[1]
     assert "binding=" not in rendered
 
@@ -2388,14 +2396,16 @@ def test_hud_thread_detail_validation_section_contract(monkeypatch, tmp_path):
     def index_of(prefix: str) -> int:
         return next(i for i, line in enumerate(lines) if line.startswith(prefix))
 
-    assert index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
-    assert index_of("Agent Sessions") < index_of("Validation") < index_of("Expected vs Actual") < index_of("Recent Activity")
+    assert index_of("Current Status") < index_of("Validation") < index_of("Expected vs Actual")
+    assert index_of("Expected vs Actual") < index_of("Validation Cases") < index_of("Recent Activity")
+    assert index_of("Recent Activity") < index_of("Protocol / Phase") < index_of("Gate & Outcome Policy") < index_of("Agent Sessions")
     assert "verdict: PASS" in rendered
     assert "protocol_match: PASS" in rendered
     assert "trajectory_match: PASS" in rendered
     assert "session_health: PASS" in rendered
     assert "required_contribution: PASS" in rendered
     assert "trace_completeness: PASS" in rendered
+    assert "missing_contribution_blocked: not triggered" in rendered
     assert "reason:" not in rendered
     assert "next expected action: record_outcome" in rendered
 

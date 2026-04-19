@@ -1057,6 +1057,45 @@ def _detail_validation_snapshot(
     }
 
 
+def _detail_validation_cases(
+    thread: dict[str, object],
+    trace_rows: list[dict[str, object]],
+    protocol_plan: dict[str, object] | None,
+) -> list[str]:
+    current_phase = str(thread.get("current_phase") or "").strip()
+    primary_row = _detail_primary_trace_row(trace_rows)
+    rows = [
+        "happy_path_accept: not evaluated in current state",
+        "retry_same_phase: not triggered",
+        "missing_contribution_blocked: not triggered",
+        "close_requires_summary: not triggered",
+    ]
+
+    if isinstance(protocol_plan, dict):
+        valid_outcomes = protocol_plan.get("valid_outcomes")
+        if isinstance(valid_outcomes, list) and "accept" in valid_outcomes:
+            rows[0] = "happy_path_accept: ready"
+        suggested_action = str(protocol_plan.get("suggested_action") or "").strip()
+        missing_items = protocol_plan.get("missing")
+        if suggested_action == "submit_contribution" and isinstance(missing_items, list) and missing_items:
+            rows[2] = "missing_contribution_blocked: PASS"
+        elif suggested_action == "close_thread":
+            rows[3] = "close_requires_summary: ready"
+
+    if isinstance(primary_row, dict):
+        target_phase = str(primary_row.get("target_phase") or "").strip()
+        reason = str(primary_row.get("reason") or "").strip()
+        outcome = str(primary_row.get("outcome") or "").strip()
+        if primary_row.get("kind") == "gate" and target_phase and target_phase == current_phase:
+            rows[1] = "retry_same_phase: PASS"
+        elif outcome == "retry":
+            rows[1] = "retry_same_phase: PASS"
+        if reason == "missing_contribution":
+            rows[2] = "missing_contribution_blocked: PASS"
+
+    return rows
+
+
 def _try_protocol_next_snapshot(
     thread_id: str,
     config: BTwinConfig | None = None,
@@ -1230,6 +1269,7 @@ def _render_thread_detail(
         runtime_sessions,
         protocol_plan,
     )
+    validation_cases = _detail_validation_cases(thread, trace_rows, protocol_plan)
     next_action_token = str(validation["next_expected_action"] or "").strip()
     next_action_display = (
         _humanize_hud_action(next_action_token)
@@ -1318,6 +1358,66 @@ def _render_thread_detail(
                     label = f"{label} [done]"
                 procedure_path_items.append(label)
 
+    _append_detail_section(lines, "Current Status")
+    lines.append(f"topic: {topic}")
+    if isinstance(current_procedure, str) and current_procedure:
+        lines.append(f"procedure: {current_procedure}")
+    elif isinstance(procedure_summary, str) and procedure_summary:
+        lines.append(f"procedure: {procedure_summary}")
+    if isinstance(current_gate, str) and current_gate:
+        lines.append(f"gate: {current_gate}")
+    elif isinstance(gates_summary, str) and gates_summary:
+        lines.append(f"gate: {gates_summary}")
+    if isinstance(cycle_index, int):
+        lines.append(f"cycle: {cycle_index}")
+    if actor_parts:
+        lines.append(f"actors: {', '.join(actor_parts)}")
+    else:
+        lines.append("actors: -")
+
+    _append_detail_section(lines, "Validation")
+    lines.append(f"verdict: {validation['verdict']}")
+    for check_name, check_status in validation["checks"]:
+        lines.append(f"{check_name}: {check_status}")
+    if validation["verdict"] != "PASS":
+        reason_text = "; ".join(str(reason) for reason in validation["reasons"]) or "validation warning"
+        lines.append(f"reason: {reason_text}")
+    lines.append(f"next expected action: {validation['next_expected_action']}")
+
+    _append_detail_section(lines, "Expected vs Actual")
+    if expected_bits:
+        _append_detail_bullets(lines, "expected", expected_bits)
+    else:
+        lines.append("expected: protocol / thread context only")
+    if actual_bits:
+        _append_detail_bullets(lines, "actual", actual_bits)
+    else:
+        lines.append("actual: no recent workflow activity")
+
+    _append_detail_section(lines, "Validation Cases")
+    lines.extend(validation_cases)
+
+    _append_detail_section(lines, "Recent Activity")
+    if trace_rows:
+        activity_rows: list[dict[str, object]] = []
+        if isinstance(primary_row, dict):
+            activity_rows.append(primary_row)
+        for row in reversed(trace_rows[-5:]):
+            if row is primary_row:
+                continue
+            if isinstance(row, dict):
+                activity_rows.append(row)
+        for row in activity_rows[:3]:
+            timestamp = str(row.get("timestamp", ""))
+            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
+            _lane, headline, _headline_style = _workflow_event_heading(row)
+            lines.append(f"{time_label}  {headline}")
+            summary = row.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                lines.append(f"summary: {_truncate_hud_text(summary)}")
+    else:
+        lines.append("No recent workflow events")
+
     _append_detail_section(lines, "Protocol / Phase")
     lines.append(f"phase: {phase}")
     if isinstance(current_procedure, str) and current_procedure:
@@ -1356,46 +1456,6 @@ def _render_thread_detail(
         lines.extend(agent_session_rows)
     else:
         lines.append("No agent sessions")
-
-    _append_detail_section(lines, "Validation")
-    lines.append(f"verdict: {validation['verdict']}")
-    for check_name, check_status in validation["checks"]:
-        lines.append(f"{check_name}: {check_status}")
-    if validation["verdict"] != "PASS":
-        reason_text = "; ".join(str(reason) for reason in validation["reasons"]) or "validation warning"
-        lines.append(f"reason: {reason_text}")
-    lines.append(f"next expected action: {validation['next_expected_action']}")
-
-    _append_detail_section(lines, "Expected vs Actual")
-    if expected_bits:
-        _append_detail_bullets(lines, "expected", expected_bits)
-    else:
-        lines.append("expected: protocol / thread context only")
-    if actual_bits:
-        _append_detail_bullets(lines, "actual", actual_bits)
-    else:
-        lines.append("actual: no recent workflow activity")
-
-    _append_detail_section(lines, "Recent Activity")
-    if trace_rows:
-        activity_rows: list[dict[str, object]] = []
-        if isinstance(primary_row, dict):
-            activity_rows.append(primary_row)
-        for row in reversed(trace_rows[-5:]):
-            if row is primary_row:
-                continue
-            if isinstance(row, dict):
-                activity_rows.append(row)
-        for row in activity_rows[:3]:
-            timestamp = str(row.get("timestamp", ""))
-            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-            _lane, headline, _headline_style = _workflow_event_heading(row)
-            lines.append(f"{time_label}  {headline}")
-            summary = row.get("summary")
-            if isinstance(summary, str) and summary.strip():
-                lines.append(f"summary: {_truncate_hud_text(summary)}")
-    else:
-        lines.append("No recent workflow events")
 
     _append_detail_section(lines, "Quick Actions")
     lines.append("[l] live trace   [c] close thread")
@@ -2548,21 +2608,26 @@ def _render_hud_thread_detail_renderable(state: _HudNavigatorState, limit: int) 
         visible_activity = activity_lines[state.thread_log_offset : state.thread_log_offset + window_size] or activity_lines[-window_size:]
 
     body = Layout(name="thread-detail-body")
-    body.split_row(
-        Layout(name="thread-detail-main", ratio=3),
-        Layout(name="thread-detail-side", ratio=2),
+    body.split_column(
+        Layout(_hud_panel("Thread Summary", intro_lines, border_style="bright_blue"), name="thread-summary", size=max(len(intro_lines) + 2, 8)),
+        Layout(name="thread-top-row", ratio=2),
+        Layout(_hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"), name="thread-expected", ratio=2),
+        Layout(name="thread-validation-row", ratio=2),
+        Layout(name="thread-support-row", ratio=2),
+        Layout(_hud_panel("Quick Actions", section_map.get("Quick Actions", ["[b] back  [q] quit"]), border_style="bright_black"), name="thread-actions", size=6),
     )
-    body["thread-detail-main"].split_column(
-        Layout(_hud_panel("Current Status", intro_lines, border_style="bright_blue"), name="thread-summary", ratio=1),
+    body["thread-top-row"].split_row(
+        Layout(_hud_panel("Current Status", section_map.get("Current Status", ["-"]), border_style="cyan"), name="thread-current-status", ratio=1),
+        Layout(_hud_panel("Validation", section_map.get("Validation", ["-"]), border_style="magenta"), name="thread-validation", ratio=1),
+    )
+    body["thread-validation-row"].split_row(
+        Layout(_hud_panel("Validation Cases", section_map.get("Validation Cases", ["-"]), border_style="yellow"), name="thread-validation-cases", ratio=1),
+        Layout(_hud_panel("Recent Activity", visible_activity, border_style="yellow"), name="thread-activity", ratio=1),
+    )
+    body["thread-support-row"].split_row(
         Layout(_hud_panel("Protocol / Phase", section_map.get("Protocol / Phase", ["-"])), name="thread-protocol", ratio=1),
         Layout(_hud_panel("Gate & Outcome Policy", section_map.get("Gate & Outcome Policy", ["-"])), name="thread-policy", ratio=1),
-        Layout(_hud_panel("Expected vs Actual", section_map.get("Expected vs Actual", ["-"]), border_style="green"), name="thread-expected", ratio=1),
-        Layout(_hud_panel("Recent Activity", visible_activity, border_style="yellow"), name="thread-activity", ratio=2),
-    )
-    body["thread-detail-side"].split_column(
-        Layout(_hud_panel("Validation", section_map.get("Validation", ["-"]), border_style="magenta"), name="thread-validation", ratio=1),
         Layout(_hud_panel("Agent Sessions", section_map.get("Agent Sessions", ["No agent sessions"])), name="thread-sessions", ratio=1),
-        Layout(_hud_panel("Quick Actions", section_map.get("Quick Actions", ["[b] back  [q] quit"]), border_style="bright_black"), name="thread-actions", size=6),
     )
     return _render_hud_shell_renderable(
         "Thread Detail",
