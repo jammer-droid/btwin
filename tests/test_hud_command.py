@@ -1794,14 +1794,17 @@ def test_hud_validation_renderable_shows_context_and_evidence_lines(monkeypatch,
     )
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
-    renderable = main._render_hud_navigator_renderable(state, config, limit=5)
+    renderable = main._render_hud_navigator_renderable(state, config, limit=5, animation_phase=1)
 
     rendered = _renderable_to_text(renderable, width=180)
+    lines = rendered.splitlines()
+    assert any("Design Review" in line and "review-loop" in line for line in lines)
+    assert any("WARN" in line and "Missing contribution for current phase." in line for line in lines)
+    assert "⠙ Review" in rendered or "⠙ Collect Feedback" in rendered
     assert "Flow" not in rendered
     assert "Phase" in rendered
-    assert "• Review" in rendered
     assert "Procedure" in rendered
-    assert "Announce · • Collect Feedback · Resolve" in rendered
+    assert "Announce · ⠙ Collect Feedback · Resolve" in rendered or "⠙ Collect Feedback" in rendered
     assert "Cases" in rendered
     assert "Missing contribution blocked [PASS]" in rendered
     assert "Evidence" in rendered

@@ -1434,6 +1434,22 @@ def _validation_summary_row(label: str, value: str | Text) -> Text:
     return row
 
 
+def _validation_summary_pair_row(
+    left_label: str,
+    left_value: str | Text,
+    right_label: str,
+    right_value: str | Text,
+) -> Table:
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(
+        _validation_summary_row(left_label, left_value),
+        _validation_summary_row(right_label, right_value),
+    )
+    return grid
+
+
 def _detail_phase_progression(thread: dict[str, object]) -> str | None:
     protocol_name = str(thread.get("protocol") or "").strip()
     if not protocol_name:
@@ -3351,6 +3367,7 @@ def _render_hud_thread_detail_renderable(
 def _render_hud_validation_focus_renderable(
     state: _HudNavigatorState,
     limit: int,
+    animation_phase: int = 0,
     snapshot: dict[str, object] | None = None,
 ) -> RenderableType:
     if state.selected_thread_id is None:
@@ -3453,18 +3470,29 @@ def _render_hud_validation_focus_renderable(
     evidence_summary = validation_snapshot.get("evidence_summary")
 
     context_rows: list[RenderableType | str] = [
-        _validation_summary_row("Topic", Text(topic, style="bold")),
-        _validation_summary_row("Protocol", Text(protocol, style="dim")),
-        _validation_summary_row("Verdict", _verdict_text(verdict)),
-        _validation_summary_row(
+        _validation_summary_pair_row(
+            "Topic",
+            Text(topic, style="bold"),
+            "Protocol",
+            Text(protocol, style="dim"),
+        ),
+        _validation_summary_pair_row(
+            "Verdict",
+            _verdict_text(verdict),
             "Primary",
             Text(primary_reason, style="" if verdict == "PASS" else "yellow"),
         ),
-        _validation_summary_row("Phase", phase_progression.replace(" - ", " · ")),
+        _validation_summary_row(
+            "Phase",
+            _hud_progress_value_text(phase_progression.replace(" - ", " · "), animation_phase),
+        ),
     ]
     if procedure_progression != "-":
         context_rows.append(
-            _validation_summary_row("Procedure", procedure_progression.replace(" - ", " · "))
+            _validation_summary_row(
+                "Procedure",
+                _hud_progress_value_text(procedure_progression.replace(" - ", " · "), animation_phase),
+            )
         )
     context_rows.append(_validation_summary_row("Next", Text(next_action_display, style="cyan")))
     context_rows.append(_validation_summary_row("Status", status_text))
@@ -3745,7 +3773,7 @@ def _render_hud_navigator_renderable(
     if state.screen == "thread":
         return _render_hud_thread_detail_renderable(state, limit, phase, snapshot=snapshot)
     if state.screen == "validation":
-        return _render_hud_validation_focus_renderable(state, limit, snapshot=snapshot)
+        return _render_hud_validation_focus_renderable(state, limit, phase, snapshot=snapshot)
     if state.screen == "live":
         return _render_hud_live_trace_renderable(state, limit, phase, snapshot=snapshot)
     return _render_hud_menu_renderable(state)
