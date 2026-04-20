@@ -75,7 +75,7 @@ from btwin_core.runtime_binding_store import RuntimeBinding, RuntimeBindingState
 from btwin_core.runtime_logging import RuntimeEventLogger
 from btwin_core.thread_chat import parse_thread_chat_input
 from btwin_core.thread_store import ThreadStore
-from btwin_core.validation_snapshot import build_validation_snapshot
+from btwin_core.validation_snapshot import build_validation_snapshot, summarize_official_response_promotion
 from btwin_core.validation_telemetry import ValidationTelemetryStore
 from btwin_core.workflow_event_log import WorkflowEventLog
 from btwin_core.storage import Storage
@@ -108,7 +108,7 @@ sources_app = typer.Typer(help="Manage B-TWIN data sources for dashboard workflo
 promotion_app = typer.Typer(help="Manage promotion queue operations.")
 indexer_app = typer.Typer(help="Manage core indexer workflows.")
 runtime_app = typer.Typer(help="Inspect runtime mode and integration settings.")
-live_app = typer.Typer(help="Use the attached live collaboration surface.")
+live_app = typer.Typer(help="Use the runtime-attached live collaboration surface.")
 agent_app = typer.Typer(help="Manage B-TWIN agent definitions.")
 protocol_app = typer.Typer(help="Manage B-TWIN protocol definitions.")
 thread_app = typer.Typer(help="Manage B-TWIN protocol threads.")
@@ -972,6 +972,7 @@ def _detail_validation_snapshot(
     trace_rows: list[dict[str, object]],
     runtime_sessions: dict[str, dict[str, object]],
     protocol_plan: dict[str, object] | None = None,
+    telemetry_rows: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     primary_row = _detail_primary_trace_row(trace_rows)
     protocol = str(thread.get("protocol") or "").strip()
@@ -995,16 +996,17 @@ def _detail_validation_snapshot(
     for session in runtime_sessions.values():
         if not isinstance(session, dict):
             continue
-        if bool(session.get("degraded")) and not bool(session.get("recovery_pending")):
+        transport_health = _runtime_transport_health_state(session)
+        if transport_health == "degraded":
             session_health = "FAIL"
-            reasons.append("runtime session degraded")
+            reasons.append("transport degraded")
             break
-        if bool(session.get("recovery_pending")):
+        if transport_health == "recovering":
             session_health = "WARN"
-            reasons.append("runtime session recovery pending")
-        elif bool(session.get("fallback_transport_involved")):
+            reasons.append("transport recovery pending")
+        elif transport_health == "fallback":
             session_health = "WARN"
-            reasons.append("runtime session fallback active")
+            reasons.append("fallback transport active")
     checks.append(("session_health", session_health))
 
     required_contribution = "PASS"
@@ -1056,12 +1058,14 @@ def _detail_validation_snapshot(
         verdict = "WARN"
 
     deduped_reasons = _dedupe_validation_reasons(reasons)
+    official_response_promotion = summarize_official_response_promotion(telemetry_rows or [])
 
     return {
         "verdict": verdict,
         "checks": checks,
         "reasons": deduped_reasons,
         "next_expected_action": next_expected_action,
+        "official_response_promotion": official_response_promotion,
     }
 
 
@@ -1247,7 +1251,7 @@ def _dedupe_validation_reasons(reasons: list[str]) -> list[str]:
 _VALIDATION_CHECK_DEFINITIONS: dict[str, tuple[str, str]] = {
     "protocol_match": ("Protocol match", "thread has known protocol + phase"),
     "trajectory_match": ("Trajectory match", "recent workflow trace exists"),
-    "session_health": ("Session health", "no degraded or recovering sessions"),
+    "session_health": ("Session health", "no transport degradation or recovery pending"),
     "required_contribution": ("Required contribution", "all expected contributions recorded"),
     "trace_completeness": ("Trace completeness", "≥1 workflow event captured"),
 }
@@ -1270,7 +1274,7 @@ def _check_actual_for_status(check_name: str, status: str, runtime_sessions: dic
         return f"{len(trace_rows)} trace row(s)" if trace_rows else "no recent trace"
     if check_name == "session_health":
         if status == "PASS":
-            return "all sessions nominal"
+            return "all transports nominal"
         degraded: list[str] = []
         recovering: list[str] = []
         fallback: list[str] = []
@@ -1278,19 +1282,20 @@ def _check_actual_for_status(check_name: str, status: str, runtime_sessions: dic
             for name, session in runtime_sessions.items():
                 if not isinstance(session, dict):
                     continue
-                if session.get("recovery_pending"):
+                transport_health = _runtime_transport_health_state(session)
+                if transport_health == "recovering":
                     recovering.append(name)
-                elif session.get("degraded"):
+                elif transport_health == "degraded":
                     degraded.append(name)
-                elif session.get("fallback_transport_involved"):
+                elif transport_health == "fallback":
                     fallback.append(name)
         parts: list[str] = []
         if recovering:
-            parts.append(f"{', '.join(recovering)} recovering")
+            parts.append(f"{', '.join(recovering)} transport recovery pending")
         if degraded:
-            parts.append(f"{', '.join(degraded)} degraded")
+            parts.append(f"{', '.join(degraded)} transport degraded")
         if fallback:
-            parts.append(f"{', '.join(fallback)} on fallback")
+            parts.append(f"{', '.join(fallback)} on fallback transport")
         return " · ".join(parts) if parts else "session issue"
     if check_name == "required_contribution":
         return "all contributions recorded" if status == "PASS" else "contribution missing"
@@ -1457,8 +1462,10 @@ def _shared_validation_header_context(
     trace_rows: list[dict[str, object]],
     runtime_sessions: dict[str, dict[str, object]],
     protocol_plan: dict[str, object] | None,
+    telemetry_rows: list[dict[str, object]],
     *,
     include_step_fallback: bool = True,
+    include_official_response_promotion: bool = False,
 ) -> dict[str, str | dict[str, object]]:
     state_payload = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else None
     cycle_index = state_payload.get("cycle_index") if isinstance(state_payload, dict) else None
@@ -1469,6 +1476,7 @@ def _shared_validation_header_context(
         trace_rows,
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
     )
     primary_reason = _detail_primary_validation_reason(validation)
     status_text, next_hint = _detail_status_summary(trace_rows, phase_cycle_payload)
@@ -1509,6 +1517,8 @@ def _shared_validation_header_context(
         if procedure_progression and procedure_progression != "-"
         else "-",
         "next_action": next_action_display,
+        "official_response_promotion": str(validation.get("official_response_promotion") or ""),
+        "include_official_response_promotion": include_official_response_promotion,
         "validation": validation,
     }
 
@@ -1524,6 +1534,9 @@ def _shared_validation_header_lines(context: dict[str, str | dict[str, object]])
     procedure_progression = str(context.get("procedure_progression") or "").strip()
     if procedure_progression and procedure_progression != "-":
         lines.append(_validation_summary_line("Procedure", procedure_progression))
+    official_response_promotion = str(context.get("official_response_promotion") or "").strip()
+    if official_response_promotion and bool(context.get("include_official_response_promotion")):
+        lines.append(_validation_summary_line("Official response", official_response_promotion))
     lines.append(_validation_summary_line("Next", str(context["next_action"])))
     return lines
 
@@ -1558,6 +1571,14 @@ def _shared_validation_header_renderables(
             _validation_summary_row(
                 "Procedure",
                 _hud_progress_value_text(procedure_progression, animation_phase),
+            )
+        )
+    official_response_promotion = str(context.get("official_response_promotion") or "").strip()
+    if official_response_promotion and bool(context.get("include_official_response_promotion")):
+        rows.append(
+            _validation_summary_row(
+                "Official response",
+                Text(official_response_promotion, style="cyan"),
             )
         )
     rows.append(
@@ -1659,6 +1680,7 @@ def _render_thread_detail(
     thread_id = str(thread.get("thread_id", ""))
     state = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else {}
     primary_row = _detail_primary_trace_row(trace_rows)
+    telemetry_rows = _validation_telemetry_rows(thread_id, config)
 
     runtime_sessions = {
         agent_name: session
@@ -1671,6 +1693,7 @@ def _render_thread_detail(
         trace_rows,
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
         include_step_fallback=False,
     )
     agents = status_summary.get("agents", [])
@@ -1763,6 +1786,7 @@ def _render_validation_focus(
 ) -> str:
     config = _get_config()
     thread_id = str(thread.get("thread_id", ""))
+    telemetry_rows = _validation_telemetry_rows(thread_id, config)
     runtime_sessions = {
         agent_name: session
         for agent_name, session in _runtime_sessions_for_thread(thread_id, config)
@@ -1774,6 +1798,7 @@ def _render_validation_focus(
         trace_rows,
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
     )
     validation_cases = _detail_validation_cases(thread, trace_rows, protocol_plan)
     compliance_rows = _validation_compliance_rows(validation, validation_cases, runtime_sessions, trace_rows)
@@ -1783,7 +1808,9 @@ def _render_validation_focus(
         trace_rows=trace_rows,
         runtime_sessions=runtime_sessions,
         protocol_plan=protocol_plan,
+        telemetry_rows=telemetry_rows,
         include_step_fallback=True,
+        include_official_response_promotion=True,
     )
     lines = _shared_validation_header_lines(header_context)
 
@@ -2237,45 +2264,91 @@ def _runtime_transport_surface_and_kind(transport_mode: object) -> tuple[str, st
     return "unknown", "unknown"
 
 
+def _runtime_mode_display_name(mode: object) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized == "attached":
+        return "runtime-attached"
+    if normalized == "standalone":
+        return "local"
+    return str(mode or "-")
+
+
+def _runtime_transport_label(transport_mode: object) -> str:
+    surface, _kind = _runtime_transport_surface_and_kind(transport_mode)
+    if surface != "unknown":
+        return surface
+    return str(transport_mode or "-")
+
+
+def _runtime_transport_degraded(session: dict[str, object]) -> bool:
+    return _runtime_transport_health_state(session) in {"fallback", "degraded", "recovering"}
+
+
+def _runtime_transport_recovery_pending(session: dict[str, object]) -> bool:
+    return bool(session.get("transport_recovery_pending", session.get("recovery_pending", False)))
+
+
+def _runtime_transport_health_state(session: dict[str, object]) -> str:
+    if _runtime_transport_recovery_pending(session):
+        return "recovering"
+    if bool(session.get("transport_degraded_compat_only")) and bool(session.get("fallback_transport_involved")):
+        return "fallback"
+    if "transport_degraded" in session:
+        if bool(session.get("transport_degraded")):
+            return "degraded"
+        if bool(session.get("fallback_transport_involved")):
+            return "fallback"
+        return "nominal"
+    if bool(session.get("degraded")):
+        return "degraded"
+    if bool(session.get("fallback_transport_involved")):
+        return "fallback"
+    return "nominal"
+
+
+def _runtime_session_activity(status: object, session: dict[str, object]) -> str:
+    if _runtime_transport_recovery_pending(session):
+        return "recovering"
+    normalized = str(status or "").strip().lower()
+    if normalized in _AGENT_WORKING_STATUSES or normalized in {"received", "thinking", "responding"}:
+        return "working"
+    return "attached"
+
+
 def _runtime_session_summary(session: dict[str, object] | None) -> str | None:
     if not isinstance(session, dict):
         return None
-    surface, _kind = _runtime_transport_surface_and_kind(session.get("transport_mode"))
-    fallback = bool(session.get("fallback_transport_involved"))
-    recoverable = bool(session.get("recoverable"))
-    recovery_pending = bool(session.get("recovery_pending"))
-    if surface == "app-server" and not fallback:
-        return "app-server"
-    if surface == "exec":
-        if fallback and recovery_pending:
-            return "exec fallback, recovering"
-        if fallback and recoverable:
-            return "exec fallback, recoverable"
-        if fallback:
-            return "exec fallback"
-        return "exec"
-    return None
+    transport_label = _runtime_transport_label(session.get("transport_mode"))
+    transport_health = _runtime_transport_health_state(session)
+    if transport_health == "recovering":
+        return "attached, transport degraded, recovering"
+    if transport_health == "fallback":
+        if session.get("recoverable"):
+            return "attached, transport degraded, recoverable"
+        return "attached, transport degraded"
+    if transport_health == "degraded":
+        return "attached, transport degraded"
+    return f"attached via {transport_label}"
 
 
 def _render_runtime_session_lines(agent_name: str, session: dict[str, object]) -> list[str]:
     transport_mode = session.get("transport_mode", "-")
-    surface, kind = _runtime_transport_surface_and_kind(transport_mode)
-    primary_transport_mode = session.get("primary_transport_mode") or transport_mode
-    status = session.get("status", "-")
-    fallback = "yes" if session.get("fallback_transport_involved") else "no"
-    degraded = "yes" if session.get("degraded", bool(session.get("fallback_transport_involved"))) else "no"
+    transport_label = _runtime_transport_label(transport_mode)
+    primary_transport_label = _runtime_transport_label(session.get("primary_transport_mode") or transport_mode)
+    activity = _runtime_session_activity(session.get("status", "-"), session)
+    degraded = "yes" if _runtime_transport_degraded(session) else "no"
     recoverable = "yes" if session.get("recoverable", False) else "no"
-    recovering = "yes" if session.get("recovery_pending", False) else "no"
+    recovering = "yes" if _runtime_transport_recovery_pending(session) else "no"
     recovery_attempts = int(session.get("recovery_attempts") or 0)
     style = _runtime_session_style(session)
     return [
         _style_hud_line(
-            f"{agent_name}  transport={transport_mode}  surface={surface}  kind={kind}",
+            f"{agent_name}  session=attached  activity={activity}  transport={transport_label}",
             style,
         ),
         _style_hud_line(
-            f"       primary={primary_transport_mode}  status={status}  fallback={fallback}  "
-            f"degraded={degraded}  recoverable={recoverable}  recovering={recovering}  recovery_attempts={recovery_attempts}",
+            f"       primary={primary_transport_label}  current={transport_label}  "
+            f"transport_degraded={degraded}  recoverable={recoverable}  recovering={recovering}  recovery_attempts={recovery_attempts}",
             style,
         ),
     ]
@@ -2585,13 +2658,13 @@ def _agent_state_descriptor(
     """Return (logical_state, transport_summary) for an agent."""
     transport = _runtime_session_summary(session) or ""
     if isinstance(session, dict):
-        if session.get("recovery_pending"):
+        if _runtime_transport_recovery_pending(session):
             return "recovering", transport
-        if session.get("degraded") or session.get("fallback_transport_involved"):
-            return "degraded", transport
     normalized = (status or "").strip().lower()
     if normalized in _AGENT_WORKING_STATUSES:
         return "working", transport
+    if isinstance(session, dict):
+        return "attached", transport
     if normalized in _AGENT_WAITING_STATUSES:
         return "waiting", transport
     if normalized in _AGENT_IDLE_STATUSES:
@@ -2603,6 +2676,8 @@ def _agent_state_descriptor(
 def _agent_glyph_text(logical_state: str, animation_phase: int) -> Text:
     if logical_state == "working":
         return Text(_spinner_frame(animation_phase), style="bold cyan")
+    if logical_state == "attached":
+        return Text("●", style="green")
     if logical_state == "waiting":
         symbol = "◉" if animation_phase % 2 == 0 else "◎"
         return Text(symbol, style="bold yellow")
@@ -2652,6 +2727,7 @@ def _compose_agent_row(
     glyph = _agent_glyph_text(logical_state, animation_phase)
     label_style = {
         "working": "bold cyan",
+        "attached": "green",
         "waiting": "yellow",
         "degraded": "bold red",
         "recovering": "yellow",
@@ -2753,7 +2829,7 @@ def _render_hud(thread_id: str | None, limit: int, animation_phase: int | None =
     binding_label = "none"
     if binding is not None:
         binding_label = binding.agent_name if binding.status == "active" else f"{binding.agent_name} ({binding.status})"
-    lines.append(f"Runtime  mode={config.runtime.mode}  binding={binding_label}")
+    lines.append(f"Runtime  mode={_runtime_mode_display_name(config.runtime.mode)}  binding={binding_label}")
     if binding_state.binding_error:
         lines.append(f"Binding  error={binding_state.binding_error}")
 
@@ -3034,7 +3110,7 @@ def _render_hud_menu(state: _HudNavigatorState) -> str:
 
 def _render_hud_screen(title: str, body_lines: list[str], hint_line: str, config: BTwinConfig | None = None) -> str:
     current_config = config or _get_config()
-    lines = [f"B-TWIN HUD :: {title} :: mode={current_config.runtime.mode}", ""]
+    lines = [f"B-TWIN HUD :: {title} :: mode={_runtime_mode_display_name(current_config.runtime.mode)}", ""]
     lines.extend(body_lines)
     lines.extend(
         [
@@ -3202,7 +3278,7 @@ def _render_hud_shell_renderable(
     root["hud-header"].update(
         Panel(
             Text(f"B-TWIN HUD :: {title}", style="bold"),
-            subtitle=f"mode={current_config.runtime.mode}",
+            subtitle=f"mode={_runtime_mode_display_name(current_config.runtime.mode)}",
             border_style="bright_blue",
             box=box.ROUNDED,
             padding=(0, 1),
@@ -3449,13 +3525,18 @@ def _render_hud_thread_detail_renderable(
     protocol_plan = snapshot.get("protocol_plan") if isinstance(snapshot, dict) and snapshot.get("selected_thread_id") == state.selected_thread_id else None
     if not isinstance(protocol_plan, dict):
         protocol_plan = _try_protocol_next_snapshot(state.selected_thread_id, config)
+    telemetry_rows = snapshot.get("telemetry_rows") if isinstance(snapshot, dict) and snapshot.get("selected_thread_id") == state.selected_thread_id else None
+    if not isinstance(telemetry_rows, list):
+        telemetry_rows = _validation_telemetry_rows(state.selected_thread_id, config)
     header_context = _shared_validation_header_context(
         thread,
         trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None,
         trace_payload.get("trace", []) if isinstance(trace_payload, dict) else [],
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
         include_step_fallback=False,
+        include_official_response_promotion=False,
     )
     header_rows = _shared_validation_header_renderables(header_context, animation_phase)
     agent_rows: list[RenderableType | str] = list(
@@ -3559,6 +3640,7 @@ def _render_hud_validation_focus_renderable(
         trace_rows,
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
     )
     validation_cases = _detail_validation_cases(thread, trace_rows, protocol_plan)
     header_context = _shared_validation_header_context(
@@ -3567,7 +3649,9 @@ def _render_hud_validation_focus_renderable(
         trace_rows,
         runtime_sessions,
         protocol_plan,
+        telemetry_rows,
         include_step_fallback=True,
+        include_official_response_promotion=True,
     )
     verdict = str(header_context["verdict"])
 
@@ -4598,7 +4682,7 @@ def _attached_runtime_diagnostics_context() -> dict[str, object]:
 
     messages = [
         "- If you use a custom endpoint, check [bold]BTWIN_API_URL[/bold]",
-        "- For local-only usage, switch to [bold]runtime.mode: standalone[/bold] in the active config",
+        "- For local mode, switch to [bold]runtime.mode: standalone[/bold] in the active config",
     ]
     path_matches_current = None
     path_btwin_resolved = None
@@ -4657,7 +4741,7 @@ def _render_attached_http_status_error(exc) -> None:
 
     detail_text = detail if isinstance(detail, str) else response.text.strip() or exc.__class__.__name__
     console.print(
-        "[red]Attached runtime shared API responded with an error.[/red]\n"
+        "[red]The runtime-attached shared API responded with an error.[/red]\n"
         f"- URL: {_api_base_url()}\n"
         f"- Status: {response.status_code}\n"
         f"- Detail: {detail_text}"
@@ -4674,7 +4758,7 @@ def _attached_http_status_exit_code(exc) -> int:
 def _render_attached_transport_error(exc) -> None:
     lines = _attached_runtime_diagnostics()
     console.print(
-        "[red]Attached runtime could not reach the shared B-TWIN API.[/red]\n"
+        "[red]B-TWIN could not reach the runtime-attached shared API.[/red]\n"
         + "\n".join(lines)
         + f"\n- Error: {exc.__class__.__name__}: {exc}"
     )
@@ -4727,9 +4811,9 @@ def _require_attached_live(config: BTwinConfig) -> None:
     if _use_attached_api(config):
         return
     console.print(
-        "[red]`btwin live` requires attached runtime mode.[/red]\n"
-        "- Switch the active config to [bold]runtime.mode: attached[/bold]\n"
-        "- Or set [bold]BTWIN_CONFIG_PATH[/bold] to an attached config before using `btwin live`"
+        "[red]`btwin live` requires runtime-attached mode.[/red]\n"
+        "- Switch the active config to [bold]runtime.mode: attached[/bold] for runtime-attached mode\n"
+        "- Or set [bold]BTWIN_CONFIG_PATH[/bold] to a config with [bold]runtime.mode: attached[/bold] before using `btwin live`"
     )
     raise typer.Exit(4)
 
@@ -6306,7 +6390,7 @@ def _doctor_attached_api_check(config: BTwinConfig) -> dict[str, object]:
         return {
             "status": "skipped",
             "ok": True,
-            "detail": "runtime.mode is standalone",
+            "detail": "runtime.mode is standalone (local mode)",
             "url": None,
         }
 
@@ -7195,11 +7279,11 @@ def thread_create(
         console.print(f"  {enter_command}")
 
 
-@live_app.command("threads")
+@live_app.command("threads", help="List active threads in runtime-attached live mode.")
 def live_threads(
     as_json: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """List active threads in attached live mode."""
+    """List active threads in runtime-attached live mode."""
     config = _get_config()
     _require_attached_live(config)
     threads = _list_live_threads(config)
@@ -7215,11 +7299,11 @@ def live_threads(
         console.print(_format_live_thread_entry(thread))
 
 
-@live_app.command("status")
+@live_app.command("status", help="Show runtime-attached live status summary.")
 def live_status(
     as_json: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """Show attached live runtime status summary."""
+    """Show runtime-attached live status summary."""
     config = _get_config()
     _require_attached_live(config)
     threads = _list_live_threads(config)
@@ -7242,7 +7326,7 @@ def live_status(
     console.print(f"attached_agents: {', '.join(agent_names) if agent_names else '-'}")
 
 
-@live_app.command("attach")
+@live_app.command("attach", help="Attach one agent to a runtime-attached live thread.")
 def live_attach(
     thread_id: str = typer.Option(..., "--thread", help="Thread id"),
     agent_name: str = typer.Option(..., "--agent", help="Agent name"),
@@ -7253,7 +7337,7 @@ def live_attach(
     ),
     as_json: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """Attach one agent to a live thread."""
+    """Attach one agent to a runtime-attached live thread."""
     config = _get_config()
     _require_attached_live(config)
     payload = _attached_api_call_or_exit(
@@ -7274,7 +7358,7 @@ def live_attach(
     console.print(f"attached {agent_name} -> {thread_id} ({mode})")
 
 
-@live_app.command("recover")
+@live_app.command("recover", help="Recover one runtime-attached agent session for a live thread.")
 def live_recover(
     thread_id: str = typer.Option(..., "--thread", help="Thread id"),
     agent_name: str = typer.Option(..., "--agent", help="Agent name"),
@@ -7285,7 +7369,7 @@ def live_recover(
     ),
     as_json: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """Recover one attached agent runtime session for a live thread."""
+    """Recover one runtime-attached agent session for a live thread."""
     config = _get_config()
     _require_attached_live(config)
     payload = _attached_api_call_or_exit(
@@ -7303,14 +7387,14 @@ def live_recover(
     console.print(f"recovered {agent_name} -> {thread_id} ({mode})")
 
 
-@live_app.command("close")
+@live_app.command("close", help="Close one runtime-attached live thread.")
 def live_close(
     thread_id: str = typer.Option(..., "--thread", help="Thread id"),
     summary: str = typer.Option(..., "--summary", help="Thread summary"),
     decision: str | None = typer.Option(None, "--decision", help="Thread decision"),
     as_json: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """Close one live thread."""
+    """Close one runtime-attached live thread."""
     config = _get_config()
     _require_attached_live(config)
     payload: dict[str, object] = {"summary": summary}
@@ -7320,7 +7404,7 @@ def live_close(
     _emit_payload(closed, as_json=as_json)
 
 
-@live_app.command("enter")
+@live_app.command("enter", help="Enter a runtime-attached live thread with human-readable chat formatting.")
 def live_enter(
     thread_id: str = typer.Option(..., "--thread", help="Thread id"),
     actor: str = typer.Option(..., "--as", help="Actor name"),
@@ -7331,7 +7415,7 @@ def live_enter(
         help="When using --attach, allow the attached helper agents to run without interactive approval prompts.",
     ),
 ):
-    """Enter an attached live thread with human-readable chat formatting."""
+    """Enter a runtime-attached live thread with human-readable chat formatting."""
     config = _get_config()
     _require_attached_live(config)
     for agent_name in attach_agents:
@@ -8305,9 +8389,9 @@ def chat():
     config = _get_config()
     if _use_attached_api(config):
         console.print(
-            "[red]Chat mode is only supported in standalone runtime mode.[/red]\n"
+            "[red]Chat mode is only supported in local mode.[/red]\n"
             "Set `runtime.mode: standalone` in ~/.btwin/config.yaml for local chat,\n"
-            "or use B-TWIN through MCP/serve-api for shared attached mode."
+            "or use B-TWIN through MCP/serve-api for runtime-attached shared sessions."
         )
         raise typer.Exit(1)
     if not config.llm.api_key:

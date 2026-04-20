@@ -39,13 +39,17 @@ def test_build_validation_snapshot_includes_flow_and_evidence_context() -> None:
         telemetry_rows=[
             {
                 "event_type": "validation.signal.recorded",
-                "evidence_level": "critical",
-                "payload": {"signal": "runtime_output_persisted"},
+                "payload": {
+                    "signal": "runtime_output_persisted",
+                    "official_response_source": "agent_message_completed",
+                    "official_response_basis": "final_answer_agent_message_completed",
+                    "contribution_candidate_basis": "final_answer_agent_message_completed",
+                },
             },
             {
                 "event_type": "validation.signal.recorded",
                 "evidence_level": "critical",
-                "payload": {"signal": "message_persisted"},
+                "payload": {"signal": "runtime_output_persisted"},
             },
         ],
         protocol_plan={"passed": False, "missing": [{"agent": "alice", "missing_sections": ["findings"]}]},
@@ -64,6 +68,11 @@ def test_build_validation_snapshot_includes_flow_and_evidence_context() -> None:
         "telemetry signals 2 recent",
         "protocol gaps 1 participant",
     ]
+    assert snapshot["official_response_promotion"] == (
+        "promoted from agent_message_completed via "
+        "final_answer_agent_message_completed; candidate basis "
+        "final_answer_agent_message_completed"
+    )
 
 
 def test_build_validation_snapshot_drops_to_low_confidence_without_trace_or_telemetry() -> None:
@@ -84,7 +93,12 @@ def test_build_validation_snapshot_drops_to_low_confidence_without_trace_or_tele
         validation_cases=["happy_path_accept: not evaluated in current state"],
         trace_rows=[],
         runtime_sessions={},
-        telemetry_rows=[],
+        telemetry_rows=[
+            {
+                "event_type": "validation.signal.recorded",
+                "payload": {"signal": "message_persisted", "contribution_candidate_basis": "commentary_agent_message_completed"},
+            }
+        ],
         protocol_plan=None,
         phase_progression=None,
         procedure_progression=None,
@@ -94,6 +108,10 @@ def test_build_validation_snapshot_drops_to_low_confidence_without_trace_or_tele
     assert snapshot["evidence_summary"] == [
         "workflow trace missing",
         "runtime sessions unavailable",
-        "telemetry signals missing",
+        "telemetry signals 1 recent",
     ]
     assert snapshot["relevant_case_progression"] == "Happy path accept [SKIP]"
+    assert snapshot["official_response_promotion"] == (
+        "no official-response promotion evidence; latest candidate basis "
+        "commentary_agent_message_completed"
+    )

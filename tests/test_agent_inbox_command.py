@@ -181,7 +181,7 @@ def test_agent_inbox_attached_enriches_runtime_sessions(tmp_path, monkeypatch):
         "path_matches_current": False,
         "messages": [
             "- If you use a custom endpoint, check [bold]BTWIN_API_URL[/bold]",
-            "- For local-only usage, switch to [bold]runtime.mode: standalone[/bold] in the active config",
+            "- For local mode, switch to [bold]runtime.mode: standalone[/bold] in the active config",
             "- Possible PATH mismatch: the current process and the `btwin` on PATH are different.",
             "- Re-run `btwin init` if needed, then restart the MCP client session.",
         ],
@@ -271,7 +271,7 @@ def test_agent_inbox_attached_reports_missing_path_diagnostics(tmp_path, monkeyp
     assert diagnostics["path_matches_current"] is False
     assert diagnostics["messages"] == [
         "- If you use a custom endpoint, check [bold]BTWIN_API_URL[/bold]",
-        "- For local-only usage, switch to [bold]runtime.mode: standalone[/bold] in the active config",
+        "- For local mode, switch to [bold]runtime.mode: standalone[/bold] in the active config",
         "- `btwin` is not currently resolvable from PATH.",
     ]
 
@@ -459,7 +459,7 @@ def test_agent_inbox_missing_runtime_data_does_not_fail(tmp_path, monkeypatch):
         "path_matches_current": True,
         "messages": [
             "- If you use a custom endpoint, check [bold]BTWIN_API_URL[/bold]",
-            "- For local-only usage, switch to [bold]runtime.mode: standalone[/bold] in the active config",
+            "- For local mode, switch to [bold]runtime.mode: standalone[/bold] in the active config",
             "- If MCP tools still look stale, restart your MCP client session to clear a stale MCP proxy or stale Codex client session.",
         ],
     }

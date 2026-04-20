@@ -16,6 +16,10 @@ def _attached_config() -> BTwinConfig:
     return BTwinConfig(runtime=RuntimeConfig(mode="attached"))
 
 
+def _standalone_config() -> BTwinConfig:
+    return BTwinConfig(runtime=RuntimeConfig(mode="standalone"))
+
+
 def _parse_json_output(output: str):
     return json.loads(output.strip())
 
@@ -73,6 +77,32 @@ def test_live_threads_attached_renders_human_summary(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "Live debate" in result.output
     assert "attached_agents: alice" in result.output
+
+
+def test_live_threads_help_uses_runtime_attached_wording():
+    result = runner.invoke(app, ["live", "threads", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "runtime-attached live mode" in result.output
+
+
+def test_live_help_uses_runtime_attached_wording():
+    result = runner.invoke(app, ["live", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "runtime-attached live collaboration surface" in result.output
+    assert "Use the attached live collaboration surface." not in result.output
+
+
+def test_live_guardrail_uses_runtime_attached_and_config_value(monkeypatch):
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config())
+
+    result = runner.invoke(app, ["live", "status"])
+
+    assert result.exit_code == 4, result.output
+    assert "`btwin live` requires runtime-attached mode." in result.output
+    assert "runtime.mode: attached" in result.output
+    assert "attached runtime mode" not in result.output
 
 
 def test_live_attach_attached_calls_spawn_agent(monkeypatch):

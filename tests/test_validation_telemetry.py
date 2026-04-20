@@ -128,10 +128,93 @@ def test_agent_runner_records_runtime_and_fallback_output_signals(tmp_path: Path
     )
 
     signals = [
-        row["payload"]["signal"]
+        row["payload"]
         for row in ValidationTelemetryStore(data_dir).tail(limit=10, thread_id=thread["thread_id"])
     ]
 
-    assert "runtime_output_persisted" in signals
-    assert "fallback_runtime_output_persisted" in signals
-    assert "message_persisted" in signals
+    assert any(
+        payload["signal"] == "runtime_output_persisted"
+        and payload["official_response_source"] == "agent_message_completed"
+        and payload["official_response_basis"] == "final_answer_agent_message_completed"
+        and payload["contribution_candidate_basis"] == "final_answer_agent_message_completed"
+        for payload in signals
+    )
+    assert any(
+        payload["signal"] == "fallback_runtime_output_persisted"
+        and payload["official_response_source"] == "response_text"
+        and payload["official_response_basis"] == "commentary_only_outputs_fallback"
+        and payload["contribution_candidate_basis"] == "response_text_after_non_final_outputs"
+        for payload in signals
+    )
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["official_response_source"] == "agent_message_completed"
+        and payload["official_response_basis"] == "final_answer_agent_message_completed"
+        and payload["contribution_candidate_basis"] == "final_answer_agent_message_completed"
+        for payload in signals
+    )
+
+
+def test_agent_runner_promotes_response_text_when_only_commentary_output_was_persisted(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    threads_dir = data_dir / "threads"
+    threads_dir.mkdir(parents=True)
+
+    thread_store = ThreadStore(threads_dir)
+    thread = thread_store.create_thread(
+        topic="Promotion thread",
+        protocol="code-review",
+        participants=["alice"],
+        initial_phase="analysis",
+    )
+    runner = AgentRunner(
+        thread_store,
+        ProtocolStore(data_dir / "protocols"),
+        AgentStore(data_dir),
+        EventBus(),
+        config=BTwinConfig(data_dir=data_dir),
+    )
+
+    runner._persist_invocation_outputs(
+        thread["thread_id"],
+        "alice",
+        InvocationResult(
+            ok=True,
+            response_text="Durable final answer",
+            outputs=(RuntimeOutput(content="Working on it", phase="commentary", state_affecting=False),),
+        ),
+        chain_depth=1,
+    )
+
+    messages = thread_store.list_messages(thread["thread_id"])
+
+    assert [(message["message_phase"], message["state_affecting"]) for message in messages] == [
+        ("commentary", False),
+        ("final_answer", True),
+    ]
+    assert messages[-1]["tldr"] == "Durable final answer"
+
+    signals = [
+        row["payload"]
+        for row in ValidationTelemetryStore(data_dir).tail(limit=10, thread_id=thread["thread_id"])
+    ]
+
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["message_phase"] == "commentary"
+        and payload["contribution_candidate_basis"] == "commentary_agent_message_completed"
+        for payload in signals
+    )
+    assert any(
+        payload["signal"] == "fallback_runtime_output_persisted"
+        and payload["official_response_source"] == "response_text"
+        and payload["official_response_basis"] == "commentary_only_outputs_fallback"
+        and payload["contribution_candidate_basis"] == "response_text_after_non_final_outputs"
+        for payload in signals
+    )
+    assert messages[-1]["routing_source"] == "response_text"
+    assert messages[-1]["routing_reason"] == (
+        "official_response_source=response_text; "
+        "official_response_basis=commentary_only_outputs_fallback; "
+        "contribution_candidate_basis=response_text_after_non_final_outputs"
+    )

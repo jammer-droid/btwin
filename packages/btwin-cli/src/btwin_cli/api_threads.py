@@ -55,8 +55,11 @@ _RUNTIME_SESSION_FIELDS = (
     "continuity_mode",
     "launch_strategy",
     "last_transport_error",
+    "transport_degraded_compat_only",
+    "transport_degraded",
     "degraded",
     "recoverable",
+    "transport_recovery_pending",
     "recovery_attempts",
     "recovery_pending",
     "recovery_target_transport_mode",
@@ -92,10 +95,27 @@ def _normalize_runtime_session_record(session: Any) -> dict[str, object]:
         and bool(fallback_mode)
         and transport_mode == fallback_mode
     )
-    record.setdefault("degraded", bool(record["fallback_transport_involved"]))
+    transport_degraded_compat_only = (
+        record["fallback_transport_involved"]
+        and "transport_degraded" not in record
+        and "degraded" not in record
+    )
+    record["transport_degraded_compat_only"] = transport_degraded_compat_only
+    transport_degraded = bool(
+        record.get(
+            "transport_degraded",
+            record.get("degraded", record["fallback_transport_involved"]),
+        )
+    )
+    record["transport_degraded"] = transport_degraded
+    record.setdefault("degraded", transport_degraded)
     record.setdefault("recoverable", False)
     record.setdefault("recovery_attempts", 0)
-    record.setdefault("recovery_pending", False)
+    transport_recovery_pending = bool(
+        record.get("transport_recovery_pending", record.get("recovery_pending", False))
+    )
+    record["transport_recovery_pending"] = transport_recovery_pending
+    record.setdefault("recovery_pending", transport_recovery_pending)
     record.setdefault("recovery_target_transport_mode", None)
     return record
 
@@ -161,9 +181,11 @@ def _enrich_runtime_event(event: SSEEvent, agent_runner: Any | None) -> SSEEvent
         "continuity_mode",
         "launch_strategy",
         "last_transport_error",
+        "transport_degraded",
         "degraded",
         "recoverable",
         "recovery_attempts",
+        "transport_recovery_pending",
         "workspace_root",
         "helper_launch_cwd",
     ):

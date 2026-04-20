@@ -5,6 +5,7 @@ from pathlib import Path
 from rich.console import Console
 from typer.testing import CliRunner
 
+import btwin_cli.api_threads as api_threads
 import btwin_cli.main as main
 from btwin_cli.main import app
 from btwin_core.agent_store import AgentStore
@@ -498,10 +499,10 @@ def test_hud_attached_thread_view_shows_runtime_diagnostics(monkeypatch, tmp_pat
     rendered = main._render_hud("thread-1", limit=5)
 
     assert "Runtime" in rendered
-    assert "[yellow]alice  transport=resume_invocation_transport  surface=exec  kind=short-term[/yellow]" in rendered
+    assert "[yellow]alice  session=attached  activity=attached  transport=exec[/yellow]" in rendered
     assert (
-        "[yellow]       primary=resume_invocation_transport  status=failed  fallback=yes  "
-        "degraded=yes  recoverable=no  recovering=no  recovery_attempts=0[/yellow]"
+        "[yellow]       primary=exec  current=exec  transport_degraded=yes  "
+        "recoverable=no  recovering=no  recovery_attempts=0[/yellow]"
     ) in rendered
     assert "[red]last_error: live transport timed out after 6.00s of inactivity[/red]" in rendered
     assert "[yellow]04:32:23  runtime_transport_fallback  transport=resume_invocation_transport[/yellow]" in rendered
@@ -752,8 +753,8 @@ def test_render_thread_runtime_diagnostics_shows_long_term_app_server_sessions(m
     lines = main._render_thread_runtime_diagnostics("thread-1", _attached_config(data_dir))
 
     assert lines == [
-        "[green]alice  transport=live_process_transport  surface=app-server  kind=long-term[/green]",
-        "[green]       primary=live_process_transport  status=done  fallback=no  degraded=no  recoverable=no  recovering=no  recovery_attempts=0[/green]",
+        "[green]alice  session=attached  activity=attached  transport=app-server[/green]",
+        "[green]       primary=app-server  current=app-server  transport_degraded=no  recoverable=no  recovering=no  recovery_attempts=0[/green]",
     ]
 
 
@@ -792,8 +793,8 @@ def test_render_thread_runtime_diagnostics_shows_recovery_state(monkeypatch, tmp
     lines = main._render_thread_runtime_diagnostics("thread-1", _attached_config(data_dir))
 
     assert lines == [
-        "[yellow]alice  transport=resume_invocation_transport  surface=exec  kind=short-term[/yellow]",
-        "[yellow]       primary=live_process_transport  status=received  fallback=yes  degraded=yes  recoverable=yes  recovering=no  recovery_attempts=1[/yellow]",
+        "[yellow]alice  session=attached  activity=working  transport=exec[/yellow]",
+        "[yellow]       primary=app-server  current=exec  transport_degraded=yes  recoverable=yes  recovering=no  recovery_attempts=1[/yellow]",
     ]
 
 
@@ -1113,7 +1114,7 @@ def test_render_thread_watch_adds_app_server_hint_to_agents_summary(monkeypatch,
 
     rendered = main._render_thread_watch(thread, status_summary, [])
 
-    assert "Agents  alice=contributed (app-server)" in rendered
+    assert "Agents  alice=contributed (attached via app-server)" in rendered
 
 
 def test_render_thread_watch_adds_exec_fallback_recovery_hint_to_agents_summary(monkeypatch, tmp_path):
@@ -1145,7 +1146,7 @@ def test_render_thread_watch_adds_exec_fallback_recovery_hint_to_agents_summary(
 
     rendered = main._render_thread_watch(thread, status_summary, [])
 
-    assert "Agents  alice=contributed (exec fallback, recoverable)" in rendered
+    assert "Agents  alice=contributed (attached, transport degraded, recoverable)" in rendered
 
 
 def test_render_thread_watch_adds_recovering_hint_to_agents_summary(monkeypatch, tmp_path):
@@ -1178,7 +1179,7 @@ def test_render_thread_watch_adds_recovering_hint_to_agents_summary(monkeypatch,
 
     rendered = main._render_thread_watch(thread, status_summary, [])
 
-    assert "Agents  alice=contributed (exec fallback, recovering)" in rendered
+    assert "Agents  alice=contributed (attached, transport degraded, recovering)" in rendered
 
 
 def test_hud_attached_mode_shows_thread_lookup_error_instead_of_exiting(tmp_path, monkeypatch):
@@ -1290,7 +1291,7 @@ def test_hud_thread_view_scrolls_logs(monkeypatch, tmp_path):
         "_render_hud_thread_detail_screen",
         lambda thread_id, limit: "\n".join(
             [
-                "B-TWIN HUD :: Thread Detail :: mode=attached",
+                "B-TWIN HUD :: Thread Detail :: mode=runtime-attached",
                 "",
                 *[f"line {i}" for i in range(12)],
                 "",
@@ -1326,7 +1327,7 @@ def test_hud_open_selected_thread_anchors_recent_activity_to_latest(monkeypatch,
         "_render_hud_thread_detail_screen",
         lambda thread_id, limit: "\n".join(
             [
-                "B-TWIN HUD :: Thread Detail :: mode=attached",
+                "B-TWIN HUD :: Thread Detail :: mode=runtime-attached",
                 "",
                 *[f"line {i}" for i in range(12)],
                 "",
@@ -1576,7 +1577,7 @@ def test_hud_threads_view_uses_wireframe_list_and_selected_preview(monkeypatch, 
     assert "Selected Workflow" in rendered
     assert "phase: review (cycle 3)" in rendered
     assert "gate: Retry Gate" in rendered
-    assert "agents: jun=waiting(app-server)  ari=joined(app-server)" in rendered
+    assert "agents: jun=waiting(attached via app-server)  ari=joined(attached via app-server)" in rendered
     assert "last: Retry loop completed." in rendered
 
 
@@ -1597,7 +1598,7 @@ def test_hud_threads_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
 
     rendered = main._render_hud_threads(state, config, limit=5)
 
-    assert rendered.splitlines()[0] == "B-TWIN HUD :: Threads / Sessions :: mode=attached"
+    assert rendered.splitlines()[0] == "B-TWIN HUD :: Threads / Sessions :: mode=runtime-attached"
     assert "Hint      up/down select  enter open  d detail  l live  c close" in rendered
     assert "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit" in rendered
 
@@ -1763,8 +1764,81 @@ def test_hud_validation_renderable_shows_validation_sections(monkeypatch, tmp_pa
     assert "Expected" in rendered
     assert "Actual" in rendered
     assert "Missing contribution blocked" in rendered
+    assert "Official response" in rendered
+    assert "no official-response promotion evidence in recent telemetry" in rendered
     assert "Confidence" not in rendered
     assert "workflow trace present" not in rendered
+
+
+def test_hud_validation_renderable_shows_official_response_promotion_evidence(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="validation", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {"thread_id": thread_id, "topic": "Design Review", "protocol": "review-loop", "current_phase": "review"},
+            {"agents": [{"name": "jun", "status": "waiting"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {"cycle_index": 3, "current_step_label": "collect-feedback"},
+                "context_core": {"outcome_policy": "review-outcomes", "policy_outcomes": ["retry", "accept", "close"]},
+                "visual": {
+                    "procedure": [
+                        {"key": "announce", "label": "Announce", "status": "completed"},
+                        {"key": "collect-feedback", "label": "Collect Feedback", "status": "active"},
+                        {"key": "resolve", "label": "Resolve", "status": "pending"},
+                    ],
+                    "gates": [
+                        {"key": "retry", "label": "Retry Gate", "status": "active"},
+                        {"key": "accept", "label": "Accept Gate", "status": "pending"},
+                    ],
+                },
+            },
+            "trace": [
+                {"timestamp": "2026-04-19T12:03:55Z", "kind": "guard", "decision": "block", "phase": "review", "reason": "missing_contribution", "summary": "Missing contribution for current phase."}
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
+    monkeypatch.setattr(
+        main,
+        "_validation_telemetry_rows",
+        lambda thread_id, current_config, limit=20: [
+            {
+                "event_type": "validation.signal.recorded",
+                "payload": {
+                    "signal": "runtime_output_persisted",
+                    "official_response_source": "agent_message_completed",
+                    "official_response_basis": "final_answer_agent_message_completed",
+                    "contribution_candidate_basis": "final_answer_agent_message_completed",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    renderable = main._render_hud_navigator_renderable(state, config, limit=5)
+
+    rendered = _renderable_to_text(renderable, width=180)
+    assert "Official response" in rendered
+    assert "promoted from agent_message_completed via final_answer_agent_message_completed" in rendered
+    assert "candidate basis final_answer_agent_message_completed" in rendered
+    assert "Confidence" not in rendered
+    assert "Evidence" not in rendered
 
 
 def test_hud_renderable_shows_close_confirmation_footer(monkeypatch, tmp_path):
@@ -1874,6 +1948,8 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
     assert "Required contribution: WARN" in rendered
     assert "primary_reason: jun missing scope, findings" in rendered
     assert "next expected action: submit_contribution" in rendered
+    assert "Official response" in rendered
+    assert "no official-response promotion evidence in recent telemetry" in rendered
     assert "Flow" not in rendered
     assert "Status" not in rendered
     assert "Cases" not in rendered
@@ -1982,6 +2058,79 @@ def test_validation_compliance_rows_prioritize_active_cases_above_skips():
         "happy_path_accept",
         "missing_contribution_blocked",
         "close_requires_summary",
+    ]
+
+
+def test_check_actual_for_status_uses_transport_health_vocabulary():
+    actual = main._check_actual_for_status(
+        "session_health",
+        "WARN",
+        runtime_sessions={
+            "alice": {"recovery_pending": True},
+            "bob": {"degraded": True},
+            "carol": {"fallback_transport_involved": True},
+        },
+        trace_rows=[],
+    )
+
+    assert actual == (
+        "alice transport recovery pending"
+        " · bob transport degraded"
+        " · carol on fallback transport"
+    )
+
+
+def test_runtime_session_summary_marks_plain_degraded_session_as_transport_degraded():
+    assert main._runtime_session_summary(
+        {
+            "transport_mode": "live_process_transport",
+            "degraded": True,
+        }
+    ) == "attached, transport degraded"
+
+
+def test_check_actual_for_status_treats_normalized_legacy_fallback_session_as_fallback_transport():
+    normalized = api_threads._normalize_runtime_session_record(
+        {
+            "thread_id": "thread-1",
+            "provider": "codex",
+            "transport_mode": "resume_invocation_transport",
+            "fallback_mode": "resume_invocation_transport",
+        }
+    )
+
+    actual = main._check_actual_for_status(
+        "session_health",
+        "WARN",
+        runtime_sessions={"alice": normalized},
+        trace_rows=[],
+    )
+
+    assert actual == "alice on fallback transport"
+
+
+def test_validation_compliance_rows_describe_transport_health_expectation():
+    rows = main._validation_compliance_rows(
+        validation={
+            "checks": [("session_health", "WARN")],
+            "reasons": ["transport degraded"],
+            "verdict": "WARN",
+            "next_expected_action": "inspect runtime",
+        },
+        validation_cases=[],
+        runtime_sessions={"alice": {"degraded": True}},
+        trace_rows=[],
+    )
+
+    assert rows == [
+        {
+            "group": "check",
+            "key": "session_health",
+            "name": "Session health",
+            "expected": "no transport degradation or recovery pending",
+            "actual": "alice transport degraded",
+            "verdict": "WARN",
+        }
     ]
 
 
@@ -2301,7 +2450,7 @@ def test_hud_live_trace_view_uses_wireframe_sections_and_inspector(monkeypatch, 
     assert "Row Inspector" in rendered
     assert "kind: result" in rendered
     assert 'raw: {"agent": "jun", "kind": "result"' in rendered
-    assert "Sessions  jun=waiting(app-server)  ari=joined(app-server)" in rendered
+    assert "Sessions  jun=waiting(attached via app-server)  ari=joined(attached via app-server)" in rendered
 
 
 def test_hud_live_trace_renderable_uses_vertical_live_surface(monkeypatch, tmp_path):
@@ -2488,7 +2637,7 @@ def test_hud_thread_detail_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
         "_render_hud_thread_detail_screen",
         lambda thread_id, limit: "\n".join(
             [
-                "B-TWIN HUD :: Thread Detail :: mode=attached",
+                "B-TWIN HUD :: Thread Detail :: mode=runtime-attached",
                 "",
                 "Topic     Design Review",
                 "",
@@ -2501,7 +2650,7 @@ def test_hud_thread_detail_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
 
     rendered = main._render_hud_navigator(state, config, limit=5)
 
-    assert rendered.splitlines()[0] == "B-TWIN HUD :: Thread Detail :: mode=attached"
+    assert rendered.splitlines()[0] == "B-TWIN HUD :: Thread Detail :: mode=runtime-attached"
     assert "Hint      up/down scroll  pgup/pgdn page  home/end jump" in rendered
     assert "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit" in rendered
 
@@ -3078,7 +3227,7 @@ def test_hud_thread_detail_shows_agent_sessions_and_runtime_summary(monkeypatch,
     rendered = main._render_hud_navigator(state, config, limit=5)
 
     assert "Agent Sessions" in rendered
-    assert "jun  waiting     app-server" in rendered
+    assert "jun  waiting     attached via app-server" in rendered
 
 
 def test_hud_direct_thread_entry_uses_thread_detail_renderer(monkeypatch, tmp_path):
@@ -3143,7 +3292,7 @@ def test_hud_thread_detail_navigator_uses_same_render_path(monkeypatch, tmp_path
         "_render_hud_thread_detail_screen",
         lambda thread_id, limit: "\n".join(
             [
-                "B-TWIN HUD :: Thread Detail :: mode=attached",
+                "B-TWIN HUD :: Thread Detail :: mode=runtime-attached",
                 "",
                 f"shared:{thread_id}:{limit}",
                 "",
@@ -3291,7 +3440,7 @@ def test_hud_thread_detail_renders_cockpit_sections_in_stable_order(monkeypatch,
     def index_of(prefix: str) -> int:
         return next(i for i, line in enumerate(lines) if prefix in line)
 
-    assert lines[0] == "B-TWIN HUD :: Thread Detail :: mode=attached"
+    assert lines[0] == "B-TWIN HUD :: Thread Detail :: mode=runtime-attached"
     assert index_of("Topic") < index_of("Protocol") < index_of("Verdict") < index_of("Primary")
     assert index_of("Primary") < index_of("Phase") < index_of("Procedure") < index_of("Next")
     assert index_of("Next") < index_of("Recent Activity") < index_of("Agent Sessions")
@@ -3375,7 +3524,7 @@ def test_hud_validation_focus_warns_on_session_recovery(monkeypatch, tmp_path):
     assert "Rule Compliance" in rendered
     assert "WARN" in rendered
     assert "Session health" in rendered
-    assert "runtime session recovery pending" in rendered
+    assert "transport recovery pending" in rendered
     assert "Reasons" in rendered
 
 
@@ -3510,7 +3659,7 @@ def test_hud_thread_scroll_bounds_use_detail_renderer_body(monkeypatch, tmp_path
         "_render_hud_thread_detail_screen",
         lambda thread_id, limit: "\n".join(
             [
-                "B-TWIN HUD :: Thread Detail :: mode=standalone",
+                "B-TWIN HUD :: Thread Detail :: mode=local",
                 "",
                 *[f"line {i}" for i in range(12)],
                 "",

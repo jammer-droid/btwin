@@ -459,7 +459,7 @@ def test_thread_list_attached_reports_http_status_errors_without_unreachable_mes
     result = runner.invoke(app, ["thread", "list", "--json"])
 
     assert result.exit_code == 1
-    assert "shared API responded with an error" in result.output
+    assert "runtime-attached shared API responded with an error" in result.output
     assert "409" in result.output
     assert "shared API responded but the request was rejected" in result.output
     assert "could not reach the shared B-TWIN API" not in result.output
@@ -483,7 +483,7 @@ def test_thread_list_attached_reports_path_mismatch_hint_on_connect_error(monkey
     result = runner.invoke(app, ["thread", "list", "--json"])
 
     assert result.exit_code == 1
-    assert "could not reach the shared B-TWIN API" in result.output
+    assert "could not reach the runtime-attached shared API" in result.output
     assert "Possible PATH mismatch" in result.output
     assert "/tmp/current-btwin" in result.output
     assert "/tmp/path-btwin" in result.output

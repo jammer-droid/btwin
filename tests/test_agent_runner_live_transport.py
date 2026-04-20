@@ -231,6 +231,8 @@ async def test_live_transport_treats_codex_idle_status_as_turn_complete(
 
     assert result.ok is True
     assert result.response_text == "BTWIN SYSTEM OK"
+    assert result.outputs[0].promotion_source == "turn_complete_text_delta"
+    assert result.outputs[0].promotion_basis == "turn_complete_text_delta_fallback"
     assert adapter.closed is False
 
 
@@ -302,6 +304,191 @@ async def test_live_transport_collects_commentary_and_final_outputs_from_complet
         ("Working on it", "commentary", False),
         ("Done", "final_answer", True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_live_transport_synthesizes_final_answer_for_commentary_plus_turn_complete_text_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    threads_dir = data_dir / "threads"
+    threads_dir.mkdir(parents=True)
+
+    thread_store = ThreadStore(threads_dir)
+    thread = thread_store.create_thread(
+        topic="Promotion basis thread",
+        protocol="code-review",
+        participants=["alice"],
+        initial_phase="analysis",
+    )
+    runner = AgentRunner(
+        thread_store,
+        ProtocolStore(data_dir / "protocols"),
+        AgentStore(data_dir),
+        EventBus(),
+        config=BTwinConfig(data_dir=data_dir),
+    )
+
+    adapter = _FakeLiveTransportAdapter(
+        [
+            SessionEvent(kind="turn_started", content="turn-1"),
+            SessionEvent(
+                kind="agent_message_completed",
+                content="Working on it",
+                metadata={"phase": "commentary", "provider": "codex-app-server"},
+            ),
+            SessionEvent(kind="text_delta", content="Done via turn complete"),
+            SessionEvent(kind="turn_complete", content="turn-1", metadata={"provider": "codex-app-server"}),
+        ]
+    )
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.build_transport_for_provider",
+        lambda *args, **kwargs: _FakeLiveTransport(adapter),
+    )
+
+    session = RuntimeSession(
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="live_process_transport",
+    )
+    launch = LaunchResolution(
+        provider=CodexProvider(),
+        auth=ResolvedLaunchAuth(
+            provider_name="codex",
+            mode="cli_environment",
+        ),
+        env={},
+        metadata={},
+    )
+
+    result = await runner._run_live_transport(
+        session,
+        "prompt text",
+        launch,
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+    )
+    runner._persist_invocation_outputs(thread["thread_id"], "agent-1", result, chain_depth=1)
+
+    assert [(item.content, item.phase, item.state_affecting) for item in result.outputs] == [
+        ("Working on it", "commentary", False),
+        ("Done via turn complete", "final_answer", True),
+    ]
+    assert result.outputs[-1].promotion_source == "turn_complete_text_delta"
+    assert result.outputs[-1].promotion_basis == "turn_complete_text_delta_fallback"
+
+    messages = thread_store.list_messages(thread["thread_id"])
+    assert messages[-1]["routing_source"] == "turn_complete_text_delta"
+    assert "turn_complete_text_delta_fallback" in messages[-1]["routing_reason"]
+
+    telemetry_rows = [
+        row["payload"]
+        for row in runner._validation_telemetry.tail(limit=10, thread_id=thread["thread_id"])
+    ]
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["message_phase"] == "final_answer"
+        and payload["official_response_source"] == "turn_complete_text_delta"
+        and payload["official_response_basis"] == "turn_complete_text_delta_fallback"
+        for payload in telemetry_rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_transport_synthesizes_final_answer_for_commentary_plus_turn_complete_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    threads_dir = data_dir / "threads"
+    threads_dir.mkdir(parents=True)
+
+    thread_store = ThreadStore(threads_dir)
+    thread = thread_store.create_thread(
+        topic="Promotion basis thread",
+        protocol="code-review",
+        participants=["alice"],
+        initial_phase="analysis",
+    )
+    runner = AgentRunner(
+        thread_store,
+        ProtocolStore(data_dir / "protocols"),
+        AgentStore(data_dir),
+        EventBus(),
+        config=BTwinConfig(data_dir=data_dir),
+    )
+
+    adapter = _FakeLiveTransportAdapter(
+        [
+            SessionEvent(kind="turn_started", content="turn-1"),
+            SessionEvent(
+                kind="agent_message_completed",
+                content="Working on it",
+                metadata={"phase": "commentary", "provider": "codex-app-server"},
+            ),
+            SessionEvent(kind="turn_complete", content="Done from turn complete", metadata={"provider": "codex-app-server"}),
+        ]
+    )
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.build_transport_for_provider",
+        lambda *args, **kwargs: _FakeLiveTransport(adapter),
+    )
+
+    session = RuntimeSession(
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+        provider="codex",
+        transport_mode="live_process_transport",
+    )
+    launch = LaunchResolution(
+        provider=CodexProvider(),
+        auth=ResolvedLaunchAuth(
+            provider_name="codex",
+            mode="cli_environment",
+        ),
+        env={},
+        metadata={},
+    )
+
+    result = await runner._run_live_transport(
+        session,
+        "prompt text",
+        launch,
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+    )
+    runner._persist_invocation_outputs(thread["thread_id"], "agent-1", result, chain_depth=1)
+
+    assert result.ok is True
+    assert result.response_text == "Done from turn complete"
+    assert [(item.content, item.phase, item.state_affecting) for item in result.outputs] == [
+        ("Working on it", "commentary", False),
+        ("Done from turn complete", "final_answer", True),
+    ]
+    assert result.outputs[-1].promotion_source == "turn_complete_only"
+    assert result.outputs[-1].promotion_basis == "turn_complete_only_fallback"
+
+    messages = thread_store.list_messages(thread["thread_id"])
+    assert messages[-1]["routing_source"] == "turn_complete_only"
+    assert messages[-1]["routing_reason"] == (
+        "official_response_source=turn_complete_only; "
+        "official_response_basis=turn_complete_only_fallback; "
+        "contribution_candidate_basis=turn_complete_only_fallback"
+    )
+
+    telemetry_rows = [
+        row["payload"]
+        for row in runner._validation_telemetry.tail(limit=10, thread_id=thread["thread_id"])
+    ]
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["message_phase"] == "final_answer"
+        and payload["official_response_source"] == "turn_complete_only"
+        and payload["official_response_basis"] == "turn_complete_only_fallback"
+        for payload in telemetry_rows
+    )
 
 
 @pytest.mark.asyncio

@@ -88,5 +88,6 @@ def test_doctor_skips_attached_api_in_standalone_mode(tmp_path, monkeypatch):
     payload = _parse_json_output(result.output)
     assert payload["runtime_mode"] == "standalone"
     assert payload["checks"]["attached_api"]["status"] == "skipped"
+    assert payload["checks"]["attached_api"]["detail"] == "runtime.mode is standalone (local mode)"
     assert payload["checks"]["launchd_service"]["status"] == "skipped"
     assert payload["checks"]["path_btwin"]["matches_current"] is True

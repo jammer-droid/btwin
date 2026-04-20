@@ -100,6 +100,30 @@ def _evidence_summary(
     return evidence
 
 
+def summarize_official_response_promotion(telemetry_rows: list[dict[str, Any]]) -> str:
+    if not telemetry_rows:
+        return "no official-response promotion evidence in recent telemetry"
+
+    candidate_only_summary: str | None = None
+    for row in telemetry_rows:
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        source = str(payload.get("official_response_source") or "").strip()
+        basis = str(payload.get("official_response_basis") or "").strip()
+        candidate_basis = str(payload.get("contribution_candidate_basis") or "").strip()
+        if source and basis:
+            candidate_text = candidate_basis or basis
+            return f"promoted from {source} via {basis}; candidate basis {candidate_text}"
+        if candidate_only_summary is None and candidate_basis:
+            candidate_only_summary = (
+                f"no official-response promotion evidence; latest candidate basis {candidate_basis}"
+            )
+
+    return candidate_only_summary or "no official-response promotion evidence in recent telemetry"
+
+
 def _confidence(
     *,
     trace_rows: list[dict[str, object]],
@@ -149,6 +173,7 @@ def build_validation_snapshot(
         "procedure_progression": procedure_progression or "-",
         "gate_progression": _gate_progression(phase_cycle_payload) or "-",
         "relevant_case_progression": _relevant_case_progression(validation_cases),
+        "official_response_promotion": summarize_official_response_promotion(telemetry_rows),
         "evidence_summary": _evidence_summary(
             trace_rows=trace_rows,
             runtime_sessions=runtime_sessions,

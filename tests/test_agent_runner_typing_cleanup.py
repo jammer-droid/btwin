@@ -144,6 +144,41 @@ class _FakeNonCodexStreamingProvider(_FakeStreamingProvider):
         return "claude-code"
 
 
+class _MixedStreamingProvider(_FakeStreamingProvider):
+    def parse_stream_line(self, line: str) -> StreamEvent | None:
+        stripped = line.strip()
+        if stripped == "delta":
+            return StreamEvent(event_type="assistant", text_delta="delta", raw={"line": line})
+        if stripped == "complete":
+            return StreamEvent(
+                event_type="turn_complete",
+                is_final=True,
+                final_text="Done from turn complete",
+                raw={"line": line},
+            )
+        return None
+
+
+class _ParseFallbackProvider(_FakeStreamingProvider):
+    def parse_stream_line(self, line: str) -> StreamEvent | None:
+        del line
+        return None
+
+    def parse_final_response(self, output: str) -> str:
+        return "Parsed from batch fallback"
+
+
+class _TextDeltaOnlyProvider(_FakeStreamingProvider):
+    def parse_stream_line(self, line: str) -> StreamEvent | None:
+        stripped = line.strip()
+        if stripped:
+            return StreamEvent(event_type="assistant", text_delta=stripped, raw={"line": line})
+        return None
+
+    def parse_final_response(self, output: str) -> str:
+        raise AssertionError("parse_final_response should not be used for pure text_delta_only streams")
+
+
 def _drain_events(queue: asyncio.Queue[SSEEvent]) -> list[SSEEvent]:
     events: list[SSEEvent] = []
     while True:
@@ -323,6 +358,177 @@ async def test_run_subprocess_prefers_session_workspace_root(
 
     assert result.ok is True
     assert captured_kwargs["cwd"] == str(workspace_root)
+
+
+@pytest.mark.asyncio
+async def test_run_subprocess_labels_mixed_text_delta_and_turn_complete_final_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _build_runner(tmp_path)
+    thread = runner._threads.create_thread(
+        topic="Subprocess promotion",
+        protocol="code-review",
+        participants=["agent-1"],
+        initial_phase="analysis",
+    )
+    fake_proc = _FakeSubprocess([b"delta\n", b"complete\n"], returncode=0)
+
+    async def fake_create_subprocess_exec(*args, **kwargs):  # noqa: ANN001, ANN202
+        del args, kwargs
+        return fake_proc
+
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await runner._run_subprocess(
+        ["fake-codex"],
+        "prompt text",
+        _MixedStreamingProvider(),
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+    )
+    runner._persist_invocation_outputs(thread["thread_id"], "agent-1", result, chain_depth=1)
+
+    messages = runner._threads.list_messages(thread["thread_id"])
+    telemetry_rows = [
+        row["payload"]
+        for row in runner._validation_telemetry.tail(limit=10, thread_id=thread["thread_id"])
+    ]
+
+    assert result.ok is True
+    assert result.response_text == "Done from turn complete"
+    assert result.outputs[-1].promotion_source == "turn_complete_text_delta"
+    assert result.outputs[-1].promotion_basis == "turn_complete_text_delta_fallback"
+    assert messages[-1]["routing_source"] == "turn_complete_text_delta"
+    assert messages[-1]["routing_reason"] == (
+        "official_response_source=turn_complete_text_delta; "
+        "official_response_basis=turn_complete_text_delta_fallback; "
+        "contribution_candidate_basis=turn_complete_text_delta_fallback"
+    )
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["official_response_source"] == "turn_complete_text_delta"
+        and payload["official_response_basis"] == "turn_complete_text_delta_fallback"
+        and payload["contribution_candidate_basis"] == "turn_complete_text_delta_fallback"
+        for payload in telemetry_rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_subprocess_labels_parse_final_response_fallback_as_subprocess_final_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _build_runner(tmp_path)
+    thread = runner._threads.create_thread(
+        topic="Subprocess fallback",
+        protocol="code-review",
+        participants=["agent-1"],
+        initial_phase="analysis",
+    )
+    fake_proc = _FakeSubprocess([b"noise one\n", b"noise two\n"], returncode=0)
+
+    async def fake_create_subprocess_exec(*args, **kwargs):  # noqa: ANN001, ANN202
+        del args, kwargs
+        return fake_proc
+
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await runner._run_subprocess(
+        ["fake-codex"],
+        "prompt text",
+        _ParseFallbackProvider(),
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+    )
+    runner._persist_invocation_outputs(thread["thread_id"], "agent-1", result, chain_depth=1)
+
+    messages = runner._threads.list_messages(thread["thread_id"])
+    telemetry_rows = [
+        row["payload"]
+        for row in runner._validation_telemetry.tail(limit=10, thread_id=thread["thread_id"])
+    ]
+
+    assert result.ok is True
+    assert result.response_text == "Parsed from batch fallback"
+    assert result.outputs[-1].promotion_source == "subprocess_final_response"
+    assert result.outputs[-1].promotion_basis == "final_answer_subprocess_output"
+    assert messages[-1]["routing_source"] == "subprocess_final_response"
+    assert messages[-1]["routing_reason"] == (
+        "official_response_source=subprocess_final_response; "
+        "official_response_basis=final_answer_subprocess_output; "
+        "contribution_candidate_basis=final_answer_subprocess_output"
+    )
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["official_response_source"] == "subprocess_final_response"
+        and payload["official_response_basis"] == "final_answer_subprocess_output"
+        and payload["contribution_candidate_basis"] == "final_answer_subprocess_output"
+        for payload in telemetry_rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_subprocess_labels_pure_text_delta_stream_as_text_delta_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _build_runner(tmp_path)
+    thread = runner._threads.create_thread(
+        topic="Subprocess delta-only",
+        protocol="code-review",
+        participants=["agent-1"],
+        initial_phase="analysis",
+    )
+    fake_proc = _FakeSubprocess([b"alpha\n", b"beta\n"], returncode=0)
+
+    async def fake_create_subprocess_exec(*args, **kwargs):  # noqa: ANN001, ANN202
+        del args, kwargs
+        return fake_proc
+
+    monkeypatch.setattr(
+        "btwin_core.agent_runner.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = await runner._run_subprocess(
+        ["fake-codex"],
+        "prompt text",
+        _TextDeltaOnlyProvider(),
+        thread_id=thread["thread_id"],
+        agent_name="agent-1",
+    )
+    runner._persist_invocation_outputs(thread["thread_id"], "agent-1", result, chain_depth=1)
+
+    messages = runner._threads.list_messages(thread["thread_id"])
+    telemetry_rows = [
+        row["payload"]
+        for row in runner._validation_telemetry.tail(limit=10, thread_id=thread["thread_id"])
+    ]
+
+    assert result.ok is True
+    assert result.response_text == "alphabeta"
+    assert result.outputs[-1].promotion_source == "text_delta_only"
+    assert result.outputs[-1].promotion_basis == "text_delta_only_fallback"
+    assert messages[-1]["routing_source"] == "text_delta_only"
+    assert messages[-1]["routing_reason"] == (
+        "official_response_source=text_delta_only; "
+        "official_response_basis=text_delta_only_fallback; "
+        "contribution_candidate_basis=text_delta_only_fallback"
+    )
+    assert any(
+        payload["signal"] == "message_persisted"
+        and payload["official_response_source"] == "text_delta_only"
+        and payload["official_response_basis"] == "text_delta_only_fallback"
+        and payload["contribution_candidate_basis"] == "text_delta_only_fallback"
+        for payload in telemetry_rows
+    )
 
 
 @pytest.mark.asyncio

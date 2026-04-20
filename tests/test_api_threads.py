@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import btwin_cli.api_threads as api_threads
 from btwin_cli.api_threads import create_threads_router
 from btwin_core.event_bus import EventBus
 from btwin_core.phase_cycle import PhaseCycleState
@@ -360,6 +361,38 @@ def test_agent_runtime_status_includes_helper_overlay_fields(tmp_path):
     payload = response.json()
     assert payload["agents"]["alice"][0]["workspace_root"] == "/tmp/project"
     assert payload["agents"]["alice"][0]["helper_launch_cwd"] == "/tmp/project/.btwin/helpers/alice/workspace"
+
+
+def test_normalize_runtime_session_record_exposes_transport_aliases_for_legacy_fields():
+    normalized = api_threads._normalize_runtime_session_record(
+        {
+            "thread_id": "thread-1",
+            "provider": "codex",
+            "transport_mode": "resume_invocation_transport",
+            "degraded": True,
+            "recovery_pending": True,
+        }
+    )
+
+    assert normalized["degraded"] is True
+    assert normalized["transport_degraded"] is True
+    assert normalized["recovery_pending"] is True
+    assert normalized["transport_recovery_pending"] is True
+
+
+def test_normalize_runtime_session_record_preserves_fallback_only_legacy_degraded_compatibility():
+    normalized = api_threads._normalize_runtime_session_record(
+        {
+            "thread_id": "thread-1",
+            "provider": "codex",
+            "transport_mode": "resume_invocation_transport",
+            "fallback_mode": "resume_invocation_transport",
+        }
+    )
+
+    assert normalized["fallback_transport_involved"] is True
+    assert normalized["degraded"] is True
+    assert normalized["transport_degraded"] is True
 
 
 def test_attached_api_allows_direct_message_to_thread_participant_when_target_is_inactive(tmp_path):

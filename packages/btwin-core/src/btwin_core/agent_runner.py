@@ -50,6 +50,14 @@ PROMPT_MAX_BYTES = 24_000
 LIVE_TRANSPORT_STARTUP_TIMEOUT = 180.0
 CODEX_IDLE_COMPLETION_GRACE_SECONDS = 1.0
 SUBPROCESS_STREAM_LIMIT = 1024 * 1024
+PROMOTION_SOURCE_TEXT_DELTA_ONLY = "text_delta_only"
+PROMOTION_SOURCE_TURN_COMPLETE_ONLY = "turn_complete_only"
+PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA = "turn_complete_text_delta"
+PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE = "subprocess_final_response"
+PROMOTION_BASIS_TEXT_DELTA_ONLY = "text_delta_only_fallback"
+PROMOTION_BASIS_TURN_COMPLETE_ONLY = "turn_complete_only_fallback"
+PROMOTION_BASIS_TURN_COMPLETE_TEXT_DELTA = "turn_complete_text_delta_fallback"
+PROMOTION_BASIS_SUBPROCESS_FINAL_RESPONSE = "final_answer_subprocess_output"
 
 
 def _now_iso() -> str:
@@ -74,6 +82,8 @@ class RuntimeOutput:
     content: str
     phase: str = "unknown"
     state_affecting: bool = True
+    promotion_source: str | None = None
+    promotion_basis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -336,6 +346,47 @@ class AgentRunner:
             payload={"signal": signal, **(payload or {})},
         )
 
+    def _output_promotion_metadata(self, output: RuntimeOutput) -> dict[str, str]:
+        contribution_candidate_basis = output.promotion_basis or (
+            "final_answer_agent_message_completed"
+            if output.phase == "final_answer"
+            else f"{output.phase}_agent_message_completed"
+        )
+        metadata: dict[str, str] = {
+            "contribution_candidate_basis": contribution_candidate_basis,
+        }
+        if output.state_affecting or output.phase == "final_answer":
+            metadata["official_response_source"] = output.promotion_source or "agent_message_completed"
+            metadata["official_response_basis"] = output.promotion_basis or "final_answer_agent_message_completed"
+        return metadata
+
+    def _final_response_promotion_labels(
+        self,
+        *,
+        final_text_source: str | None = None,
+        observed_text_deltas: bool = False,
+        turn_complete_seen: bool | None = None,
+    ) -> tuple[str, str]:
+        if final_text_source == PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE:
+            return PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE, PROMOTION_BASIS_SUBPROCESS_FINAL_RESPONSE
+        if final_text_source == PROMOTION_SOURCE_TEXT_DELTA_ONLY:
+            return PROMOTION_SOURCE_TEXT_DELTA_ONLY, PROMOTION_BASIS_TEXT_DELTA_ONLY
+        if final_text_source == PROMOTION_SOURCE_TURN_COMPLETE_ONLY:
+            return PROMOTION_SOURCE_TURN_COMPLETE_ONLY, PROMOTION_BASIS_TURN_COMPLETE_ONLY
+        if final_text_source == PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA:
+            return PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA, PROMOTION_BASIS_TURN_COMPLETE_TEXT_DELTA
+        if turn_complete_seen is None:
+            if observed_text_deltas:
+                return PROMOTION_SOURCE_TEXT_DELTA_ONLY, PROMOTION_BASIS_TEXT_DELTA_ONLY
+            return PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE, PROMOTION_BASIS_SUBPROCESS_FINAL_RESPONSE
+        if turn_complete_seen and observed_text_deltas:
+            return PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA, PROMOTION_BASIS_TURN_COMPLETE_TEXT_DELTA
+        if turn_complete_seen:
+            return PROMOTION_SOURCE_TURN_COMPLETE_ONLY, PROMOTION_BASIS_TURN_COMPLETE_ONLY
+        if observed_text_deltas:
+            return PROMOTION_SOURCE_TEXT_DELTA_ONLY, PROMOTION_BASIS_TEXT_DELTA_ONLY
+        return PROMOTION_SOURCE_TURN_COMPLETE_ONLY, PROMOTION_BASIS_TURN_COMPLETE_ONLY
+
     async def _run_subprocess(
         self,
         cmd: list[str],
@@ -398,9 +449,11 @@ class AgentRunner:
         # Stream stdout line-by-line
         captured_session_id: str | None = None
         final_text = ""
+        final_text_source: str | None = None
         observed_text_deltas: list[str] = []
         all_output_lines: list[str] = []
         seen_text_delta = False
+        turn_complete_seen = False
         typing_started = False
         typing_done_published = False
 
@@ -432,7 +485,15 @@ class AgentRunner:
                                 self._emit_agent_typing(thread_id, agent_name, normalized.content)
                             continue
                         if normalized.kind == "turn_complete" and normalized.content:
+                            turn_complete_seen = True
                             final_text = normalized.content
+                            final_text_source = (
+                                PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA
+                                if seen_text_delta
+                                else PROMOTION_SOURCE_TURN_COMPLETE_ONLY
+                            )
+                        elif normalized.kind == "turn_complete":
+                            turn_complete_seen = True
 
                 await proc.wait()
 
@@ -443,9 +504,11 @@ class AgentRunner:
             if not final_text:
                 if observed_text_deltas:
                     final_text = "".join(observed_text_deltas)
+                    final_text_source = PROMOTION_SOURCE_TEXT_DELTA_ONLY
                 else:
                     full_output = "\n".join(all_output_lines)
                     final_text = provider.parse_final_response(full_output)
+                    final_text_source = PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE
 
             if not captured_session_id:
                 full_output = "\n".join(all_output_lines)
@@ -482,7 +545,20 @@ class AgentRunner:
 
             outputs: tuple[RuntimeOutput, ...] = ()
             if final_text.strip():
-                outputs = (RuntimeOutput(content=final_text.strip(), phase="final_answer", state_affecting=True),)
+                promotion_source, promotion_basis = self._final_response_promotion_labels(
+                    final_text_source=final_text_source,
+                    observed_text_deltas=bool(observed_text_deltas),
+                    turn_complete_seen=turn_complete_seen,
+                )
+                outputs = (
+                    RuntimeOutput(
+                        content=final_text.strip(),
+                        phase="final_answer",
+                        state_affecting=True,
+                        promotion_source=promotion_source,
+                        promotion_basis=promotion_basis,
+                    ),
+                )
 
             return InvocationResult(
                 ok=(proc.returncode == 0),
@@ -1205,11 +1281,12 @@ class AgentRunner:
         chain_depth: int,
     ) -> None:
         session = self._session_supervisor.get_session(thread_id, agent_name)
-        saved_any = False
+        promoted_official_response = False
         for output in result.outputs:
             content = output.content.strip()
             if not content:
                 continue
+            evidence = self._output_promotion_metadata(output)
             self._log_runtime_event(
                 "runtime_output_persisting",
                 thread_id=thread_id,
@@ -1221,6 +1298,7 @@ class AgentRunner:
                     "phase": output.phase,
                     "stateAffecting": output.state_affecting,
                     "contentPreview": content[:120],
+                    **evidence,
                 },
             )
             self._record_validation_signal(
@@ -1230,6 +1308,7 @@ class AgentRunner:
                 payload={
                     "message_phase": output.phase,
                     "state_affecting": output.state_affecting,
+                    **evidence,
                 },
             )
             self._save_agent_message(
@@ -1239,10 +1318,28 @@ class AgentRunner:
                 chain_depth,
                 message_phase=output.phase,
                 state_affecting=output.state_affecting,
+                routing_source=evidence.get("official_response_source", "agent_message_completed"),
+                routing_reason="; ".join(
+                    [
+                        *(
+                            [
+                                f"official_response_source={evidence['official_response_source']}",
+                                f"official_response_basis={evidence['official_response_basis']}",
+                            ]
+                            if "official_response_source" in evidence
+                            else []
+                        ),
+                        f"contribution_candidate_basis={evidence['contribution_candidate_basis']}",
+                    ]
+                ),
+                official_response_source=evidence.get("official_response_source"),
+                official_response_basis=evidence.get("official_response_basis"),
+                contribution_candidate_basis=evidence["contribution_candidate_basis"],
             )
-            saved_any = True
+            if output.state_affecting or output.phase == "final_answer":
+                promoted_official_response = True
 
-        if saved_any or not result.response_text.strip():
+        if promoted_official_response or not result.response_text.strip():
             return
 
         self._log_runtime_event(
@@ -1265,6 +1362,9 @@ class AgentRunner:
             payload={
                 "message_phase": "final_answer",
                 "state_affecting": True,
+                "official_response_source": "response_text",
+                "official_response_basis": "commentary_only_outputs_fallback",
+                "contribution_candidate_basis": "response_text_after_non_final_outputs",
             },
         )
         self._save_agent_message(
@@ -1274,6 +1374,15 @@ class AgentRunner:
             chain_depth,
             message_phase="final_answer",
             state_affecting=True,
+            routing_source="response_text",
+            routing_reason=(
+                "official_response_source=response_text; "
+                "official_response_basis=commentary_only_outputs_fallback; "
+                "contribution_candidate_basis=response_text_after_non_final_outputs"
+            ),
+            official_response_source="response_text",
+            official_response_basis="commentary_only_outputs_fallback",
+            contribution_candidate_basis="response_text_after_non_final_outputs",
         )
 
     def _save_agent_message(
@@ -1285,6 +1394,11 @@ class AgentRunner:
         *,
         message_phase: str | None = None,
         state_affecting: bool = True,
+        routing_source: str = "fallback",
+        routing_reason: str = "",
+        official_response_source: str | None = None,
+        official_response_basis: str | None = None,
+        contribution_candidate_basis: str | None = None,
     ) -> None:
         tldr = content[:100].replace("\n", " ")
         if len(content) > 100:
@@ -1297,21 +1411,33 @@ class AgentRunner:
             msg_type="message",
             message_phase=message_phase,
             state_affecting=state_affecting,
+            routing_source=routing_source,
+            routing_reason=routing_reason,
         )
         if saved_message is None:
             return
-        if state_affecting or message_phase == "final_answer":
-            self._record_validation_signal(
-                thread_id,
-                agent_name,
-                signal="message_persisted",
-                payload={
-                    "message_id": saved_message["message_id"],
-                    "message_phase": message_phase,
-                    "state_affecting": state_affecting,
-                    "contribution_candidate": state_affecting,
-                },
+        if contribution_candidate_basis is None:
+            contribution_candidate_basis = (
+                "final_answer_agent_message_completed"
+                if state_affecting or message_phase == "final_answer"
+                else f"{message_phase or 'unknown'}_agent_message_completed"
             )
+        payload: dict[str, object] = {
+            "message_id": saved_message["message_id"],
+            "message_phase": message_phase,
+            "state_affecting": state_affecting,
+            "contribution_candidate_basis": contribution_candidate_basis,
+        }
+        if official_response_source is not None:
+            payload["official_response_source"] = official_response_source
+        if official_response_basis is not None:
+            payload["official_response_basis"] = official_response_basis
+        self._record_validation_signal(
+            thread_id,
+            agent_name,
+            signal="message_persisted",
+            payload=payload,
+        )
         if not state_affecting:
             return
         self._event_bus.publish(SSEEvent(
@@ -1557,6 +1683,12 @@ class AgentRunner:
                             content=output_content,
                             phase=output_phase,
                             state_affecting=(output_phase == "final_answer"),
+                            promotion_source="agent_message_completed",
+                            promotion_basis=(
+                                "final_answer_agent_message_completed"
+                                if output_phase == "final_answer"
+                                else f"{output_phase}_agent_message_completed"
+                            ),
                         )
                         completed_outputs.append(output)
                         if output.state_affecting:
@@ -1599,9 +1731,32 @@ class AgentRunner:
 
             if not final_text and observed_text_deltas:
                 final_text = "".join(observed_text_deltas)
-            if not completed_outputs and final_text.strip():
+            if final_text.strip() and not any(
+                output.state_affecting or output.phase == "final_answer"
+                for output in completed_outputs
+            ):
+                final_text_source = (
+                    PROMOTION_SOURCE_TURN_COMPLETE_TEXT_DELTA
+                    if turn_complete_seen and observed_text_deltas
+                    else PROMOTION_SOURCE_TURN_COMPLETE_ONLY
+                    if turn_complete_seen
+                    else PROMOTION_SOURCE_TEXT_DELTA_ONLY
+                    if observed_text_deltas
+                    else PROMOTION_SOURCE_SUBPROCESS_FINAL_RESPONSE
+                )
+                promotion_source, promotion_basis = self._final_response_promotion_labels(
+                    final_text_source=final_text_source,
+                    observed_text_deltas=bool(observed_text_deltas),
+                    turn_complete_seen=turn_complete_seen,
+                )
                 completed_outputs.append(
-                    RuntimeOutput(content=final_text.strip(), phase="final_answer", state_affecting=True)
+                    RuntimeOutput(
+                        content=final_text.strip(),
+                        phase="final_answer",
+                        state_affecting=True,
+                        promotion_source=promotion_source,
+                        promotion_basis=promotion_basis,
+                    )
                 )
 
             self._log_runtime_event(
