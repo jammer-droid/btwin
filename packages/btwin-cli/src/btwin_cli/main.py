@@ -49,7 +49,13 @@ from rich.text import Text
 from btwin_core.agent_store import AgentStore, sanitize_agent_for_output
 from btwin_core.config import BTwinConfig, load_config, resolve_config_path
 from btwin_core.context_core import ContextCore
-from btwin_core.delegation_engine import DelegationAssignment, build_delegation_assignment
+from btwin_core.delegation_engine import (
+    DelegationAssignment,
+    build_delegation_assignment,
+    build_delegation_resume_packet,
+    build_delegation_resume_token,
+    default_phase_participants,
+)
 from btwin_core.delegation_state import DelegationState
 from btwin_core.delegation_store import DelegationStore
 from btwin_core.handoff_archive import get_handoff_record, list_handoff_records, write_handoff_record
@@ -357,19 +363,23 @@ def _delegate_dispatch_content(
     *,
     assignment: DelegationAssignment,
     phase_cycle_state: PhaseCycleState,
+    heading: str = "Delegation Start",
+    human_summary: str | None = None,
 ) -> tuple[str, str]:
     target_role = assignment.target_role or "unassigned"
     resolved_agent = assignment.resolved_agent or "unassigned"
     required_action = assignment.required_action or "continue"
     expected_output = assignment.expected_output or "n/a"
     content = (
-        "## Delegation Start\n\n"
+        f"## {heading}\n\n"
         f"Role: {target_role}\n\n"
         f"Agent: @{resolved_agent}\n\n"
         f"Phase: {phase_cycle_state.phase_name}\n\n"
         f"Action: {required_action}\n\n"
         f"Expected output: {expected_output}\n"
     )
+    if human_summary:
+        content += f"\nHuman input: {human_summary}\n"
     tldr = f"delegate {phase_cycle_state.phase_name} -> {resolved_agent}"
     return content, tldr
 
@@ -394,6 +404,8 @@ def _dispatch_delegate_assignment(
     thread_id: str,
     assignment: DelegationAssignment,
     phase_cycle_state: PhaseCycleState,
+    routing_source: str = "btwin.delegate.start",
+    human_summary: str | None = None,
 ) -> tuple[bool, dict[str, object] | None]:
     if assignment.status != "running" or not assignment.resolved_agent:
         return False, None
@@ -418,6 +430,8 @@ def _dispatch_delegate_assignment(
     content, tldr = _delegate_dispatch_content(
         assignment=assignment,
         phase_cycle_state=phase_cycle_state,
+        heading="Delegation Resume" if human_summary else "Delegation Start",
+        human_summary=human_summary,
     )
     try:
         msg = thread_store.send_message(
@@ -429,7 +443,7 @@ def _dispatch_delegate_assignment(
             msg_type="delegation",
             delivery_mode="direct",
             target_agents=[assignment.resolved_agent],
-            routing_source="btwin.delegate.start",
+            routing_source=routing_source,
             routing_reason="delegate_assignment",
             message_phase=phase_cycle_state.phase_name,
             state_affecting=False,
@@ -501,6 +515,7 @@ def _delegate_start_local(thread_id: str, config: BTwinConfig | None = None) -> 
             thread_id=thread_id,
             assignment=assignment,
             phase_cycle_state=phase_cycle_state,
+            routing_source="btwin.delegate.start",
         )
         if dispatch_violation is not None:
             reason = None
@@ -528,6 +543,174 @@ def _delegate_status_local(thread_id: str, config: BTwinConfig | None = None) ->
         console.print(f"[red]Delegation state for thread not found:[/red] {thread_id}")
         raise typer.Exit(4)
     return state.model_dump(exclude_none=True)
+
+
+def _delegate_wait_local(thread_id: str, config: BTwinConfig | None = None) -> dict[str, object]:
+    current_config = config or _get_config()
+    data_dir = _delegate_local_data_dir(current_config)
+    thread_store = ThreadStore(data_dir / "threads")
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        console.print(f"[red]Thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    state = _get_delegation_store(current_config).read(thread_id)
+    if state is None:
+        console.print(f"[red]Delegation state for thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    protocol_name = thread.get("protocol")
+    protocol_store = ProtocolStore(data_dir / "protocols", fallback_dir=_bundled_protocols_dir())
+    protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+    if protocol is None:
+        console.print(f"[red]Protocol not found for thread:[/red] {protocol_name}")
+        raise typer.Exit(4)
+
+    phase_name = state.current_phase or thread.get("current_phase")
+    wait_thread = dict(thread)
+    if isinstance(phase_name, str) and phase_name:
+        wait_thread["current_phase"] = phase_name
+    contributions = thread_store.list_contributions(thread_id, phase=phase_name if isinstance(phase_name, str) else None)
+    plan = describe_next(wait_thread, protocol, contributions)
+    resume_token = build_delegation_resume_token(state)
+    if state.last_resume_token != resume_token:
+        state = state.model_copy(update={"last_resume_token": resume_token})
+        _get_delegation_store(current_config).write(state)
+    return build_delegation_resume_packet(
+        thread=thread,
+        protocol=protocol,
+        state=state,
+        valid_outcomes=plan.valid_outcomes,
+    )
+
+
+def _delegate_respond_local(
+    thread_id: str,
+    *,
+    outcome: str,
+    summary: str | None = None,
+    resume_token: str | None = None,
+    config: BTwinConfig | None = None,
+) -> dict[str, object]:
+    current_config = config or _get_config()
+    data_dir = _delegate_local_data_dir(current_config)
+    thread_store = ThreadStore(data_dir / "threads")
+    delegation_store = _get_delegation_store(current_config)
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        console.print(f"[red]Thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    state = delegation_store.read(thread_id)
+    if state is None:
+        console.print(f"[red]Delegation state for thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+    if state.status != "waiting_for_human":
+        console.print(f"[red]Delegation is not waiting for human input:[/red] {thread_id}")
+        raise typer.Exit(2)
+
+    expected_resume_token = build_delegation_resume_token(state)
+    if resume_token is not None and resume_token != expected_resume_token:
+        console.print(f"[red]Resume token does not match current delegation state:[/red] {thread_id}")
+        raise typer.Exit(2)
+
+    protocol_name = thread.get("protocol")
+    protocol_store = ProtocolStore(data_dir / "protocols", fallback_dir=_bundled_protocols_dir())
+    protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+    if protocol is None:
+        console.print(f"[red]Protocol not found for thread:[/red] {protocol_name}")
+        raise typer.Exit(4)
+
+    phase_cycle_store = PhaseCycleStore(data_dir)
+    phase_cycle_state = phase_cycle_store.read(thread_id)
+    phase = _resolve_delegate_phase(thread=thread, protocol=protocol, phase_cycle_state=phase_cycle_state)
+    if phase is None:
+        console.print(f"[red]Phase not found for thread:[/red] {thread_id}")
+        raise typer.Exit(4)
+    if phase_cycle_state is None:
+        phase_cycle_state = phase_cycle_store.start_cycle(
+            thread_id=thread_id,
+            phase_name=phase.name,
+            procedure_steps=[step.action for step in phase.procedure or []],
+        )
+
+    plan_thread = dict(thread)
+    current_phase_name = state.current_phase or phase_cycle_state.phase_name
+    if isinstance(current_phase_name, str) and current_phase_name:
+        plan_thread["current_phase"] = current_phase_name
+    contributions = thread_store.list_contributions(thread_id, phase=current_phase_name if isinstance(current_phase_name, str) else None)
+    plan = describe_next(plan_thread, protocol, contributions, outcome=outcome)
+    if plan.error or not plan.passed or plan.suggested_action != "advance_phase" or not plan.next_phase:
+        console.print(f"[red]Outcome cannot be applied to delegation state:[/red] {outcome}")
+        raise typer.Exit(2)
+
+    next_phase = next((item for item in protocol.phases if item.name == plan.next_phase), None)
+    if next_phase is None:
+        console.print(f"[red]Phase not found:[/red] {plan.next_phase}")
+        raise typer.Exit(4)
+
+    updated_thread = thread_store.advance_phase(
+        thread_id,
+        next_phase=plan.next_phase,
+        phase_participants=default_phase_participants(thread, next_phase),
+    )
+    if updated_thread is None:
+        console.print(f"[red]Thread not found or closed:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    transition = advance_phase_cycle(
+        thread=plan_thread,
+        protocol=protocol,
+        current_state=phase_cycle_state,
+        outcome=outcome,
+    )
+    next_cycle_state = phase_cycle_store.write(transition.next_state)
+    next_phase_name = next_cycle_state.phase_name
+    next_phase_def = next((item for item in protocol.phases if item.name == next_phase_name), None)
+    if next_phase_def is None:
+        console.print(f"[red]Phase not found:[/red] {next_phase_name}")
+        raise typer.Exit(4)
+
+    next_assignment_thread = dict(updated_thread)
+    next_assignment_thread["current_phase"] = next_phase_name
+    next_contributions = thread_store.list_contributions(thread_id, phase=next_phase_name)
+    if next_phase_name == current_phase_name and next_cycle_state.cycle_index > phase_cycle_state.cycle_index:
+        next_contributions = []
+    next_assignment = build_delegation_assignment(
+        thread=next_assignment_thread,
+        protocol=protocol,
+        phase_cycle_state=next_cycle_state,
+        role_bindings=_build_delegate_role_bindings(updated_thread, next_phase_def),
+        contributions=next_contributions,
+    )
+
+    next_state = _delegation_state_from_assignment(
+        thread_id=thread_id,
+        phase_cycle_state=next_cycle_state,
+        assignment=next_assignment,
+    ).model_copy(update={"stop_reason": next_assignment.stop_reason, "last_resume_token": None})
+
+    if next_assignment.status == "running":
+        dispatched, dispatch_violation = _dispatch_delegate_assignment(
+            thread_store,
+            thread=updated_thread,
+            protocol=protocol,
+            thread_id=thread_id,
+            assignment=next_assignment,
+            phase_cycle_state=next_cycle_state,
+            routing_source="btwin.delegate.respond",
+            human_summary=summary,
+        )
+        if dispatch_violation is not None:
+            reason = dispatch_violation.get("error") if isinstance(dispatch_violation, dict) else "dispatch_failed"
+            blocked_state = next_state.model_copy(
+                update={"status": "blocked", "reason_blocked": reason or "dispatch_failed", "stop_reason": reason or "dispatch_failed"}
+            )
+            delegation_store.write(blocked_state)
+            return blocked_state.model_dump(exclude_none=True)
+
+    delegation_store.write(next_state)
+    return next_state.model_dump(exclude_none=True)
 
 
 def _append_system_mailbox_report(
@@ -8000,6 +8183,48 @@ def delegate_status(
         payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/delegate/status")
     else:
         payload = _delegate_status_local(thread_id, config)
+    _emit_payload(payload, as_json=as_json)
+
+
+@delegate_app.command("wait")
+def delegate_wait(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Return a resume packet for the current delegation state."""
+    config = _get_config()
+    if _use_attached_api(config):
+        payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/delegate/wait")
+    else:
+        payload = _delegate_wait_local(thread_id, config)
+    _emit_payload(payload, as_json=as_json)
+
+
+@delegate_app.command("respond")
+def delegate_respond(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    outcome: str = typer.Option(..., "--outcome", help="Outcome to apply"),
+    summary: str | None = typer.Option(None, "--summary", help="Optional human summary"),
+    resume_token: str | None = typer.Option(None, "--resume-token", help="Optional resume token from `delegate wait`"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Apply human input and re-enter the delegation loop."""
+    config = _get_config()
+    if _use_attached_api(config):
+        payload_data: dict[str, object] = {"outcome": outcome}
+        if summary is not None:
+            payload_data["summary"] = summary
+        if resume_token is not None:
+            payload_data["resumeToken"] = resume_token
+        payload = _attached_api_call_or_exit(f"/api/threads/{thread_id}/delegate/respond", payload_data)
+    else:
+        payload = _delegate_respond_local(
+            thread_id,
+            outcome=outcome,
+            summary=summary,
+            resume_token=resume_token,
+            config=config,
+        )
     _emit_payload(payload, as_json=as_json)
 
 

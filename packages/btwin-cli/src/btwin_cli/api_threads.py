@@ -11,17 +11,25 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from btwin_core.context_core import ContextCore
-from btwin_core.delegation_engine import DelegationAssignment, build_delegation_assignment
+from btwin_core.delegation_engine import (
+    DelegationAssignment,
+    build_delegation_assignment,
+    build_delegation_resume_packet,
+    build_delegation_resume_token,
+    default_phase_participants,
+)
 from btwin_core.delegation_state import DelegationState
 from btwin_core.delegation_store import DelegationStore
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.locale_settings import LocaleSettingsStore
 from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_engine import (
+    advance_phase_cycle,
     build_phase_cycle_context_core,
 )
 from btwin_core.phase_cycle_store import PhaseCycleStore
 from btwin_core.phase_context import PhaseContextBuilder
+from btwin_core.protocol_flow import describe_next
 from btwin_core.protocol_store import (
     Protocol,
     ProtocolPhase,
@@ -281,19 +289,23 @@ def _delegate_dispatch_content(
     *,
     assignment: DelegationAssignment,
     phase_cycle_state: PhaseCycleState,
+    heading: str = "Delegation Start",
+    human_summary: str | None = None,
 ) -> tuple[str, str]:
     target_role = assignment.target_role or "unassigned"
     resolved_agent = assignment.resolved_agent or "unassigned"
     required_action = assignment.required_action or "continue"
     expected_output = assignment.expected_output or "n/a"
     content = (
-        "## Delegation Start\n\n"
+        f"## {heading}\n\n"
         f"Role: {target_role}\n\n"
         f"Agent: @{resolved_agent}\n\n"
         f"Phase: {phase_cycle_state.phase_name}\n\n"
         f"Action: {required_action}\n\n"
         f"Expected output: {expected_output}\n"
     )
+    if human_summary:
+        content += f"\nHuman input: {human_summary}\n"
     tldr = f"delegate {phase_cycle_state.phase_name} -> {resolved_agent}"
     return content, tldr
 
@@ -318,6 +330,8 @@ def _dispatch_delegate_assignment(
     thread_id: str,
     assignment: DelegationAssignment,
     phase_cycle_state: PhaseCycleState,
+    routing_source: str = "btwin.delegate.start",
+    human_summary: str | None = None,
 ) -> tuple[bool, Any | None]:
     if assignment.status != "running" or not assignment.resolved_agent:
         return False, None
@@ -343,6 +357,8 @@ def _dispatch_delegate_assignment(
     content, tldr = _delegate_dispatch_content(
         assignment=assignment,
         phase_cycle_state=phase_cycle_state,
+        heading="Delegation Resume" if human_summary else "Delegation Start",
+        human_summary=human_summary,
     )
     try:
         msg = thread_store.send_message(
@@ -354,7 +370,7 @@ def _dispatch_delegate_assignment(
             msg_type="delegation",
             delivery_mode="direct",
             target_agents=[assignment.resolved_agent],
-            routing_source="btwin.delegate.start",
+            routing_source=routing_source,
             routing_reason="delegate_assignment",
             message_phase=phase_cycle_state.phase_name,
             state_affecting=False,
@@ -453,6 +469,13 @@ class ContributionSubmitRequest(BaseModel):
 class AdvancePhaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     next_phase: str = Field(alias="nextPhase")
+
+
+class DelegateRespondRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    outcome: str
+    summary: str | None = None
+    resume_token: str | None = Field(default=None, alias="resumeToken")
 
 
 class SpawnAgentRequest(BaseModel):
@@ -831,6 +854,169 @@ def create_threads_router(
         if state is None:
             raise HTTPException(status_code=404, detail=f"Delegation state for thread '{thread_id}' not found")
         return state.model_dump(exclude_none=True)
+
+    @router.get("/api/threads/{thread_id}/delegate/wait")
+    def get_delegate_wait(thread_id: str):
+        thread = thread_store.get_thread(thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+
+        state = delegation_store.read(thread_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"Delegation state for thread '{thread_id}' not found")
+
+        protocol_name = thread.get("protocol")
+        protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+        if protocol is None:
+            raise HTTPException(status_code=404, detail=f"Protocol '{protocol_name}' not found")
+
+        phase_name = state.current_phase or thread.get("current_phase")
+        wait_thread = dict(thread)
+        if isinstance(phase_name, str) and phase_name:
+            wait_thread["current_phase"] = phase_name
+        contributions = thread_store.list_contributions(
+            thread_id,
+            phase=phase_name if isinstance(phase_name, str) else None,
+        )
+        plan = describe_next(wait_thread, protocol, contributions)
+        resume_token = build_delegation_resume_token(state)
+        if state.last_resume_token != resume_token:
+            state = state.model_copy(update={"last_resume_token": resume_token})
+            delegation_store.write(state)
+        return build_delegation_resume_packet(
+            thread=thread,
+            protocol=protocol,
+            state=state,
+            valid_outcomes=plan.valid_outcomes,
+        )
+
+    @router.post("/api/threads/{thread_id}/delegate/respond")
+    def respond_delegate(thread_id: str, req: DelegateRespondRequest):
+        thread = thread_store.get_thread(thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+
+        state = delegation_store.read(thread_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"Delegation state for thread '{thread_id}' not found")
+        if state.status != "waiting_for_human":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "delegation_not_waiting_for_human",
+                    "status": state.status,
+                    "required_action": state.required_action,
+                },
+            )
+
+        expected_resume_token = build_delegation_resume_token(state)
+        if req.resume_token is not None and req.resume_token != expected_resume_token:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "stale_resume_token", "expected": expected_resume_token},
+            )
+
+        protocol_name = thread.get("protocol")
+        protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+        if protocol is None:
+            raise HTTPException(status_code=404, detail=f"Protocol '{protocol_name}' not found")
+
+        phase_cycle_state = phase_cycle_store.read(thread_id)
+        phase = _resolve_delegate_phase(thread=thread, protocol=protocol, phase_cycle_state=phase_cycle_state)
+        if phase is None:
+            raise HTTPException(status_code=409, detail={"error": "phase_not_found"})
+        if phase_cycle_state is None:
+            phase_cycle_state = phase_cycle_store.start_cycle(
+                thread_id=thread_id,
+                phase_name=phase.name,
+                procedure_steps=[step.action for step in phase.procedure or []],
+            )
+
+        plan_thread = dict(thread)
+        current_phase_name = state.current_phase or phase_cycle_state.phase_name
+        if isinstance(current_phase_name, str) and current_phase_name:
+            plan_thread["current_phase"] = current_phase_name
+        contributions = thread_store.list_contributions(
+            thread_id,
+            phase=current_phase_name if isinstance(current_phase_name, str) else None,
+        )
+        plan = describe_next(plan_thread, protocol, contributions, outcome=req.outcome)
+        if plan.error or not plan.passed or plan.suggested_action != "advance_phase" or not plan.next_phase:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": plan.error or "outcome_not_applicable",
+                    "passed": plan.passed,
+                    "missing": plan.missing,
+                    "requested_outcome": plan.requested_outcome,
+                    "valid_outcomes": plan.valid_outcomes,
+                    "suggested_action": plan.suggested_action,
+                },
+            )
+
+        next_phase = next((item for item in protocol.phases if item.name == plan.next_phase), None)
+        if next_phase is None:
+            raise HTTPException(status_code=409, detail={"error": "next_phase_not_found", "next_phase": plan.next_phase})
+
+        updated_thread = thread_store.advance_phase(
+            thread_id,
+            next_phase=plan.next_phase,
+            phase_participants=default_phase_participants(thread, next_phase),
+        )
+        if updated_thread is None:
+            raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found or closed")
+
+        transition = advance_phase_cycle(
+            thread=plan_thread,
+            protocol=protocol,
+            current_state=phase_cycle_state,
+            outcome=req.outcome,
+        )
+        next_cycle_state = phase_cycle_store.write(transition.next_state)
+        next_phase_name = next_cycle_state.phase_name
+        next_phase_def = next((item for item in protocol.phases if item.name == next_phase_name), None)
+        if next_phase_def is None:
+            raise HTTPException(status_code=409, detail={"error": "phase_not_found", "phase": next_phase_name})
+
+        next_assignment_thread = dict(updated_thread)
+        next_assignment_thread["current_phase"] = next_phase_name
+        next_contributions = thread_store.list_contributions(thread_id, phase=next_phase_name)
+        if next_phase_name == current_phase_name and next_cycle_state.cycle_index > phase_cycle_state.cycle_index:
+            next_contributions = []
+        next_assignment = build_delegation_assignment(
+            thread=next_assignment_thread,
+            protocol=protocol,
+            phase_cycle_state=next_cycle_state,
+            role_bindings=_build_delegate_role_bindings(updated_thread, next_phase_def),
+            contributions=next_contributions,
+        )
+        next_state = _delegation_state_from_assignment(
+            thread_id=thread_id,
+            phase_cycle_state=next_cycle_state,
+            assignment=next_assignment,
+        ).model_copy(update={"stop_reason": next_assignment.stop_reason, "last_resume_token": None})
+
+        if next_assignment.status == "running":
+            dispatched, dispatch_violation = _dispatch_delegate_assignment(
+                thread_store,
+                thread=updated_thread,
+                protocol=protocol,
+                thread_id=thread_id,
+                assignment=next_assignment,
+                phase_cycle_state=next_cycle_state,
+                routing_source="btwin.delegate.respond",
+                human_summary=req.summary,
+            )
+            if dispatch_violation is not None:
+                reason = dispatch_violation.get("error") if isinstance(dispatch_violation, dict) else "dispatch_failed"
+                blocked_state = next_state.model_copy(
+                    update={"status": "blocked", "reason_blocked": reason or "dispatch_failed", "stop_reason": reason or "dispatch_failed"}
+                )
+                delegation_store.write(blocked_state)
+                raise HTTPException(status_code=409, detail=blocked_state.model_dump(exclude_none=True))
+
+        delegation_store.write(next_state)
+        return next_state.model_dump(exclude_none=True)
 
     @router.post("/api/threads/{thread_id}/contributions")
     async def submit_contribution(thread_id: str, req: ContributionSubmitRequest):

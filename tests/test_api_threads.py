@@ -3,6 +3,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from btwin_cli.api_threads import create_threads_router
+from btwin_core.delegation_state import DelegationState
+from btwin_core.delegation_store import DelegationStore
 from btwin_core.event_bus import EventBus
 from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_store import PhaseCycleStore
@@ -86,6 +88,86 @@ class _FakeAgentRunner:
             "reused_session": False,
             "resumed_from_state": False,
         }
+
+
+def _seed_waiting_delegate_thread(tmp_path: Path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-wait",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute", "review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "outcome_policy": "review-outcomes",
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    },
+                    {
+                        "name": "followup",
+                        "actions": ["contribute", "review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "implementer", "action": "revise", "alias": "Revise"},
+                        ],
+                    },
+                ],
+                "outcome_policies": [
+                    {
+                        "name": "review-outcomes",
+                        "emitters": ["reviewer", "user"],
+                        "actions": ["decide"],
+                        "outcomes": ["retry", "accept"],
+                    }
+                ],
+                "transitions": [
+                    {"from": "review", "on": "retry", "to": "review", "alias": "Retry"},
+                    {"from": "review", "on": "accept", "to": "followup", "alias": "Accept"},
+                ],
+            }
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="Delegate wait thread",
+        protocol="delegate-wait",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+    thread_store.submit_contribution(
+        thread["thread_id"],
+        "alice",
+        "review",
+        content="## Completed\n\nInitial review finished.",
+        tldr="review done",
+    )
+    DelegationStore(thread_store.data_dir).write(
+        DelegationState(
+            thread_id=thread["thread_id"],
+            status="waiting_for_human",
+            updated_at="2026-04-20T00:00:00Z",
+            loop_iteration=1,
+            current_phase="review",
+            current_cycle_index=1,
+            target_role="reviewer",
+            resolved_agent="alice",
+            required_action="record_outcome",
+            expected_output="record outcome: retry, accept",
+            stop_reason="human_outcome_required",
+        )
+    )
+    return thread_store, protocol_store, event_bus, thread
 
 
 def test_threads_router_exposes_agent_inbox_and_agent_status(tmp_path):
@@ -206,6 +288,61 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
     status_response = client.get(f"/api/threads/{thread['thread_id']}/delegate/status")
     assert status_response.status_code == 200
     assert status_response.json() == second_payload
+
+
+def test_delegate_wait_returns_resume_packet(tmp_path):
+    thread_store, protocol_store, event_bus, thread = _seed_waiting_delegate_thread(tmp_path)
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.get(f"/api/threads/{thread['thread_id']}/delegate/wait")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "waiting_for_human"
+    assert payload["thread"]["alias"] == thread["thread_id"]
+    assert payload["protocol"]["phase"] == "review"
+    assert payload["resume"]["target_role"] == "reviewer"
+    assert payload["resume"]["resolved_agent"] == "alice"
+    assert payload["resume"]["required_action"] == "record_outcome"
+    assert payload["resume"]["why_now"] == "phase requirements are met and a human outcome is required to continue"
+    assert payload["resume"]["token"]
+    assert "delegate respond" in payload["resume"]["suggested_next_command"]
+
+
+def test_delegate_respond_reenters_loop_after_human_outcome(tmp_path):
+    thread_store, protocol_store, event_bus, thread = _seed_waiting_delegate_thread(tmp_path)
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/delegate/respond",
+        json={"outcome": "retry", "summary": "Need one more review pass."},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["current_phase"] == "review"
+    assert payload["current_cycle_index"] == 2
+    assert payload["loop_iteration"] == 2
+    assert payload["resolved_agent"] == "alice"
+
+    status_response = client.get(f"/api/threads/{thread['thread_id']}/delegate/status")
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "running"
+
+    inbox = thread_store.list_inbox(thread["thread_id"], "alice")
+    assert len(inbox) == 1
+    assert "Need one more review pass." in inbox[0]["_content"]
 
 
 def test_delegate_status_returns_blocked_reason_when_target_role_missing(tmp_path):

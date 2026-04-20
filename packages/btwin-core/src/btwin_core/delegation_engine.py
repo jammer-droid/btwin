@@ -191,3 +191,96 @@ def _manual_outcome_output(phase, next_plan: ProtocolNextPlan) -> str:
 
 def _fallback_expected_output(phase_name: str) -> str:
     return f"{phase_name} contribution"
+
+
+def build_delegation_resume_token(state) -> str:
+    if state.last_resume_token:
+        return state.last_resume_token
+    return ":".join(
+        [
+            "delegate",
+            state.thread_id,
+            state.current_phase or "",
+            str(state.current_cycle_index),
+            str(state.loop_iteration),
+            state.required_action or "",
+            state.last_result_message_id or "",
+        ]
+    )
+
+
+def build_delegation_resume_packet(
+    *,
+    thread: dict[str, object],
+    protocol: Protocol,
+    state,
+    valid_outcomes: list[str] | None = None,
+) -> dict[str, object]:
+    thread_id = str(thread.get("thread_id") or state.thread_id)
+    thread_alias = thread.get("alias")
+    if not isinstance(thread_alias, str) or not thread_alias.strip():
+        thread_alias = thread_id
+
+    resume = {
+        "token": build_delegation_resume_token(state),
+        "target_role": state.target_role,
+        "resolved_agent": state.resolved_agent,
+        "required_action": state.required_action,
+        "expected_output": state.expected_output,
+        "why_now": _why_now(state),
+        "suggested_next_command": _suggested_next_command(
+            thread_id=thread_id,
+            status=state.status,
+            required_action=state.required_action,
+            valid_outcomes=valid_outcomes or [],
+        ),
+    }
+    if valid_outcomes:
+        resume["valid_outcomes"] = list(valid_outcomes)
+    if state.reason_blocked:
+        resume["reason_blocked"] = state.reason_blocked
+
+    payload = {
+        "status": state.status,
+        "thread": {
+            "id": thread_id,
+            "alias": thread_alias,
+            "topic": thread.get("topic"),
+        },
+        "protocol": {
+            "name": protocol.name,
+            "phase": state.current_phase,
+        },
+        "resume": resume,
+    }
+    if state.reason_blocked:
+        payload["reason_blocked"] = state.reason_blocked
+    return payload
+
+
+def _why_now(state) -> str:
+    if state.status == "waiting_for_human" and state.required_action == "record_outcome":
+        return "phase requirements are met and a human outcome is required to continue"
+    if state.status == "blocked":
+        reason = state.reason_blocked or state.stop_reason or "unknown"
+        return f"delegation is blocked: {reason}"
+    if state.status == "running":
+        return "delegation is currently assigned to the helper"
+    if state.status == "completed":
+        return "delegation finished for the current thread state"
+    return "delegation is paused and awaiting the next operator action"
+
+
+def _suggested_next_command(
+    *,
+    thread_id: str,
+    status: str,
+    required_action: str | None,
+    valid_outcomes: list[str],
+) -> str:
+    if status == "waiting_for_human" and required_action == "record_outcome":
+        if valid_outcomes:
+            options = "|".join(valid_outcomes)
+            return f"btwin delegate respond --thread {thread_id} --outcome <{options}>"
+        return f"btwin delegate respond --thread {thread_id} --outcome <outcome>"
+    return f"btwin delegate status --thread {thread_id}"
