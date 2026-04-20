@@ -173,6 +173,15 @@ def resolve_phase_cycle_current_step_index(
     return _resolve_step_index_from_labels(state.procedure_steps, state)
 
 
+def resolve_phase_cycle_current_step(
+    phase: ProtocolPhase | None,
+    state: PhaseCycleState,
+) -> ProtocolProcedureStep | None:
+    if phase is None:
+        return None
+    return _current_step(phase, state)
+
+
 def phase_cycle_procedure_actions(phase: ProtocolPhase) -> list[str]:
     if not phase.procedure:
         return []

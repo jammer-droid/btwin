@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from btwin_core.protocol_store import Protocol, ensure_protocol_compiled
+from btwin_core.protocol_store import Protocol, ProtocolPhase, ensure_protocol_compiled
 from btwin_core.protocol_validator import ProtocolValidator
 
 ProtocolSuggestedAction = Literal["submit_contribution", "advance_phase", "record_outcome", "close_thread"]
@@ -38,9 +38,7 @@ class ProtocolNextPlan(BaseModel):
 def resolve_phase_runtime_metadata(
     protocol: Protocol, phase_name: str | None
 ) -> tuple[str | None, list[str], str | None, list[str], list[str], list[str]]:
-    if not phase_name:
-        return None, [], None, [], [], []
-    phase = next((item for item in protocol.phases if item.name == phase_name), None)
+    phase = resolve_protocol_phase(protocol, phase_name)
     if phase is None:
         return None, [], None, [], [], []
     return (
@@ -51,6 +49,12 @@ def resolve_phase_runtime_metadata(
         list(phase.outcome_actions),
         list(phase.policy_outcomes),
     )
+
+
+def resolve_protocol_phase(protocol: Protocol, phase_name: str | None) -> ProtocolPhase | None:
+    if not phase_name:
+        return None
+    return next((item for item in protocol.phases if item.name == phase_name), None)
 
 
 def _guard_note(*, guard_set: str | None, declared_guards: list[str]) -> str:
@@ -127,7 +131,7 @@ def describe_next(
             requested_outcome=outcome,
         )
 
-    phase = next((item for item in protocol.phases if item.name == current_phase), None)
+    phase = resolve_protocol_phase(protocol, current_phase)
     if phase is None:
         return ProtocolNextPlan(
             thread_id=thread_id,
