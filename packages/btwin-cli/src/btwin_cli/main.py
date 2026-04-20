@@ -2741,6 +2741,8 @@ def _hud_key_from_bytes(data: bytes) -> str | None:
     if not data:
         return None
     text = data.decode(errors="ignore")
+    if text == "J":
+        return "latest"
     if text.startswith("\x1b[A"):
         return "up"
     if text.startswith("\x1b[B"):
@@ -3500,11 +3502,13 @@ def _render_hud_live_trace_renderable(
             config=config,
         )
 
-    trace_payload = _thread_watch_payload(
-        thread,
-        status_summary,
-        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
-    )
+    trace_payload = snapshot.get("trace_payload") if isinstance(snapshot, dict) and snapshot.get("selected_thread_id") == state.selected_thread_id else None
+    if not isinstance(trace_payload, dict):
+        trace_payload = _thread_watch_payload(
+            thread,
+            status_summary,
+            _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+        )
     trace_rows = trace_payload["trace"]
     display_rows = [row for row in reversed(trace_rows) if isinstance(row, dict)]
     total_rows = len(display_rows)
@@ -3615,7 +3619,7 @@ def _render_hud_live_trace_renderable(
     return _render_hud_shell_renderable(
         "Live Trace",
         body,
-        "j/k select  J latest  [D] detail  [T] threads  [:] cmd",
+        "j/k scroll  J latest  [D] detail  [T] threads  [:] cmd",
         config=config,
     )
 
@@ -4063,33 +4067,19 @@ def _apply_hud_key(
                 status_summary,
                 _workflow_event_log(state.selected_thread_id).list_events(limit=10),
             )
-            runtime_sessions = {
-                agent_name: session
-                for agent_name, session in _runtime_sessions_for_thread(state.selected_thread_id, config)
-            }
-            mailbox_reports = _list_system_mailbox_reports(
-                thread_id=state.selected_thread_id,
-                limit=10,
-                config=config,
-            )
-            body_lines = _render_hud_live_trace_body(
-                thread,
-                status_summary,
-                trace_payload["trace"],
-                runtime_sessions,
-                len(mailbox_reports),
-            )
-            window_size = _hud_thread_view_window_size()
-            max_offset = max(0, len(body_lines) - window_size)
+            trace_rows = trace_payload.get("trace", []) if isinstance(trace_payload, dict) else []
+            display_rows = [row for row in reversed(trace_rows) if isinstance(row, dict)]
+            table_window = max(_hud_thread_view_window_size() - 10, 5)
+            max_offset = max(0, len(display_rows) - table_window)
             if key == "up":
                 state.thread_log_offset = max(0, state.thread_log_offset - 1)
             elif key == "down":
                 state.thread_log_offset = min(max_offset, state.thread_log_offset + 1)
             elif key == "page_up":
-                state.thread_log_offset = max(0, state.thread_log_offset - window_size)
+                state.thread_log_offset = max(0, state.thread_log_offset - table_window)
             elif key == "page_down":
-                state.thread_log_offset = min(max_offset, state.thread_log_offset + window_size)
-            elif key == "home":
+                state.thread_log_offset = min(max_offset, state.thread_log_offset + table_window)
+            elif key in {"home", "latest"}:
                 state.thread_log_offset = 0
             elif key == "end":
                 state.thread_log_offset = max_offset

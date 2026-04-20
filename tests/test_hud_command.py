@@ -2061,6 +2061,172 @@ def test_hud_live_trace_view_uses_wireframe_sections_and_inspector(monkeypatch, 
     assert "Sessions  jun=waiting(app-server)  ari=joined(app-server)" in rendered
 
 
+def test_hud_live_trace_renderable_uses_vertical_live_surface(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="live", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+
+    renderable = main._render_hud_live_trace_renderable(
+        state,
+        limit=5,
+        animation_phase=0,
+        snapshot={
+            "selected_thread_id": "thread-1",
+            "thread": {
+                "thread_id": "thread-1",
+                "topic": "Design Review",
+                "protocol": "review-loop",
+                "current_phase": "review",
+            },
+            "status_summary": {"agents": [{"name": "jun", "status": "waiting"}]},
+            "lookup_error": None,
+            "trace_payload": {
+                "trace": [
+                    {
+                        "timestamp": "2026-04-19T12:04:28Z",
+                        "kind": "result",
+                        "phase": "review",
+                        "agent": "jun",
+                        "summary": "LGTM with small nits",
+                    },
+                    {
+                        "timestamp": "2026-04-19T12:03:55Z",
+                        "kind": "gate",
+                        "phase": "review",
+                        "gate_alias": "Retry Gate",
+                        "gate_key": "retry-loop",
+                        "target_phase": "review",
+                        "outcome": "retry",
+                        "summary": "Retry loop completed.",
+                    },
+                ]
+            },
+        },
+    )
+
+    rendered = _renderable_to_text(renderable, width=160)
+
+    assert "Live Trace" in rendered
+    assert "Live Trace / Diagnostics" not in rendered
+    assert "Events" in rendered
+    assert "Row detail" in rendered
+    assert "No trace rows" not in rendered
+    assert "raw:" not in rendered
+    assert "Sessions" not in rendered
+
+
+def test_hud_live_trace_renderable_reuses_snapshot_trace_payload(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="live", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("snapshot trace payload should be reused")),
+    )
+
+    renderable = main._render_hud_live_trace_renderable(
+        state,
+        limit=5,
+        animation_phase=0,
+        snapshot={
+            "selected_thread_id": "thread-1",
+            "thread": {
+                "thread_id": "thread-1",
+                "topic": "Trace thread",
+                "protocol": "debate",
+                "current_phase": "review",
+            },
+            "status_summary": {"agents": []},
+            "lookup_error": None,
+            "trace_payload": {
+                "trace": [
+                    {
+                        "timestamp": "2026-04-19T04:07:27Z",
+                        "kind": "gate",
+                        "phase": "review",
+                        "gate_alias": "Retry Gate",
+                        "gate_key": "retry-loop",
+                        "target_phase": "review",
+                        "outcome": "retry",
+                        "summary": "Retry loop completed.",
+                    }
+                ]
+            },
+        },
+    )
+
+    rendered = _renderable_to_text(renderable, width=160)
+    assert "Retry loop completed." in rendered
+
+
+def test_hud_live_trace_footer_and_latest_key_match_scroll_behavior(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="live", selected_thread_id="thread-1", thread_log_offset=3)
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Trace thread",
+                "protocol": "debate",
+                "current_phase": "review",
+            },
+            {"agents": []},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_workflow_event_log",
+        lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
+    )
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "trace": [
+                {
+                    "timestamp": f"2026-04-19T04:07:{index:02d}Z",
+                    "kind": "result",
+                    "phase": "review",
+                    "agent": "jun",
+                    "summary": f"row {index}",
+                }
+                for index in range(12)
+            ]
+        },
+    )
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 12)
+
+    rendered = _renderable_to_text(
+        main._render_hud_live_trace_renderable(state, limit=12, animation_phase=0),
+        width=160,
+    )
+
+    assert "j/k scroll  J latest" in rendered
+    assert main._hud_key_from_bytes(b"J") == "latest"
+    assert main._apply_hud_key(state, "latest", config) is False
+    assert state.thread_log_offset == 0
+
+
 def test_hud_thread_detail_view_uses_shared_tui_chrome(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
