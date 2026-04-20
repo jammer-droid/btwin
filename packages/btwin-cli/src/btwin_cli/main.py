@@ -1410,6 +1410,7 @@ def _detail_progression_line(items: list[tuple[str, bool]]) -> str:
 _THREAD_DETAIL_LABEL_WIDTH = 9
 _THREAD_DETAIL_LABEL_GAP = "  "
 _VALIDATION_HEADER_LABEL_WIDTH = 10
+_WORKFLOW_CONTEXT_PANEL_TITLE = "Workflow Context"
 
 
 def _detail_summary_prefix(label: str) -> str:
@@ -3265,8 +3266,6 @@ def _render_hud_thread_detail_renderable(
     ).splitlines()
     intro_lines, sections = _parse_hud_sections(detail_lines)
     section_map = {title: lines for title, lines in sections}
-    protocol_title = str(thread.get("protocol") or "Thread Detail")
-
     activity_lines = section_map.get("Recent Activity", ["No recent workflow events"])
     visible_activity = activity_lines
     if activity_lines and state.thread_log_offset:
@@ -3305,7 +3304,7 @@ def _render_hud_thread_detail_renderable(
     body.split_column(
         Layout(
             _hud_panel(
-                protocol_title,
+                _WORKFLOW_CONTEXT_PANEL_TITLE,
                 header_rows,
                 border_style="bright_blue",
             ),
@@ -3447,7 +3446,7 @@ def _render_hud_validation_focus_renderable(
     body_sections: list[Layout] = [
         Layout(
             _hud_panel(
-                "Validation",
+                _WORKFLOW_CONTEXT_PANEL_TITLE,
                 context_rows,
                 border_style="bright_blue",
             ),

@@ -3123,7 +3123,7 @@ def test_hud_validation_focus_section_contract(monkeypatch, tmp_path):
             if line.startswith("╭") and title in line
         )
 
-    assert panel_index("Validation") < panel_index("Rule Compliance")
+    assert panel_index("Workflow Context") < panel_index("Rule Compliance")
     assert "PASS" in rendered
     assert "all checks aligned" in rendered
     assert "Protocol match" in rendered
