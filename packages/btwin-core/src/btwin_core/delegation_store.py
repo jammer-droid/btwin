@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 from pydantic import ValidationError
 
 from btwin_core.delegation_state import DelegationState
+
+_ENTRY_KIND_STATE: Literal["state"] = "state"
+_ENTRY_KIND_DELETED: Literal["deleted"] = "deleted"
 
 
 class DelegationStore:
@@ -19,9 +23,11 @@ class DelegationStore:
         if not self.file_path.exists():
             return None
 
-        for state in reversed(self._read_states()):
-            if state.thread_id == thread_id:
-                return state
+        for kind, payload in reversed(self._read_entries()):
+            if kind == _ENTRY_KIND_DELETED and payload == thread_id:
+                return None
+            if kind == _ENTRY_KIND_STATE and payload.thread_id == thread_id:
+                return payload
         return None
 
     def write(self, state: DelegationState) -> DelegationState:
@@ -34,51 +40,42 @@ class DelegationStore:
         states: list[DelegationState] = []
         seen_thread_ids: set[str] = set()
 
-        for state in reversed(self._read_states()):
-            if state.thread_id in seen_thread_ids:
+        for kind, payload in reversed(self._read_entries()):
+            thread_id = payload if kind == _ENTRY_KIND_DELETED else payload.thread_id
+            if thread_id in seen_thread_ids:
                 continue
-            seen_thread_ids.add(state.thread_id)
-            states.append(state)
+            seen_thread_ids.add(thread_id)
+            if kind == _ENTRY_KIND_STATE:
+                states.append(payload)
 
         return states
 
     def delete(self, thread_id: str) -> bool:
-        if not self.file_path.exists():
+        if self.read(thread_id) is None:
             return False
 
-        kept_lines: list[str] = []
-        deleted = False
-        for line in self.file_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                kept_lines.append(line)
-                continue
-            if isinstance(payload, dict) and payload.get("thread_id") == thread_id:
-                deleted = True
-                continue
-            kept_lines.append(line)
-
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        rewritten = "\n".join(kept_lines)
-        if rewritten:
-            rewritten += "\n"
-        self.file_path.write_text(rewritten, encoding="utf-8")
-        return deleted
+        tombstone = json.dumps({"thread_id": thread_id, "deleted": True}, ensure_ascii=False, sort_keys=True)
+        with self.file_path.open("a", encoding="utf-8") as handle:
+            handle.write(tombstone + "\n")
+        return True
 
-    def _read_states(self) -> list[DelegationState]:
+    def _read_entries(self) -> list[tuple[Literal["state", "deleted"], DelegationState | str]]:
         if not self.file_path.exists():
             return []
 
-        states: list[DelegationState] = []
+        entries: list[tuple[Literal["state", "deleted"], DelegationState | str]] = []
         for line in self.file_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
-                states.append(DelegationState.model_validate(payload))
+                if isinstance(payload, dict) and payload.get("deleted") is True:
+                    thread_id = payload.get("thread_id")
+                    if isinstance(thread_id, str) and thread_id:
+                        entries.append((_ENTRY_KIND_DELETED, thread_id))
+                    continue
+                entries.append((_ENTRY_KIND_STATE, DelegationState.model_validate(payload)))
             except (json.JSONDecodeError, ValidationError):
                 continue
-        return states
+        return entries
