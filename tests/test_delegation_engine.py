@@ -127,3 +127,40 @@ def test_build_delegation_assignment_marks_completed_when_no_next_work_remains()
 
     assert assignment.status == "completed"
     assert assignment.required_action == "close_thread"
+
+
+def test_build_delegation_assignment_blocks_when_runtime_recovery_has_failed():
+    assignment = build_delegation_assignment(
+        thread=_review_thread(),
+        protocol=_review_protocol(),
+        phase_cycle_state=_review_cycle_state(),
+        role_bindings={"reviewer": "alice"},
+        runtime_session={
+            "degraded": True,
+            "recoverable": False,
+            "recovery_pending": False,
+        },
+    )
+
+    assert assignment.status == "blocked"
+    assert assignment.target_role == "reviewer"
+    assert assignment.resolved_agent == "alice"
+    assert assignment.reason_blocked == "failed_recovery"
+    assert assignment.stop_reason == "failed_recovery"
+
+
+def test_build_delegation_assignment_fails_when_loop_iteration_exceeds_cap():
+    assignment = build_delegation_assignment(
+        thread=_review_thread(),
+        protocol=_review_protocol(),
+        phase_cycle_state=_review_cycle_state(),
+        role_bindings={"reviewer": "alice"},
+        loop_iteration=2,
+        max_auto_iterations=1,
+    )
+
+    assert assignment.status == "failed"
+    assert assignment.target_role == "reviewer"
+    assert assignment.resolved_agent == "alice"
+    assert assignment.required_action == "submit_contribution"
+    assert assignment.stop_reason == "max_auto_iterations_reached"

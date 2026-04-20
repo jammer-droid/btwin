@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pydantic import BaseModel, ConfigDict
 
 from btwin_core.delegation_state import DelegationStatus
@@ -9,6 +11,8 @@ from btwin_core.phase_cycle import PhaseCycleState
 from btwin_core.phase_cycle_engine import build_phase_cycle_context_core, resolve_phase_cycle_current_step
 from btwin_core.protocol_flow import ProtocolNextPlan, describe_next, resolve_protocol_phase
 from btwin_core.protocol_store import Protocol, ensure_protocol_compiled
+
+DEFAULT_MAX_AUTO_ITERATIONS = 5
 
 
 class DelegationAssignment(BaseModel):
@@ -31,6 +35,9 @@ def build_delegation_assignment(
     phase_cycle_state: PhaseCycleState,
     role_bindings: dict[str, str] | None = None,
     contributions: list[dict[str, object]] | None = None,
+    runtime_session: Mapping[str, object] | None = None,
+    loop_iteration: int | None = None,
+    max_auto_iterations: int = DEFAULT_MAX_AUTO_ITERATIONS,
 ) -> DelegationAssignment:
     compiled_protocol = ensure_protocol_compiled(protocol)
     current_phase = _current_phase_name(thread, phase_cycle_state)
@@ -110,6 +117,30 @@ def build_delegation_assignment(
             expected_output=expected_output,
             reason_blocked="missing_role_binding",
             stop_reason="missing_role_binding",
+        )
+    if _runtime_recovery_failed(runtime_session):
+        return DelegationAssignment(
+            status="blocked",
+            next_phase=next_plan.next_phase,
+            target_role=target_role,
+            resolved_agent=resolved_agent,
+            required_action=next_plan.suggested_action,
+            expected_output=expected_output,
+            reason_blocked="failed_recovery",
+            stop_reason="failed_recovery",
+        )
+    if _loop_iteration_limit_reached(
+        loop_iteration=loop_iteration,
+        max_auto_iterations=max_auto_iterations,
+    ):
+        return DelegationAssignment(
+            status="failed",
+            next_phase=next_plan.next_phase,
+            target_role=target_role,
+            resolved_agent=resolved_agent,
+            required_action=next_plan.suggested_action,
+            expected_output=expected_output,
+            stop_reason="max_auto_iterations_reached",
         )
 
     return DelegationAssignment(
@@ -191,6 +222,22 @@ def _manual_outcome_output(phase, next_plan: ProtocolNextPlan) -> str:
 
 def _fallback_expected_output(phase_name: str) -> str:
     return f"{phase_name} contribution"
+
+
+def _runtime_recovery_failed(runtime_session: Mapping[str, object] | None) -> bool:
+    if runtime_session is None:
+        return False
+    return bool(runtime_session.get("degraded")) and not bool(runtime_session.get("recoverable")) and not bool(
+        runtime_session.get("recovery_pending")
+    )
+
+
+def _loop_iteration_limit_reached(*, loop_iteration: int | None, max_auto_iterations: int) -> bool:
+    if loop_iteration is None:
+        return False
+    if max_auto_iterations <= 0:
+        return False
+    return loop_iteration > max_auto_iterations
 
 
 def build_delegation_resume_token(state) -> str:

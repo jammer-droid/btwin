@@ -283,3 +283,162 @@ def test_duplicate_result_message_id_is_not_reprocessed(tmp_path: Path) -> None:
 
     review_contributions = thread_store.list_contributions(thread["thread_id"], phase="review")
     assert len(review_contributions) == 1
+
+
+def test_helper_result_blocks_when_runtime_recovery_has_failed(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    runner, thread_store, protocol_store, delegation_store, phase_cycle_store = _build_runner(data_dir)
+
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-followup",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [{"role": "reviewer", "action": "review", "alias": "Review"}],
+                    },
+                    {
+                        "name": "followup",
+                        "actions": ["review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [{"role": "reviewer", "action": "review", "alias": "Follow Up"}],
+                    },
+                ],
+            }
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="Failed recovery thread",
+        protocol="delegate-followup",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    phase_cycle_store.write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+    _seed_running_delegation(delegation_store, thread_id=thread["thread_id"])
+    session = runner._session_supervisor.ensure_session_nowait(
+        thread["thread_id"],
+        "alice",
+        provider="codex",
+    )
+    session.degraded = True
+    session.recoverable = False
+    session.recovery_pending = False
+
+    runner._persist_invocation_outputs(
+        thread["thread_id"],
+        "alice",
+        InvocationResult(
+            ok=True,
+            outputs=(
+                RuntimeOutput(
+                    content="## completed\nReview is complete.\n",
+                    phase="final_answer",
+                    state_affecting=True,
+                ),
+            ),
+        ),
+        chain_depth=1,
+    )
+
+    state = delegation_store.read(thread["thread_id"])
+    assert state is not None
+    assert state.status == "blocked"
+    assert state.reason_blocked == "failed_recovery"
+    assert state.stop_reason == "failed_recovery"
+
+    delegation_messages = [
+        message
+        for message in thread_store.list_messages(thread["thread_id"])
+        if message.get("msg_type") == "delegation"
+    ]
+    assert delegation_messages == []
+
+
+def test_helper_result_fails_when_auto_iteration_cap_is_exceeded(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    runner, thread_store, protocol_store, delegation_store, phase_cycle_store = _build_runner(data_dir)
+
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-followup",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [{"role": "reviewer", "action": "review", "alias": "Review"}],
+                    },
+                    {
+                        "name": "followup",
+                        "actions": ["review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [{"role": "reviewer", "action": "review", "alias": "Follow Up"}],
+                    },
+                ],
+            }
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="Iteration cap thread",
+        protocol="delegate-followup",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    phase_cycle_store.write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+    delegation_store.write(
+        DelegationState(
+            thread_id=thread["thread_id"],
+            status="running",
+            loop_iteration=5,
+            current_phase="review",
+            current_cycle_index=1,
+            target_role="reviewer",
+            resolved_agent="alice",
+            required_action="submit_contribution",
+            expected_output="review contribution",
+        )
+    )
+
+    runner._persist_invocation_outputs(
+        thread["thread_id"],
+        "alice",
+        InvocationResult(
+            ok=True,
+            outputs=(
+                RuntimeOutput(
+                    content="## completed\nReview is complete.\n",
+                    phase="final_answer",
+                    state_affecting=True,
+                ),
+            ),
+        ),
+        chain_depth=1,
+    )
+
+    state = delegation_store.read(thread["thread_id"])
+    assert state is not None
+    assert state.status == "failed"
+    assert state.stop_reason == "max_auto_iterations_reached"
+
+    delegation_messages = [
+        message
+        for message in thread_store.list_messages(thread["thread_id"])
+        if message.get("msg_type") == "delegation"
+    ]
+    assert delegation_messages == []

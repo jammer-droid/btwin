@@ -396,3 +396,22 @@ def test_delegate_wait_and_respond_use_attached_api_when_attached(tmp_path, monk
             {"outcome": "retry", "summary": "Need one more review pass."},
         ),
     ]
+
+
+def test_delegate_stop_marks_state_completed(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / "custom-runtime-data"
+    _thread_store, thread = _seed_waiting_delegate_thread(data_dir)
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+
+    result = runner.invoke(
+        app,
+        ["delegate", "stop", "--thread", thread["thread_id"], "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["status"] == "completed"
+    assert payload["stop_reason"] == "stopped_by_operator"

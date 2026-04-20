@@ -1489,6 +1489,23 @@ class AgentRunner:
                 role_bindings=build_delegate_role_bindings(advanced_thread, next_phase),
                 contributions=self._threads.list_contributions(thread_id, phase=assignment.next_phase),
             )
+            if next_assignment.status == "running" and next_assignment.resolved_agent:
+                next_session = self._session_supervisor.get_session(thread_id, next_assignment.resolved_agent)
+                next_assignment = build_delegation_assignment(
+                    thread=advanced_thread,
+                    protocol=protocol,
+                    phase_cycle_state=next_cycle_state,
+                    role_bindings=build_delegate_role_bindings(advanced_thread, next_phase),
+                    contributions=self._threads.list_contributions(thread_id, phase=assignment.next_phase),
+                    runtime_session={
+                        "degraded": next_session.degraded,
+                        "recoverable": next_session.recoverable,
+                        "recovery_pending": next_session.recovery_pending,
+                    }
+                    if next_session is not None
+                    else None,
+                    loop_iteration=delegation_state.loop_iteration + 1,
+                )
             if next_assignment.status == "running":
                 dispatched_message = self._dispatch_delegation_message(
                     thread=advanced_thread,

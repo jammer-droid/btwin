@@ -713,6 +713,27 @@ def _delegate_respond_local(
     return next_state.model_dump(exclude_none=True)
 
 
+def _delegate_stop_local(thread_id: str, config: BTwinConfig | None = None) -> dict[str, object]:
+    current_config = config or _get_config()
+    delegation_store = _get_delegation_store(current_config)
+    state = delegation_store.read(thread_id)
+    if state is None:
+        console.print(f"[red]Delegation state for thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    stopped_state = state.model_copy(
+        update={
+            "status": "completed",
+            "updated_at": _iso_now(),
+            "reason_blocked": None,
+            "last_resume_token": None,
+            "stop_reason": "stopped_by_operator",
+        }
+    )
+    delegation_store.write(stopped_state)
+    return stopped_state.model_dump(exclude_none=True)
+
+
 def _append_system_mailbox_report(
     *,
     thread_id: str,
@@ -8225,6 +8246,16 @@ def delegate_respond(
             resume_token=resume_token,
             config=config,
         )
+    _emit_payload(payload, as_json=as_json)
+
+
+@delegate_app.command("stop")
+def delegate_stop(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Stop delegation for one thread and keep the final stop reason."""
+    payload = _delegate_stop_local(thread_id, _get_config())
     _emit_payload(payload, as_json=as_json)
 
 
