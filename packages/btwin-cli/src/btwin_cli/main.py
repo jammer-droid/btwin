@@ -795,6 +795,14 @@ def _thread_watch_phase_cycle_payload(
         thread_id=thread_id,
         phase_name=phase.name,
         procedure_steps=_phase_cycle_procedure_steps(phase),
+    ).model_copy(
+        update={
+            "current_step_index": -1,
+            "current_step_label": None,
+            "procedure_steps": [],
+            "completed_steps": [],
+            "status": "blocked",
+        }
     )
     context_core = _build_phase_cycle_context_core(
         thread=thread,
@@ -803,10 +811,14 @@ def _thread_watch_phase_cycle_payload(
         state=seed_state,
         last_cycle_outcome=None,
     )
+    visual = _phase_cycle_visual_payload(protocol=protocol, phase=phase, state=seed_state)
+    if isinstance(visual, dict):
+        visual = dict(visual)
+        visual["procedure"] = []
     return {
         "state": seed_state.model_dump(),
         "context_core": context_core.model_dump(),
-        "visual": _phase_cycle_visual_payload(protocol=protocol, phase=phase, state=seed_state),
+        "visual": visual,
         "synthetic": True,
         "source": "btwin.thread_watch.synthetic",
     }
@@ -1463,13 +1475,10 @@ def _shared_validation_header_context(
     runtime_sessions: dict[str, dict[str, object]],
     protocol_plan: dict[str, object] | None,
     telemetry_rows: list[dict[str, object]],
-    *,
-    include_step_fallback: bool = True,
     include_official_response_promotion: bool = False,
 ) -> dict[str, str | dict[str, object]]:
     state_payload = phase_cycle_payload.get("state") if isinstance(phase_cycle_payload, dict) else None
     cycle_index = state_payload.get("cycle_index") if isinstance(state_payload, dict) else None
-    step_label = state_payload.get("current_step_label") if isinstance(state_payload, dict) else None
     validation = _detail_validation_snapshot(
         thread,
         phase_cycle_payload,
@@ -1489,21 +1498,11 @@ def _shared_validation_header_context(
 
     protocol_name = str(thread.get("protocol") or "").strip()
     phase = str(thread.get("current_phase") or "-")
-    phase_definition = _thread_watch_protocol_phase(
-        _get_protocol_store().get_protocol(protocol_name) if protocol_name else None,
-        phase,
-    )
     phase_progression = _detail_phase_progression(thread)
     if not phase_progression or phase_progression == "-":
         phase_progression = f"• {_detail_progress_label(phase)}"
 
-    procedure_progression = _detail_procedure_progression(
-        phase_cycle_payload,
-        phase_definition,
-        step_label,
-    )
-    if include_step_fallback and (not procedure_progression or procedure_progression == "-"):
-        procedure_progression = f"• {_detail_progress_label(step_label)}" if step_label else "-"
+    procedure_progression = _detail_procedure_progression(phase_cycle_payload)
     if procedure_progression and procedure_progression != "-" and isinstance(cycle_index, int):
         procedure_progression = f"{procedure_progression}  (cycle {cycle_index})"
 
@@ -1605,10 +1604,9 @@ def _detail_phase_progression(thread: dict[str, object]) -> str | None:
 
 def _detail_procedure_progression(
     phase_cycle_payload: dict[str, object] | None,
-    phase_definition: ProtocolPhase | None,
-    step_label: object,
 ) -> str | None:
     procedure_items: list[tuple[str, bool]] = []
+    has_real_procedure_progress = False
     visual = phase_cycle_payload.get("visual") if isinstance(phase_cycle_payload, dict) else None
     procedure_nodes = visual.get("procedure") if isinstance(visual, dict) else None
     if isinstance(procedure_nodes, list) and procedure_nodes:
@@ -1619,27 +1617,11 @@ def _detail_procedure_progression(
             if not label:
                 continue
             status = str(node.get("status") or "").strip().lower()
+            if status in {"active", "completed"}:
+                has_real_procedure_progress = True
             procedure_items.append((label, status == "active"))
-
-    if phase_definition is not None and phase_definition.procedure and len(procedure_items) <= 1:
-        current_step = str(step_label or "").strip()
-        procedure_items = []
-        for step in phase_definition.procedure:
-            label = step.visual_label()
-            if not label:
-                continue
-            step_keys = {
-                step.visual_key(),
-                step.action,
-                label,
-            }
-            procedure_items.append((label, current_step in {key for key in step_keys if key}))
-        if procedure_items and not any(is_current for _, is_current in procedure_items) and not current_step:
-            label, _ = procedure_items[0]
-            procedure_items[0] = (label, True)
-    if len(procedure_items) == 1 and not any(is_current for _, is_current in procedure_items):
-        label, _ = procedure_items[0]
-        procedure_items[0] = (label, True)
+    if not has_real_procedure_progress:
+        return None
 
     rendered = _detail_progression_line(procedure_items)
     return rendered if rendered != "-" else None
@@ -1694,7 +1676,6 @@ def _render_thread_detail(
         runtime_sessions,
         protocol_plan,
         telemetry_rows,
-        include_step_fallback=False,
     )
     agents = status_summary.get("agents", [])
     actor_parts: list[str] = []
@@ -1810,7 +1791,6 @@ def _render_validation_focus(
         runtime_sessions=runtime_sessions,
         protocol_plan=protocol_plan,
         telemetry_rows=telemetry_rows,
-        include_step_fallback=True,
         include_official_response_promotion=True,
     )
     lines = _shared_validation_header_lines(header_context)
@@ -3381,24 +3361,14 @@ def _render_hud_threads_renderable(
             phase_cycle_payload = trace_payload.get("phase_cycle") if isinstance(trace_payload, dict) else None
             phase = str(thread.get("current_phase") or "-")
             cycle_index = None
-            step_label = None
             if isinstance(phase_cycle_payload, dict):
                 state_payload = phase_cycle_payload.get("state")
                 if isinstance(state_payload, dict):
                     cycle_index = state_payload.get("cycle_index")
-                    step_label = state_payload.get("current_step_label")
             phase_progression = _detail_phase_progression(thread)
             procedure_progression = None
             if isinstance(phase_cycle_payload, dict):
-                phase_definition = _thread_watch_protocol_phase(
-                    _get_protocol_store().get_protocol(str(thread.get("protocol") or "")) if thread.get("protocol") else None,
-                    phase,
-                )
-                procedure_progression = _detail_procedure_progression(
-                    phase_cycle_payload,
-                    phase_definition,
-                    step_label,
-                )
+                procedure_progression = _detail_procedure_progression(phase_cycle_payload)
             primary_row = _detail_primary_trace_row(trace_rows)
             gate_label = ""
             if isinstance(primary_row, dict):
@@ -3550,7 +3520,6 @@ def _render_hud_thread_detail_renderable(
         runtime_sessions,
         protocol_plan,
         telemetry_rows,
-        include_step_fallback=False,
         include_official_response_promotion=False,
     )
     header_rows = _shared_validation_header_renderables(header_context, animation_phase)
@@ -3665,7 +3634,6 @@ def _render_hud_validation_focus_renderable(
         runtime_sessions,
         protocol_plan,
         telemetry_rows,
-        include_step_fallback=True,
         include_official_response_promotion=True,
     )
     verdict = str(header_context["verdict"])

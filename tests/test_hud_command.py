@@ -1709,7 +1709,9 @@ def test_hud_thread_detail_renderable_shows_validation_panel(monkeypatch, tmp_pa
     assert "Thread Detail" in rendered
     assert "review-loop" in rendered
     assert "Context" in rendered and "Review" in rendered and "Decision" in rendered
-    assert "Announce" in rendered and "Collect Feedback" in rendered and "Resolve" in rendered
+    assert "Collect Feedback" in rendered
+    assert "Announce" not in rendered
+    assert "Resolve" not in rendered
     assert "Protocol / Phase" not in rendered
     assert "Gate / Guard Focus" not in rendered
     assert "Recent Activity" in rendered
@@ -1892,23 +1894,28 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
             None,
         ),
     )
-    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
     monkeypatch.setattr(
         main,
-        "_thread_watch_payload",
-        lambda thread, status, events: {
-            "phase_cycle": {"state": {"cycle_index": 1, "current_step_label": "gate"}},
-            "trace": [
-                {
-                    "timestamp": "2026-04-19T12:04:28Z",
-                    "kind": "gate",
-                    "phase": "analysis",
-                    "reason": "missing_contribution",
-                    "summary": "Missing contribution for current phase.",
-                }
-            ],
-        },
+        "_get_protocol_store",
+        lambda: type(
+            "FakeProtocolStore",
+            (),
+            {
+                "get_protocol": lambda self, name: Protocol(
+                    name="code-review",
+                    phases=[
+                        ProtocolPhase(name="analysis"),
+                        ProtocolPhase(name="discussion"),
+                        ProtocolPhase(name="decision"),
+                    ],
+                    transitions=[
+                        ProtocolTransition.model_validate({"from": "analysis", "to": "discussion", "on": "accept", "alias": "Accept"}),
+                    ],
+                )
+            },
+        )(),
     )
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
     monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
     monkeypatch.setattr(
         main,
@@ -1942,7 +1949,7 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
     assert "Verdict     WARN" in rendered
     assert "Primary     jun missing scope, findings" in rendered
     assert "Phase       • Analysis · Discussion" in rendered
-    assert "Procedure   • Gate" in rendered
+    assert "Procedure   " not in rendered
     assert "Next        submit contribution" in rendered
     assert "Rule Compliance" in rendered
     assert "Required contribution: WARN" in rendered
@@ -1955,6 +1962,7 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
     assert "Cases" not in rendered
     assert "Evidence" not in rendered
     assert "Confidence" not in rendered
+    assert "current step" not in rendered
     assert "Reasons" in rendered
     assert "- jun missing scope, findings" in rendered
     assert "Why this verdict" not in rendered
@@ -3089,7 +3097,7 @@ def test_hud_thread_detail_does_not_hard_cap_recent_activity_rows(monkeypatch, t
     assert rendered.index("[BTWIN] [context] Cycle gate completed") < rendered.index("[DERIVED] phase: Discussion active")
 
 
-def test_hud_thread_detail_marks_first_procedure_step_when_runtime_step_missing(monkeypatch, tmp_path):
+def test_hud_thread_detail_omits_procedure_flow_when_runtime_step_missing(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     data_dir = tmp_path / ".btwin"
     project_root.mkdir()
@@ -3133,6 +3141,11 @@ def test_hud_thread_detail_marks_first_procedure_step_when_runtime_step_missing(
                         ),
                         ProtocolPhase(name="decision"),
                     ],
+                    transitions=[
+                        ProtocolTransition.model_validate(
+                            {"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate"}
+                        ),
+                    ],
                 )
             },
         )(),
@@ -3142,22 +3155,133 @@ def test_hud_thread_detail_marks_first_procedure_step_when_runtime_step_missing(
         "_workflow_event_log",
         lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})(),
     )
+    monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_render_thread_runtime_diagnostics", lambda thread_id, config: [])
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    rendered = main._render_hud_navigator(state, config, limit=5)
+
+    assert "Verdict     WARN" in rendered
+    assert "Phase       Context · • Review · Decision" in rendered
+    assert "Procedure   " not in rendered
+    assert "Inspect" not in rendered
+    assert "Revise" not in rendered
+    assert "Confirm" not in rendered
+    assert "current step" not in rendered
+    assert "Cycle      " not in rendered
+    assert "Status     " not in rendered
+
+
+def test_thread_watch_phase_cycle_payload_synthetic_seed_is_conservative(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+
+    thread = {
+        "thread_id": "thread-1",
+        "topic": "Procedure Demo",
+        "protocol": "procedure-demo",
+        "current_phase": "review",
+    }
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(main, "_phase_cycle_payload_for_thread", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "_get_protocol_store",
+        lambda: type(
+            "FakeProtocolStore",
+            (),
+            {
+                "get_protocol": lambda self, name: Protocol(
+                    name="procedure-demo",
+                    phases=[
+                        ProtocolPhase(name="context"),
+                        ProtocolPhase(
+                            name="review",
+                            procedure=[
+                                {"role": "reviewer", "action": "inspect", "alias": "Inspect", "key": "inspect"},
+                                {"role": "reviewer", "action": "revise", "alias": "Revise", "key": "revise"},
+                                {"role": "reviewer", "action": "confirm", "alias": "Confirm", "key": "confirm"},
+                            ],
+                        ),
+                        ProtocolPhase(name="decision"),
+                    ],
+                )
+            },
+        )(),
+    )
+
+    payload = main._thread_watch_phase_cycle_payload(thread, config)
+
+    assert payload is not None
+    assert payload["synthetic"] is True
+    assert payload["state"]["current_step_label"] is None
+    assert payload["state"]["current_step_index"] == -1
+    assert payload["visual"]["procedure"] == []
+    assert payload["visual"]["gates"]
+    assert payload["context_core"]["current_step_label"] is None
+    assert payload["context_core"]["current_step_alias"] is None
+
+
+def test_hud_thread_detail_renders_completed_runtime_procedure_flow(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="thread", selected_thread_id="thread-1")
+    protocol = Protocol(
+        name="procedure-demo",
+        phases=[
+            ProtocolPhase(name="context"),
+            ProtocolPhase(
+                name="review",
+                procedure=[
+                    {"role": "reviewer", "action": "inspect", "alias": "Inspect", "key": "inspect"},
+                    {"role": "reviewer", "action": "revise", "alias": "Revise", "key": "revise"},
+                    {"role": "reviewer", "action": "confirm", "alias": "Confirm", "key": "confirm"},
+                ],
+            ),
+            ProtocolPhase(name="decision"),
+        ],
+        transitions=[
+            ProtocolTransition.model_validate({"from": "review", "to": "decision", "on": "accept", "alias": "Accept Gate"}),
+        ],
+    )
+    phase = next(item for item in protocol.phases if item.name == "review")
+    completed_state = PhaseCycleState.start(
+        thread_id="thread-1",
+        phase_name="review",
+        procedure_steps=["inspect", "revise", "confirm"],
+    ).finish_cycle(gate_outcome="accept", next_phase="decision")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {
+                "thread_id": thread_id,
+                "topic": "Procedure Demo",
+                "protocol": "procedure-demo",
+                "current_phase": "review",
+            },
+            {"agents": [{"name": "jun", "status": "waiting"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(main, "_get_protocol_store", lambda: type("FakeProtocolStore", (), {"get_protocol": lambda self, name: protocol})())
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
     monkeypatch.setattr(
         main,
         "_thread_watch_payload",
         lambda thread, status, events: {
             "phase_cycle": {
-                "synthetic": True,
-                "state": {
-                    "cycle_index": 1,
-                    "current_step_label": None,
-                    "status": "active",
-                },
-                "visual": {
-                    "procedure": [
-                        {"key": "gate", "label": "Gate", "status": "pending"},
-                    ],
-                },
+                "state": completed_state.model_dump(),
+                "visual": main._phase_cycle_visual_payload(protocol=protocol, phase=phase, state=completed_state),
             },
             "trace": [],
         },
@@ -3170,7 +3294,11 @@ def test_hud_thread_detail_marks_first_procedure_step_when_runtime_step_missing(
 
     assert "Verdict     WARN" in rendered
     assert "Phase       Context · • Review · Decision" in rendered
-    assert "Procedure   • Inspect · Revise · Confirm  (cycle 1)" in rendered
+    assert "Procedure   Inspect · Revise · Confirm · Gate  (cycle 1)" in rendered
+    assert "Inspect" in rendered
+    assert "Revise" in rendered
+    assert "Confirm" in rendered
+    assert "Gate" in rendered
     assert "Cycle      " not in rendered
     assert "Status     " not in rendered
 
