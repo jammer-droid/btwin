@@ -1639,6 +1639,7 @@ def test_hud_validation_renderable_shows_validation_sections(monkeypatch, tmp_pa
         },
     )
     monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
+    monkeypatch.setattr(main, "_validation_telemetry_rows", lambda thread_id, current_config, limit=20: [])
     monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
 
     renderable = main._render_hud_navigator_renderable(state, config, limit=5)
@@ -1652,6 +1653,8 @@ def test_hud_validation_renderable_shows_validation_sections(monkeypatch, tmp_pa
     assert "Expected" in rendered
     assert "Actual" in rendered
     assert "Missing contribution blocked" in rendered
+    assert "Confidence" in rendered
+    assert "workflow trace present" in rendered
 
 
 def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch, tmp_path):
@@ -1691,6 +1694,22 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
     monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [])
     monkeypatch.setattr(
         main,
+        "_validation_telemetry_rows",
+        lambda thread_id, current_config, limit=20: [
+            {
+                "event_type": "validation.signal.recorded",
+                "evidence_level": "critical",
+                "payload": {"signal": "session_state_changed", "state": "thinking"},
+            },
+            {
+                "event_type": "validation.signal.recorded",
+                "evidence_level": "critical",
+                "payload": {"signal": "runtime_output_persisted"},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        main,
         "_try_protocol_next_snapshot",
         lambda thread_id, current_config: {
             "passed": False,
@@ -1704,6 +1723,11 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
 
     assert "Validation verdict  WARN" in rendered
     assert "Primary reason  jun missing scope, findings" in rendered
+    assert "Confidence  high" in rendered
+    assert "Evidence  workflow trace present · runtime sessions unavailable · telemetry signals 2 recent · protocol gaps 1 participant" in rendered
+    assert "Flow  • Analysis · Discussion" in rendered
+    assert "Procedure  • Gate" in rendered
+    assert "Cases  Missing contribution blocked [PASS]" in rendered
     assert "Rule Compliance" in rendered
     assert "Required contribution: WARN" in rendered
     assert "primary_reason: jun missing scope, findings" in rendered
@@ -1713,6 +1737,74 @@ def test_hud_validation_focus_uses_protocol_next_for_validation_gap(monkeypatch,
     assert "- jun missing scope, findings" in rendered
     assert "Why this verdict" not in rendered
     assert "Validation Cases" not in rendered
+
+
+def test_hud_validation_renderable_shows_context_and_evidence_lines(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    project_root.mkdir()
+    config = _attached_config(data_dir)
+    state = main._HudNavigatorState(screen="validation", selected_thread_id="thread-1")
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: config)
+    monkeypatch.setattr(
+        main,
+        "_try_load_thread_snapshot",
+        lambda thread_id, current_config: (
+            {"thread_id": thread_id, "topic": "Design Review", "protocol": "review-loop", "current_phase": "review"},
+            {"agents": [{"name": "jun", "status": "waiting"}]},
+            None,
+        ),
+    )
+    monkeypatch.setattr(main, "_workflow_event_log", lambda thread_id: type("FakeLog", (), {"list_events": lambda self, limit: []})())
+    monkeypatch.setattr(
+        main,
+        "_thread_watch_payload",
+        lambda thread, status, events: {
+            "phase_cycle": {
+                "state": {"cycle_index": 3, "current_step_label": "collect-feedback"},
+                "context_core": {"outcome_policy": "review-outcomes", "policy_outcomes": ["retry", "accept", "close"]},
+                "visual": {
+                    "procedure": [
+                        {"key": "announce", "label": "Announce", "status": "completed"},
+                        {"key": "collect-feedback", "label": "Collect Feedback", "status": "active"},
+                        {"key": "resolve", "label": "Resolve", "status": "pending"},
+                    ],
+                    "gates": [
+                        {"key": "retry", "label": "Retry Gate", "status": "active"},
+                        {"key": "accept", "label": "Accept Gate", "status": "pending"},
+                    ],
+                },
+            },
+            "trace": [
+                {"timestamp": "2026-04-19T12:03:55Z", "kind": "guard", "decision": "block", "phase": "review", "reason": "missing_contribution", "summary": "Missing contribution for current phase."}
+            ],
+        },
+    )
+    monkeypatch.setattr(main, "_runtime_sessions_for_thread", lambda thread_id, current_config: [("jun", {"status": "waiting"})])
+    monkeypatch.setattr(
+        main,
+        "_validation_telemetry_rows",
+        lambda thread_id, current_config, limit=20: [
+            {"event_type": "validation.signal.recorded", "payload": {"signal": "session_state_changed", "state": "thinking"}},
+            {"event_type": "validation.signal.recorded", "payload": {"signal": "runtime_output_persisted"}},
+        ],
+    )
+    monkeypatch.setattr(main, "_hud_thread_view_window_size", lambda: 200)
+
+    renderable = main._render_hud_navigator_renderable(state, config, limit=5)
+
+    rendered = _renderable_to_text(renderable, width=180)
+    assert "Flow" in rendered
+    assert "• Review" in rendered
+    assert "Procedure" in rendered
+    assert "Announce · • Collect Feedback · Resolve" in rendered
+    assert "Cases" in rendered
+    assert "Missing contribution blocked [PASS]" in rendered
+    assert "Evidence" in rendered
+    assert "telemetry signals 2 recent" in rendered
+    assert "Confidence" in rendered
     assert "Trace / Reason Excerpt" not in rendered
 
 
