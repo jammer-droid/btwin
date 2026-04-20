@@ -29,6 +29,7 @@ from btwin_core.protocol_validator import ProtocolValidator
 from btwin_core.system_mailbox_store import SystemMailboxStore
 from btwin_core.thread_store import ThreadStore
 from btwin_core.thread_summarizer import ThreadSummarizer
+from btwin_core.workflow_event_log import WorkflowEventLog
 from btwin_core.workflow_constraints import (
     validate_contribution_submission,
     validate_direct_message_targets,
@@ -231,6 +232,8 @@ class ThreadCloseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     summary: str
     decision: str | None = None
+    force: bool = False
+    source: str | None = None
 
 
 class MessageSendRequest(BaseModel):
@@ -361,7 +364,7 @@ def create_threads_router(
         if thread is None:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
         proto = protocol_store.get_protocol(thread.get("protocol", ""))
-        if proto is not None:
+        if proto is not None and not req.force:
             current_phase = thread.get("current_phase")
             contributions = (
                 thread_store.list_contributions(thread_id, phase=current_phase)
@@ -374,6 +377,17 @@ def create_threads_router(
         closed = thread_store.close_thread(thread_id, summary=req.summary, decision=req.decision)
         if closed is None:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+        if req.force:
+            WorkflowEventLog(thread_store.workflow_event_log_path(thread_id)).append(
+                {
+                    "timestamp": closed.get("closed_at"),
+                    "thread_id": thread_id,
+                    "event_type": "thread_force_closed",
+                    "source": f"btwin.{req.source}" if req.source else "btwin",
+                    "summary": req.summary,
+                    "decision": req.decision,
+                }
+            )
 
         result_record_id = None
         if btwin_factory is not None:
@@ -420,7 +434,7 @@ def create_threads_router(
             SSEEvent(
                 type="thread_closed",
                 resource_id=thread_id,
-                metadata={"summary": req.summary[:100]},
+                metadata={"summary": req.summary[:100], "force": req.force, "source": req.source},
             )
         )
         response = dict(closed)

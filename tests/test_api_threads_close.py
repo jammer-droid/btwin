@@ -7,6 +7,7 @@ from btwin_cli.api_threads import create_threads_router
 from btwin_core.event_bus import EventBus
 from btwin_core.protocol_store import Protocol, ProtocolPhase, ProtocolSection, ProtocolStore
 from btwin_core.thread_store import ThreadStore
+from btwin_core.workflow_event_log import WorkflowEventLog
 
 
 class _FailingBacklinkTwin:
@@ -111,3 +112,49 @@ def test_close_thread_rejects_when_protocol_next_step_is_not_close(tmp_path):
     detail = response.json()["detail"]
     assert detail["error"] == "thread_not_closable_from_phase"
     assert "protocol apply-next" in detail["hint"]
+
+
+def test_force_close_thread_bypasses_protocol_validation_and_records_event(tmp_path):
+    data_dir = tmp_path / ".btwin"
+    thread_store = ThreadStore(data_dir / "threads")
+    protocol_store = ProtocolStore(data_dir / "protocols")
+    protocol_store.save_protocol(
+        Protocol(
+            name="review-flow",
+            description="Requires a followup phase before close",
+            phases=[
+                ProtocolPhase(
+                    name="context",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="background", required=True)],
+                ),
+                ProtocolPhase(name="discussion", actions=["discuss"]),
+            ],
+        )
+    )
+    thread = thread_store.create_thread(
+        topic="Force close regression",
+        protocol="review-flow",
+        participants=["alice"],
+        initial_phase="context",
+    )
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, EventBus()))
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/close",
+        json={
+            "summary": "Force-closed from B-TWIN HUD after user confirmation.",
+            "force": True,
+            "source": "hud",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "completed"
+    events = WorkflowEventLog(thread_store.workflow_event_log_path(thread["thread_id"])).list_events()
+    assert events[-1]["event_type"] == "thread_force_closed"
+    assert events[-1]["source"] == "btwin.hud"
