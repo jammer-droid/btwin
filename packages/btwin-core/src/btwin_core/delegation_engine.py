@@ -15,11 +15,13 @@ class DelegationAssignment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: DelegationStatus
+    next_phase: str | None = None
     target_role: str | None = None
     resolved_agent: str | None = None
     required_action: str | None = None
     expected_output: str | None = None
     reason_blocked: str | None = None
+    stop_reason: str | None = None
 
 
 def build_delegation_assignment(
@@ -38,6 +40,7 @@ def build_delegation_assignment(
             status="blocked",
             required_action="record_outcome",
             reason_blocked="phase_not_found",
+            stop_reason="phase_not_found",
         )
 
     thread_snapshot = dict(thread)
@@ -49,6 +52,7 @@ def build_delegation_assignment(
             required_action="submit_contribution",
             expected_output=_fallback_expected_output(phase.name),
             reason_blocked="phase_cycle_blocked",
+            stop_reason="phase_cycle_blocked",
         )
 
     next_plan = describe_next(
@@ -59,13 +63,17 @@ def build_delegation_assignment(
     if next_plan.manual_outcome_required:
         return DelegationAssignment(
             status="waiting_for_human",
+            next_phase=next_plan.next_phase,
             required_action=next_plan.suggested_action,
             expected_output=_manual_outcome_output(phase, next_plan),
+            stop_reason="human_outcome_required",
         )
     if phase_cycle_state.status == "completed" or next_plan.suggested_action in {"advance_phase", "close_thread"}:
         return DelegationAssignment(
             status="completed",
+            next_phase=next_plan.next_phase,
             required_action=next_plan.suggested_action,
+            stop_reason=next_plan.suggested_action,
         )
 
     current_step = resolve_phase_cycle_current_step(phase, phase_cycle_state)
@@ -85,28 +93,73 @@ def build_delegation_assignment(
     if not target_role:
         return DelegationAssignment(
             status="blocked",
+            next_phase=next_plan.next_phase,
             required_action=next_plan.suggested_action,
             expected_output=expected_output,
             reason_blocked="missing_target_role",
+            stop_reason="missing_target_role",
         )
 
     resolved_agent = (role_bindings or {}).get(target_role)
     if not resolved_agent:
         return DelegationAssignment(
             status="blocked",
+            next_phase=next_plan.next_phase,
             target_role=target_role,
             required_action=next_plan.suggested_action,
             expected_output=expected_output,
             reason_blocked="missing_role_binding",
+            stop_reason="missing_role_binding",
         )
 
     return DelegationAssignment(
         status="running",
+        next_phase=next_plan.next_phase,
         target_role=target_role,
         resolved_agent=resolved_agent,
         required_action=next_plan.suggested_action,
         expected_output=expected_output,
     )
+
+
+def build_delegate_role_bindings(
+    thread: dict[str, object],
+    phase,
+) -> dict[str, str]:
+    participants = thread.get("phase_participants", [])
+    if not isinstance(participants, list):
+        participants = []
+    if not phase.procedure:
+        return {}
+
+    bindings: dict[str, str] = {}
+    for step, participant in zip(phase.procedure, participants):
+        if isinstance(step.role, str) and step.role and isinstance(participant, str) and participant:
+            bindings[step.role] = participant
+    return bindings
+
+
+def default_phase_participants(
+    thread: dict[str, object],
+    phase,
+) -> list[str]:
+    phase_participants = thread.get("phase_participants", [])
+    if isinstance(phase_participants, list) and phase_participants:
+        return [name for name in phase_participants if isinstance(name, str) and name][: len(phase.procedure or [])]
+
+    participants = thread.get("participants", [])
+    names: list[str] = []
+    for participant in participants:
+        if isinstance(participant, dict):
+            name = participant.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+            continue
+        if isinstance(participant, str) and participant:
+            names.append(participant)
+    if not phase.procedure:
+        return names
+    return names[: len(phase.procedure)]
 
 
 def _current_phase_name(thread: dict[str, object], phase_cycle_state: PhaseCycleState) -> str | None:

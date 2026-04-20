@@ -30,3 +30,7 @@ class DelegationState(BaseModel):
     required_action: str | None = None
     expected_output: str | None = None
     reason_blocked: str | None = None
+    last_dispatch_message_id: str | None = None
+    last_result_message_id: str | None = None
+    last_resume_token: str | None = None
+    stop_reason: str | None = None

@@ -15,6 +15,12 @@ from btwin_core.auth_adapters import ResolvedLaunchAuth, build_auth_adapter
 from btwin_core.codex_cli_config import build_codex_config_args
 from btwin_core.config import BTwinConfig, load_config
 from btwin_core.context_formatter import ContextFormatter
+from btwin_core.delegation_engine import (
+    build_delegate_role_bindings,
+    build_delegation_assignment,
+    default_phase_participants,
+)
+from btwin_core.delegation_store import DelegationStore
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.gateway_client import GatewayLaunchContext, build_gateway_client
 from btwin_core.helper_overlay import (
@@ -26,6 +32,8 @@ from btwin_core.helper_overlay import (
     materialize_helper_overlay,
 )
 from btwin_core.message_router import MessageRouter
+from btwin_core.phase_cycle_engine import phase_cycle_procedure_actions
+from btwin_core.phase_cycle_store import PhaseCycleStore
 from btwin_core.protocol_store import ProtocolStore
 from btwin_core.providers import CLIProvider, get_provider, get_provider_runtime_profile
 from btwin_core.resource_paths import resolve_workspace_root
@@ -39,6 +47,7 @@ from btwin_core.session_supervisor import (
 from btwin_core.session_transports import TransportLaunchContext, build_transport_for_provider
 from btwin_core.thread_store import ThreadStore
 from btwin_core.validation_telemetry import ValidationTelemetryStore
+from btwin_core.workflow_constraints import validate_direct_message_targets
 from btwin_core.prototypes.persistent_sessions.base import PersistentSessionAdapter
 from btwin_core.prototypes.persistent_sessions.types import SessionConfig, SessionTurn
 
@@ -106,6 +115,8 @@ class AgentRunner:
         self._agents = agent_store
         self._event_bus = event_bus
         self._config = self._resolve_runtime_config(config)
+        self._delegations = DelegationStore(self._config.data_dir)
+        self._phase_cycles = PhaseCycleStore(self._config.data_dir)
         self._runtime_event_logger = runtime_event_logger
         self._validation_telemetry = ValidationTelemetryStore(self._config.data_dir)
         self._providers_config = self._load_providers(providers_path)
@@ -1206,6 +1217,7 @@ class AgentRunner:
     ) -> None:
         session = self._session_supervisor.get_session(thread_id, agent_name)
         saved_any = False
+        saved_messages: list[dict[str, object]] = []
         for output in result.outputs:
             content = output.content.strip()
             if not content:
@@ -1232,7 +1244,7 @@ class AgentRunner:
                     "state_affecting": output.state_affecting,
                 },
             )
-            self._save_agent_message(
+            saved_message = self._save_agent_message(
                 thread_id,
                 agent_name,
                 content,
@@ -1240,7 +1252,16 @@ class AgentRunner:
                 message_phase=output.phase,
                 state_affecting=output.state_affecting,
             )
+            if saved_message is not None:
+                saved_messages.append(saved_message)
             saved_any = True
+
+        for saved_message in saved_messages:
+            self._maybe_continue_delegation_from_saved_message(
+                thread_id,
+                agent_name,
+                saved_message,
+            )
 
         if saved_any or not result.response_text.strip():
             return
@@ -1267,7 +1288,7 @@ class AgentRunner:
                 "state_affecting": True,
             },
         )
-        self._save_agent_message(
+        saved_message = self._save_agent_message(
             thread_id,
             agent_name,
             result.response_text.strip(),
@@ -1275,6 +1296,12 @@ class AgentRunner:
             message_phase="final_answer",
             state_affecting=True,
         )
+        if saved_message is not None:
+            self._maybe_continue_delegation_from_saved_message(
+                thread_id,
+                agent_name,
+                saved_message,
+            )
 
     def _save_agent_message(
         self,
@@ -1285,7 +1312,7 @@ class AgentRunner:
         *,
         message_phase: str | None = None,
         state_affecting: bool = True,
-    ) -> None:
+    ) -> dict[str, object] | None:
         tldr = content[:100].replace("\n", " ")
         if len(content) > 100:
             tldr = tldr[:97] + "..."
@@ -1299,7 +1326,8 @@ class AgentRunner:
             state_affecting=state_affecting,
         )
         if saved_message is None:
-            return
+            return None
+        saved_message = {**saved_message, "_content": content.strip()}
         if state_affecting or message_phase == "final_answer":
             self._record_validation_signal(
                 thread_id,
@@ -1313,7 +1341,7 @@ class AgentRunner:
                 },
             )
         if not state_affecting:
-            return
+            return saved_message
         self._event_bus.publish(SSEEvent(
             type="message_sent",
             resource_id=thread_id,
@@ -1326,6 +1354,314 @@ class AgentRunner:
                 "state_affecting": state_affecting,
             },
         ))
+        return saved_message
+
+    def _maybe_continue_delegation_from_saved_message(
+        self,
+        thread_id: str,
+        agent_name: str,
+        saved_message: dict[str, object] | None,
+    ) -> None:
+        if saved_message is None:
+            return
+        if saved_message.get("message_phase") != "final_answer":
+            return
+        if saved_message.get("state_affecting") is False:
+            return
+
+        delegation_state = self._delegations.read(thread_id)
+        if delegation_state is None or delegation_state.status != "running":
+            return
+        if delegation_state.resolved_agent != agent_name:
+            return
+
+        message_id = saved_message.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            return
+        if delegation_state.last_result_message_id == message_id:
+            return
+
+        thread = self._threads.get_thread(thread_id)
+        if thread is None:
+            return
+        protocol_name = thread.get("protocol")
+        protocol = self._protocols.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+        if protocol is None:
+            blocked_state = delegation_state.model_copy(
+                update={
+                    "status": "blocked",
+                    "reason_blocked": "protocol_not_found",
+                    "stop_reason": "protocol_not_found",
+                    "last_result_message_id": message_id,
+                    "updated_at": _now_iso(),
+                }
+            )
+            self._delegations.write(blocked_state)
+            return
+
+        phase_cycle_state = self._phase_cycles.read(thread_id)
+        current_phase_name = delegation_state.current_phase or (
+            phase_cycle_state.phase_name if phase_cycle_state is not None else thread.get("current_phase")
+        )
+        if not isinstance(current_phase_name, str) or not current_phase_name:
+            return
+        if phase_cycle_state is None:
+            phase_cycle_state = self._phase_cycles.start_cycle(
+                thread_id=thread_id,
+                phase_name=current_phase_name,
+                procedure_steps=[],
+            )
+
+        content = saved_message.get("_content")
+        if not isinstance(content, str) or not content.strip():
+            return
+
+        contribution = self._threads.submit_contribution(
+            thread_id,
+            agent_name,
+            current_phase_name,
+            content=content,
+            tldr=content[:100].replace("\n", " "),
+            source_message_id=message_id,
+        )
+        if contribution is None:
+            blocked_state = delegation_state.model_copy(
+                update={
+                    "status": "blocked",
+                    "reason_blocked": "contribution_persist_failed",
+                    "stop_reason": "contribution_persist_failed",
+                    "last_result_message_id": message_id,
+                    "updated_at": _now_iso(),
+                }
+            )
+            self._delegations.write(blocked_state)
+            return
+
+        assignment_thread = dict(thread)
+        assignment_thread["current_phase"] = current_phase_name
+        phase = next((item for item in protocol.phases if item.name == current_phase_name), None)
+        if phase is None:
+            return
+        assignment = build_delegation_assignment(
+            thread=assignment_thread,
+            protocol=protocol,
+            phase_cycle_state=phase_cycle_state,
+            role_bindings=build_delegate_role_bindings(assignment_thread, phase),
+            contributions=self._threads.list_contributions(thread_id, phase=current_phase_name),
+        )
+
+        if (
+            assignment.status == "completed"
+            and assignment.required_action == "advance_phase"
+            and isinstance(assignment.next_phase, str)
+            and assignment.next_phase
+        ):
+            next_phase = next((item for item in protocol.phases if item.name == assignment.next_phase), None)
+            if next_phase is None:
+                blocked_state = delegation_state.model_copy(
+                    update={
+                        "status": "blocked",
+                        "reason_blocked": "next_phase_not_found",
+                        "stop_reason": "next_phase_not_found",
+                        "last_result_message_id": message_id,
+                        "updated_at": _now_iso(),
+                    }
+                )
+                self._delegations.write(blocked_state)
+                return
+
+            advanced_thread = self._threads.advance_phase(
+                thread_id,
+                assignment.next_phase,
+                phase_participants=default_phase_participants(thread, next_phase),
+            )
+            if advanced_thread is None:
+                return
+            next_cycle_state = self._phase_cycles.start_cycle(
+                thread_id=thread_id,
+                phase_name=assignment.next_phase,
+                procedure_steps=phase_cycle_procedure_actions(next_phase),
+            )
+            next_assignment = build_delegation_assignment(
+                thread=advanced_thread,
+                protocol=protocol,
+                phase_cycle_state=next_cycle_state,
+                role_bindings=build_delegate_role_bindings(advanced_thread, next_phase),
+                contributions=self._threads.list_contributions(thread_id, phase=assignment.next_phase),
+            )
+            if next_assignment.status == "running":
+                dispatched_message = self._dispatch_delegation_message(
+                    thread=advanced_thread,
+                    thread_id=thread_id,
+                    agent_name=next_assignment.resolved_agent,
+                    phase_name=assignment.next_phase,
+                    loop_iteration=delegation_state.loop_iteration + 1,
+                    expected_output=next_assignment.expected_output,
+                    required_action=next_assignment.required_action,
+                    target_role=next_assignment.target_role,
+                    protocol=protocol,
+                )
+                if dispatched_message is None:
+                    blocked_state = delegation_state.model_copy(
+                        update={
+                            "status": "blocked",
+                            "current_phase": assignment.next_phase,
+                            "current_cycle_index": next_cycle_state.cycle_index,
+                            "target_role": next_assignment.target_role,
+                            "resolved_agent": next_assignment.resolved_agent,
+                            "required_action": next_assignment.required_action,
+                            "expected_output": next_assignment.expected_output,
+                            "reason_blocked": "dispatch_failed",
+                            "last_result_message_id": message_id,
+                            "stop_reason": "dispatch_failed",
+                            "updated_at": _now_iso(),
+                        }
+                    )
+                    self._delegations.write(blocked_state)
+                    return
+                self._delegations.write(
+                    delegation_state.model_copy(
+                        update={
+                            "status": "running",
+                            "loop_iteration": delegation_state.loop_iteration + 1,
+                            "current_phase": assignment.next_phase,
+                            "current_cycle_index": next_cycle_state.cycle_index,
+                            "target_role": next_assignment.target_role,
+                            "resolved_agent": next_assignment.resolved_agent,
+                            "required_action": next_assignment.required_action,
+                            "expected_output": next_assignment.expected_output,
+                            "reason_blocked": None,
+                            "last_dispatch_message_id": dispatched_message["message_id"],
+                            "last_result_message_id": message_id,
+                            "stop_reason": None,
+                            "updated_at": _now_iso(),
+                        }
+                    )
+                )
+                return
+
+            self._delegations.write(
+                delegation_state.model_copy(
+                    update={
+                        "status": next_assignment.status,
+                        "current_phase": assignment.next_phase,
+                        "current_cycle_index": next_cycle_state.cycle_index,
+                        "target_role": next_assignment.target_role,
+                        "resolved_agent": next_assignment.resolved_agent,
+                        "required_action": next_assignment.required_action,
+                        "expected_output": next_assignment.expected_output,
+                        "reason_blocked": next_assignment.reason_blocked,
+                        "last_result_message_id": message_id,
+                        "stop_reason": next_assignment.stop_reason,
+                        "updated_at": _now_iso(),
+                    }
+                )
+            )
+            return
+
+        self._delegations.write(
+            delegation_state.model_copy(
+                update={
+                    "status": assignment.status,
+                    "current_phase": current_phase_name,
+                    "current_cycle_index": phase_cycle_state.cycle_index,
+                    "target_role": assignment.target_role,
+                    "resolved_agent": assignment.resolved_agent,
+                    "required_action": assignment.required_action,
+                    "expected_output": assignment.expected_output,
+                    "reason_blocked": assignment.reason_blocked,
+                    "last_result_message_id": message_id,
+                    "stop_reason": assignment.stop_reason,
+                    "updated_at": _now_iso(),
+                }
+            )
+        )
+
+    def _dispatch_delegation_message(
+        self,
+        *,
+        thread: dict[str, object],
+        thread_id: str,
+        agent_name: str | None,
+        phase_name: str,
+        loop_iteration: int,
+        expected_output: str | None,
+        required_action: str | None,
+        target_role: str | None,
+        protocol,
+    ) -> dict[str, object] | None:
+        if not agent_name:
+            return None
+        validation = validate_direct_message_targets(
+            thread={**thread, "current_phase": phase_name},
+            protocol=protocol,
+            from_agent="btwin",
+            target_agents=[agent_name],
+        )
+        if validation is not None:
+            return None
+
+        client_message_id = ":".join(
+            [
+                "delegate",
+                "continue",
+                thread_id,
+                str(loop_iteration),
+                phase_name,
+                target_role or "",
+                agent_name,
+                required_action or "",
+            ]
+        )
+        if any(
+            message.get("client_message_id") == client_message_id
+            for message in self._threads.list_messages(thread_id)
+        ):
+            return None
+
+        content = (
+            "## Delegation Continue\n\n"
+            f"Role: {target_role or 'unassigned'}\n\n"
+            f"Agent: @{agent_name}\n\n"
+            f"Phase: {phase_name}\n\n"
+            f"Action: {required_action or 'continue'}\n\n"
+            f"Expected output: {expected_output or 'n/a'}\n"
+        )
+        tldr = f"delegate {phase_name} -> {agent_name}"
+        message = self._threads.send_message(
+            thread_id=thread_id,
+            from_agent="btwin",
+            content=content,
+            tldr=tldr,
+            client_message_id=client_message_id,
+            msg_type="delegation",
+            delivery_mode="direct",
+            target_agents=[agent_name],
+            routing_source="btwin.delegate.continue",
+            routing_reason="delegate_assignment",
+            message_phase=phase_name,
+            state_affecting=False,
+        )
+        if message is None:
+            return None
+        self._event_bus.publish(
+            SSEEvent(
+                type="message_sent",
+                resource_id=thread_id,
+                metadata={
+                    "message_id": message["message_id"],
+                    "from_agent": "btwin",
+                    "content": content,
+                    "chain_depth": 0,
+                    "client_message_id": client_message_id,
+                    "delivery_mode": "direct",
+                    "target_agents": [agent_name],
+                    "message_phase": phase_name,
+                    "state_affecting": False,
+                },
+            )
+        )
+        return message
 
     def _should_use_live_transport(self, session: AgentSession) -> bool:
         if self._session_transport_mode_for_invoke(session) != "live_process_transport":

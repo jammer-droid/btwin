@@ -127,7 +127,13 @@ class ThreadStore:
     def get_thread(self, thread_id: str) -> dict | None:
         return self._load_meta(thread_id)
 
-    def advance_phase(self, thread_id: str, next_phase: str) -> dict | None:
+    def advance_phase(
+        self,
+        thread_id: str,
+        next_phase: str,
+        *,
+        phase_participants: list[str] | None = None,
+    ) -> dict | None:
         """Advance thread to the next phase. Returns None if thread not found or closed."""
         meta = self._load_meta(thread_id)
         if meta is None:
@@ -135,7 +141,10 @@ class ThreadStore:
         if meta.get("status") != "active":
             return None
         meta["current_phase"] = next_phase
-        meta["phase_participants"] = [p["name"] for p in meta.get("participants", [])]
+        if phase_participants is not None:
+            meta["phase_participants"] = [name for name in phase_participants if isinstance(name, str) and name]
+        else:
+            meta["phase_participants"] = [p["name"] for p in meta.get("participants", [])]
         self._save_meta(thread_id, meta)
         return meta
 
@@ -408,6 +417,8 @@ class ThreadStore:
         phase: str,
         content: str,
         tldr: str,
+        *,
+        source_message_id: str | None = None,
     ) -> dict | None:
         meta = self._load_meta(thread_id)
         if meta is None:
@@ -430,6 +441,8 @@ class ThreadStore:
             "supersedes": latest_prev["contribution_id"] if latest_prev else None,
             "created_at": now,
         }
+        if source_message_id:
+            contrib["source_message_id"] = source_message_id
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         filename = f"{agent_name}-{phase}-{timestamp}.md"
