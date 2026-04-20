@@ -135,7 +135,7 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
                 "phases": [
                     {
                         "name": "review",
-                        "actions": ["contribute"],
+                        "actions": ["review"],
                         "template": [{"section": "completed", "required": True}],
                         "procedure": [
                             {"role": "reviewer", "action": "review", "alias": "Review"},
@@ -160,6 +160,8 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
         )
     )
 
+    event_queue = event_bus.subscribe()
+
     from fastapi import FastAPI
 
     app = FastAPI()
@@ -181,6 +183,9 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
     inbox_response = client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"})
     assert inbox_response.status_code == 200
     assert inbox_response.json()["pending_count"] == 1
+    published_event = event_queue.get_nowait()
+    assert published_event.type == "thread_updated"
+    assert published_event.resource_id == thread["thread_id"]
 
     second_response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
     assert second_response.status_code == 200
@@ -264,7 +269,7 @@ def test_delegate_start_uses_phase_cycle_fallback_when_thread_phase_missing(tmp_
                 "phases": [
                     {
                         "name": "review",
-                        "actions": ["contribute"],
+                        "actions": ["review"],
                         "template": [{"section": "completed", "required": True}],
                         "procedure": [
                             {"role": "reviewer", "action": "review", "alias": "Review"},
@@ -305,6 +310,115 @@ def test_delegate_start_uses_phase_cycle_fallback_when_thread_phase_missing(tmp_
     assert client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"}).json()["pending_count"] == 1
 
 
+def test_delegate_start_prefers_phase_cycle_state_over_stale_thread_phase(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-stale-phase",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["review"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    },
+                    {
+                        "name": "decision",
+                        "actions": ["decide"],
+                        "procedure": [
+                            {"role": "decider", "action": "decide", "alias": "Decision"},
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Stale phase delegate thread",
+        protocol="delegate-stale-phase",
+        participants=["alice"],
+        initial_phase="decision",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["target_role"] == "reviewer"
+    assert payload["resolved_agent"] == "alice"
+    assert client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"}).json()["pending_count"] == 1
+
+
+def test_delegate_start_rejects_when_direct_routing_is_disallowed(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-direct-blocked",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Direct routing blocked delegate thread",
+        protocol="delegate-direct-blocked",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["status"] == "blocked"
+    assert detail["reason_blocked"] == "direct_message_not_allowed_in_phase"
+    assert client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"}).json()["pending_count"] == 0
+
+
 def test_delegate_start_reports_dispatch_failure_without_false_success(tmp_path, monkeypatch):
     thread_store = ThreadStore(tmp_path / "threads")
     protocol_store = ProtocolStore(tmp_path / "protocols")
@@ -316,7 +430,7 @@ def test_delegate_start_reports_dispatch_failure_without_false_success(tmp_path,
                 "phases": [
                     {
                         "name": "review",
-                        "actions": ["contribute"],
+                        "actions": ["review"],
                         "template": [{"section": "completed", "required": True}],
                         "procedure": [
                             {"role": "reviewer", "action": "review", "alias": "Review"},
@@ -374,7 +488,7 @@ def test_delegate_start_rejects_closed_thread(tmp_path):
                 "phases": [
                     {
                         "name": "review",
-                        "actions": ["contribute"],
+                        "actions": ["review"],
                         "procedure": [
                             {"role": "reviewer", "action": "review", "alias": "Review"},
                         ],

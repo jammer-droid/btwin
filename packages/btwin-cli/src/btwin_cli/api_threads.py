@@ -234,6 +234,25 @@ def _build_delegate_role_bindings(thread: dict[str, object], phase: ProtocolPhas
     return bindings
 
 
+def _validate_delegate_direct_message(
+    *,
+    thread: dict[str, object],
+    protocol: Protocol,
+    from_agent: str,
+    target_agents: list[str],
+    phase_name: str | None = None,
+) -> Any:
+    validation_thread = dict(thread)
+    if phase_name is not None:
+        validation_thread["current_phase"] = phase_name
+    return validate_direct_message_targets(
+        thread=validation_thread,
+        protocol=protocol,
+        from_agent=from_agent,
+        target_agents=target_agents,
+    )
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -294,12 +313,24 @@ def _delegate_dispatch_exists(
 def _dispatch_delegate_assignment(
     thread_store: ThreadStore,
     *,
+    thread: dict[str, object],
+    protocol: Protocol,
     thread_id: str,
     assignment: DelegationAssignment,
     phase_cycle_state: PhaseCycleState,
-) -> bool:
+) -> Any:
     if assignment.status != "running" or not assignment.resolved_agent:
-        return True
+        return None
+
+    validation = _validate_delegate_direct_message(
+        thread=thread,
+        protocol=protocol,
+        from_agent="btwin",
+        target_agents=[assignment.resolved_agent],
+        phase_name=phase_cycle_state.phase_name,
+    )
+    if validation is not None:
+        return validation
 
     client_message_id = _delegate_dispatch_client_message_id(
         thread_id=thread_id,
@@ -307,7 +338,7 @@ def _dispatch_delegate_assignment(
         assignment=assignment,
     )
     if _delegate_dispatch_exists(thread_store, thread_id=thread_id, client_message_id=client_message_id):
-        return True
+        return None
 
     content, tldr = _delegate_dispatch_content(
         assignment=assignment,
@@ -330,8 +361,10 @@ def _dispatch_delegate_assignment(
         )
     except Exception:
         logger.warning("Delegation dispatch failed for thread %s", thread_id, exc_info=True)
-        return False
-    return msg is not None
+        return {"error": "dispatch_failed"}
+    if msg is None:
+        return {"error": "dispatch_failed"}
+    return None
 
 
 def _resolve_delegate_phase(
@@ -340,18 +373,18 @@ def _resolve_delegate_phase(
     protocol: Protocol,
     phase_cycle_state: PhaseCycleState | None,
 ) -> ProtocolPhase | None:
-    thread_phase_name = thread.get("current_phase")
-    if isinstance(thread_phase_name, str) and thread_phase_name:
-        phase = next((item for item in protocol.phases if item.name == thread_phase_name), None)
-        if phase is not None:
-            return phase
-
     if phase_cycle_state is not None:
         phase_name = phase_cycle_state.phase_name
         if isinstance(phase_name, str) and phase_name:
             phase = next((item for item in protocol.phases if item.name == phase_name), None)
             if phase is not None:
                 return phase
+
+    thread_phase_name = thread.get("current_phase")
+    if isinstance(thread_phase_name, str) and thread_phase_name:
+        phase = next((item for item in protocol.phases if item.name == thread_phase_name), None)
+        if phase is not None:
+            return phase
 
     return None
 
@@ -624,7 +657,7 @@ def create_threads_router(
                 )
             proto = protocol_store.get_protocol(thread.get("protocol", ""))
             if proto is not None:
-                violation = validate_direct_message_targets(
+                violation = _validate_delegate_direct_message(
                     thread=thread,
                     protocol=proto,
                     from_agent=req.from_agent,
@@ -741,9 +774,13 @@ def create_threads_router(
                 procedure_steps=[step.action for step in phase.procedure or []],
             )
 
+        assignment_thread = dict(thread)
+        if phase_cycle_state is not None and isinstance(phase_cycle_state.phase_name, str) and phase_cycle_state.phase_name:
+            assignment_thread["current_phase"] = phase_cycle_state.phase_name
+
         contributions = thread_store.list_contributions(thread_id, phase=phase.name)
         assignment = build_delegation_assignment(
-            thread=thread,
+            thread=assignment_thread,
             protocol=protocol,
             phase_cycle_state=phase_cycle_state,
             role_bindings=_build_delegate_role_bindings(thread, phase),
@@ -755,16 +792,37 @@ def create_threads_router(
             assignment=assignment,
         )
         if assignment.status == "running":
-            if not _dispatch_delegate_assignment(
+            dispatch_violation = _dispatch_delegate_assignment(
                 thread_store,
+                thread=thread,
+                protocol=protocol,
                 thread_id=thread_id,
                 assignment=assignment,
                 phase_cycle_state=phase_cycle_state,
-            ):
-                blocked_state = state.model_copy(update={"status": "blocked", "reason_blocked": "dispatch_failed"})
+            )
+            if dispatch_violation is not None:
+                reason = None
+                if isinstance(dispatch_violation, dict):
+                    reason = dispatch_violation.get("error")
+                else:
+                    reason = getattr(dispatch_violation, "error", None)
+                blocked_state = state.model_copy(
+                    update={"status": "blocked", "reason_blocked": reason or "dispatch_failed"}
+                )
                 delegation_store.write(blocked_state)
                 raise HTTPException(status_code=409, detail=blocked_state.model_dump(exclude_none=True))
         delegation_store.write(state)
+        if assignment.status == "running":
+            event_bus.publish(
+                SSEEvent(
+                    type="thread_updated",
+                    resource_id=thread_id,
+                    metadata={
+                        "agent_dispatched": assignment.resolved_agent,
+                        "delegation_status": state.status,
+                    },
+                )
+            )
         return state.model_dump(exclude_none=True)
 
     @router.get("/api/threads/{thread_id}/delegate/status")
