@@ -1692,22 +1692,32 @@ def _render_thread_detail(
 
     _append_detail_section(lines, "Recent Activity")
     if trace_rows:
-        activity_rows: list[dict[str, object]] = []
-        if isinstance(primary_row, dict):
-            activity_rows.append(primary_row)
-        for row in reversed(trace_rows[-5:]):
-            if row is primary_row:
-                continue
-            if isinstance(row, dict):
-                activity_rows.append(row)
-        for row in activity_rows[:3]:
+        activity_rows = [row for row in trace_rows if isinstance(row, dict)]
+        collapsed_activity_rows = _collapse_detail_activity_rows(activity_rows)
+        rendered_entries: list[tuple[str, str, list[str]]] = []
+        for row, repeat_count, headline, _supporting_text in collapsed_activity_rows:
             timestamp = str(row.get("timestamp", ""))
             time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
-            _lane, headline, _headline_style = _workflow_event_heading(row)
+            repeat_suffix = f" ×{repeat_count}" if repeat_count > 1 else ""
+            rendered_entries.append((timestamp, f"{headline}{repeat_suffix}", []))
+        gate_entry = _detail_system_gate_entry(
+            primary_row,
+            str(header_context.get("next_action") or "-"),
+        )
+        if gate_entry is not None:
+            rendered_entries.append(gate_entry)
+        phase_entry = _detail_system_phase_entry(
+            thread,
+            activity_rows,
+        )
+        if phase_entry is not None:
+            rendered_entries.append(phase_entry)
+
+        for timestamp, headline, detail_lines in rendered_entries:
+            time_label = timestamp[11:19] if "T" in timestamp and len(timestamp) >= 19 else timestamp
             lines.append(f"{time_label}  {headline}")
-            summary = row.get("summary")
-            if isinstance(summary, str) and summary.strip():
-                lines.append(f"summary: {_truncate_hud_text(summary)}")
+            for detail_line in detail_lines[:2]:
+                lines.append(f"          {detail_line}")
     else:
         lines.append("No recent workflow events")
 
@@ -1730,7 +1740,7 @@ def _render_hud_thread_detail_screen(thread_id: str | None, limit: int) -> str:
     trace_payload = _thread_watch_payload(
         thread,
         status_summary,
-        _workflow_event_log(thread_id).list_events(limit=limit),
+        _workflow_event_log(thread_id).list_events(limit=_hud_recent_activity_event_limit(limit)),
     )
     return _render_hud_screen(
         "Thread Detail",
@@ -2057,6 +2067,143 @@ def _workflow_event_heading(event: dict[str, object]) -> tuple[str, str, str | N
         return lane, "Phase update", None
     raw_event_type = str(event.get("event_type") or "event")
     return lane, raw_event_type.replace("_", " "), style
+
+
+def _detail_activity_headline(row: dict[str, object]) -> str:
+    lane, headline, _headline_style = _workflow_event_heading(row)
+    kind = str(row.get("kind") or "").strip()
+    summary = str(row.get("summary") or "").strip()
+    if kind == "attempt" and summary:
+        match = re.search(r"Required result type:\s*([^.]+)", summary, re.IGNORECASE)
+        if match:
+            required_result = _detail_progress_label(match.group(1))
+            headline = f"{required_result} in progress"
+    source_badge = "[BTWIN]"
+    if lane != "BTWIN -> CODEX":
+        agent_name = str(row.get("agent") or "").strip()
+        source_badge = f"[CODEX {agent_name}]" if agent_name else "[CODEX]"
+
+    badges = [source_badge]
+    hook_name = str(row.get("hook_event_name") or "").strip()
+    if hook_name:
+        badges.append(f"[{hook_name}]")
+
+    phase = str(row.get("phase") or "").strip()
+    if phase:
+        badges.append(f"[{phase}]")
+
+    gate_label = str(row.get("gate_alias") or row.get("gate_key") or "").strip()
+    if gate_label:
+        badges.append(f"[{gate_label}]")
+
+    guard_label = ""
+    if str(row.get("kind") or "").strip() == "guard" or str(row.get("decision") or "").strip() == "block":
+        guard_label = str(row.get("baseline_guard") or row.get("reason") or "").strip()
+    if guard_label:
+        badges.append(f"[{guard_label}]")
+
+    return f"{' '.join(badges)} {headline}"
+
+
+def _detail_activity_supporting_text(row: dict[str, object]) -> str | None:
+    return None
+
+
+def _collapse_detail_activity_rows(
+    rows: list[dict[str, object]],
+) -> list[tuple[dict[str, object], int, str, str | None]]:
+    collapsed: list[tuple[dict[str, object], int, str, str | None]] = []
+    for row in rows:
+        headline = _detail_activity_headline(row)
+        supporting_text = _detail_activity_supporting_text(row)
+        if collapsed and collapsed[-1][2] == headline and collapsed[-1][3] == supporting_text:
+            previous_row, count, _, _ = collapsed[-1]
+            collapsed[-1] = (previous_row, count + 1, headline, supporting_text)
+            continue
+        collapsed.append((row, 1, headline, supporting_text))
+    return collapsed
+
+
+def _detail_required_result_from_rows(rows: list[dict[str, object]]) -> str | None:
+    for row in rows:
+        summary = str(row.get("summary") or "").strip()
+        if not summary:
+            continue
+        match = re.search(r"Required result type:\s*([^.]+)", summary, re.IGNORECASE)
+        if match:
+            return _detail_progress_label(match.group(1))
+    return None
+
+
+def _detail_user_facing_next_action(next_action: str) -> str | None:
+    text = str(next_action or "").strip()
+    if not text or text == "-":
+        return None
+    lowered = text.lower()
+    if lowered.startswith("inspect ") or lowered.startswith("watch "):
+        return None
+    return text
+
+
+def _detail_system_phase_entry(
+    thread: dict[str, object],
+    activity_rows: list[dict[str, object]],
+) -> tuple[str, str, list[str]] | None:
+    phase = str(thread.get("current_phase") or "").strip()
+    if not phase:
+        return None
+    timestamp = ""
+    for row in activity_rows:
+        if str(row.get("kind") or "").strip() == "attempt" and str(row.get("phase") or "").strip() == phase:
+            timestamp = str(row.get("timestamp") or "")
+            break
+    for row in activity_rows:
+        if timestamp:
+            break
+        if str(row.get("phase") or "").strip() == phase:
+            timestamp = str(row.get("timestamp") or "")
+            break
+    if not timestamp and activity_rows:
+        timestamp = str(activity_rows[0].get("timestamp") or "")
+    required_result = _detail_required_result_from_rows(activity_rows)
+    details: list[str] = []
+    if required_result:
+        details.append(f"Expected result: {required_result}")
+    return timestamp, f"[SYSTEM] Entered phase: {_detail_progress_label(phase)}", details
+
+
+def _detail_system_gate_entry(
+    row: dict[str, object] | None,
+    next_action: str,
+) -> tuple[str, str, list[str]] | None:
+    if not isinstance(row, dict):
+        return None
+    kind = str(row.get("kind") or "").strip()
+    decision = str(row.get("decision") or "").strip()
+    gate_label = str(row.get("gate_alias") or row.get("gate_key") or "Current Gate").strip()
+    timestamp = str(row.get("timestamp") or "")
+    if kind == "guard" and decision == "block":
+        details: list[str] = []
+        reason = str(row.get("baseline_guard") or row.get("reason") or "").strip()
+        if reason:
+            details.append(f"Reason: {reason}")
+        user_facing_next = _detail_user_facing_next_action(next_action)
+        if user_facing_next:
+            details.append(f"Next: {user_facing_next}")
+        return timestamp, f"[SYSTEM] Gate blocked: {gate_label}", details
+    if kind == "gate":
+        details = []
+        outcome = str(row.get("outcome") or "").strip()
+        if outcome:
+            details.append(f"Result: {outcome}")
+        target_phase = str(row.get("target_phase") or "").strip()
+        if target_phase:
+            details.append(f"Target: {target_phase}")
+        policy_outcomes = row.get("policy_outcomes")
+        if isinstance(policy_outcomes, list) and policy_outcomes:
+            details.append("Options: " + " | ".join(str(item) for item in policy_outcomes))
+        return timestamp, f"[SYSTEM] Gate resolved: {gate_label}", details
+    return None
 
 
 def _runtime_session_style(session: dict[str, object]) -> str | None:
@@ -2673,6 +2820,7 @@ class _HudNavigatorState:
     thread_index: int = 0
     selected_thread_id: str | None = None
     thread_log_offset: int = 0
+    close_confirmation_thread_id: str | None = None
 
 
 def _hud_snapshot_identity(state: _HudNavigatorState) -> tuple[object, ...]:
@@ -2690,6 +2838,7 @@ def _snapshot_hud_navigator_screen(
         "screen": state.screen,
         "thread_index": state.thread_index,
         "selected_thread_id": state.selected_thread_id,
+        "close_confirmation_thread_id": state.close_confirmation_thread_id,
     }
 
     if state.screen == "threads":
@@ -2728,10 +2877,11 @@ def _snapshot_hud_navigator_screen(
     if lookup_error is not None or not isinstance(thread, dict) or not isinstance(status_summary, dict):
         return snapshot
 
+    trace_limit = _hud_recent_activity_event_limit(limit) if state.screen == "thread" else limit
     snapshot["trace_payload"] = _thread_watch_payload(
         thread,
         status_summary,
-        _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+        _workflow_event_log(state.selected_thread_id).list_events(limit=trace_limit),
     )
     snapshot["runtime_sessions"] = {
         agent_name: session
@@ -2843,15 +2993,30 @@ class _HudRawInput:
         return False
 
 
-def _close_hud_thread(thread_id: str, config: BTwinConfig) -> None:
-    summary = "Closed from B-TWIN HUD."
+def _close_hud_thread(thread_id: str, config: BTwinConfig) -> bool:
+    summary = "Force-closed from B-TWIN HUD after user confirmation."
     if _use_attached_api(config):
-        _attached_api_call_or_exit(f"/api/threads/{thread_id}/close", {"summary": summary})
-        return
+        try:
+            _attached_api_call_or_exit(
+                f"/api/threads/{thread_id}/close",
+                {"summary": summary, "force": True, "source": "hud"},
+            )
+        except typer.Exit:
+            return False
+        return True
 
-    closed = _get_thread_store().close_thread(thread_id, summary=summary)
+    store = _get_thread_store()
+    closed = store.close_thread(thread_id, summary=summary)
     if closed is None:
-        raise typer.BadParameter(f"Thread not found: {thread_id}")
+        return False
+    _append_workflow_event(
+        thread_id,
+        event_type="thread_force_closed",
+        source="btwin.hud",
+        summary=summary,
+    )
+    _record_thread_result_entry(store.data_dir, thread_id, closed, summary, decision=None)
+    return True
 
 
 def _render_hud_menu(state: _HudNavigatorState) -> str:
@@ -3025,6 +3190,7 @@ def _render_hud_shell_renderable(
     hint_line: str,
     *,
     config: BTwinConfig | None = None,
+    footer_lines: list[str] | None = None,
 ) -> RenderableType:
     current_config = config or _get_config()
     root = Layout(name="hud-root")
@@ -3043,14 +3209,13 @@ def _render_hud_shell_renderable(
         )
     )
     root["hud-body"].update(body)
+    footer_content = footer_lines or [
+        f"Hint      {hint_line}",
+        "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
+    ]
     root["hud-footer"].update(
         Panel(
-            _hud_renderable_lines(
-                [
-                    f"Hint      {hint_line}",
-                    "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
-                ]
-            ),
+            _hud_renderable_lines(footer_content),
             border_style="bright_black",
             box=box.ROUNDED,
             padding=(0, 1),
@@ -3218,6 +3383,7 @@ def _render_hud_threads_renderable(
         body,
         "up/down select  enter open  d detail  l live  c close",
         config=config,
+        footer_lines=_hud_footer_lines(state, "up/down select  enter open  d detail  l live  c close"),
     )
 
 
@@ -3256,7 +3422,7 @@ def _render_hud_thread_detail_renderable(
         trace_payload = _thread_watch_payload(
             thread,
             status_summary,
-            _workflow_event_log(state.selected_thread_id).list_events(limit=limit),
+            _workflow_event_log(state.selected_thread_id).list_events(limit=_hud_recent_activity_event_limit(limit)),
         )
     detail_lines = _render_thread_detail(
         thread,
@@ -3267,10 +3433,12 @@ def _render_hud_thread_detail_renderable(
     intro_lines, sections = _parse_hud_sections(detail_lines)
     section_map = {title: lines for title, lines in sections}
     activity_lines = section_map.get("Recent Activity", ["No recent workflow events"])
-    visible_activity = activity_lines
-    if activity_lines and state.thread_log_offset:
-        window_size = max(_hud_thread_view_window_size() - 6, 5)
-        visible_activity = activity_lines[state.thread_log_offset : state.thread_log_offset + window_size] or activity_lines[-window_size:]
+    window_size = _hud_recent_activity_window_size()
+    visible_activity = (
+        activity_lines[state.thread_log_offset : state.thread_log_offset + window_size] or activity_lines[-window_size:]
+        if activity_lines
+        else ["No recent workflow events"]
+    )
 
     runtime_sessions = snapshot.get("runtime_sessions") if isinstance(snapshot, dict) and snapshot.get("selected_thread_id") == state.selected_thread_id else None
     if not isinstance(runtime_sessions, dict):
@@ -3330,6 +3498,7 @@ def _render_hud_thread_detail_renderable(
         body,
         "up/down scroll  pgup/pgdn page  home/end jump",
         config=config,
+        footer_lines=_hud_footer_lines(state, "up/down scroll  pgup/pgdn page  home/end jump"),
     )
 
 
@@ -3478,6 +3647,7 @@ def _render_hud_validation_focus_renderable(
         body,
         "[T] threads  [D] detail  [L] live  [:] cmd",
         config=config,
+        footer_lines=_hud_footer_lines(state, "[T] threads  [D] detail  [L] live  [:] cmd"),
     )
 
 
@@ -3648,6 +3818,7 @@ def _render_hud_live_trace_renderable(
         body,
         "j/k scroll  J latest  [D] detail  [T] threads  [:] cmd",
         config=config,
+        footer_lines=_hud_footer_lines(state, "j/k scroll  J latest  [D] detail  [T] threads  [:] cmd"),
     )
 
 
@@ -3768,6 +3939,36 @@ def _hud_thread_view_window_size() -> int:
         return 12
 
 
+def _hud_recent_activity_window_size() -> int:
+    return max(_hud_thread_view_window_size() - 6, 5)
+
+
+def _hud_recent_activity_event_limit(limit: int) -> int:
+    return max(limit, _hud_recent_activity_window_size() + 8)
+
+
+def _hud_default_thread_log_offset(thread_id: str, limit: int = 10) -> int:
+    activity_lines = _render_hud_thread_detail_activity_lines(thread_id, limit)
+    window_size = _hud_recent_activity_window_size()
+    return max(0, len(activity_lines) - window_size)
+
+
+def _hud_clear_close_confirmation(state: _HudNavigatorState) -> None:
+    state.close_confirmation_thread_id = None
+
+
+def _hud_footer_lines(state: _HudNavigatorState, hint_line: str) -> list[str]:
+    if state.close_confirmation_thread_id:
+        return [
+            "Hint      Closing now may discard unsaved protocol progress.",
+            "Nav       [C]onfirm close  [B] cancel  [Q] quit",
+        ]
+    return [
+        f"Hint      {hint_line}",
+        "Nav       [T]hreads  [D]etail  [V]alidation  [L]ive  [:] cmd  [q] quit",
+    ]
+
+
 def _render_hud_thread_detail_lookup_error(thread_id: str, lookup_error: str) -> str:
     return _render_hud_screen(
         "Thread Detail",
@@ -3786,6 +3987,16 @@ def _render_hud_thread_detail_body_lines(thread_id: str, limit: int) -> list[str
         if len(screen_lines) >= (_HUD_SCREEN_HEADER_LINES + _HUD_SCREEN_FOOTER_LINES)
         else []
     )
+
+
+def _render_hud_thread_detail_activity_lines(thread_id: str, limit: int) -> list[str]:
+    screen_lines = _render_hud_thread_detail_screen(thread_id, limit).splitlines()
+    if len(screen_lines) < (_HUD_SCREEN_HEADER_LINES + _HUD_SCREEN_FOOTER_LINES):
+        return []
+    body_lines = screen_lines[_HUD_SCREEN_HEADER_LINES:-_HUD_SCREEN_FOOTER_LINES]
+    _intro_lines, sections = _parse_hud_sections(body_lines)
+    section_map = {title: lines for title, lines in sections}
+    return section_map.get("Recent Activity", body_lines)
 
 
 def _render_hud_validation_focus_body_lines(thread_id: str, limit: int) -> list[str]:
@@ -3932,7 +4143,8 @@ def _hud_open_selected_thread(
     selected = threads[state.thread_index].get("thread_id")
     if isinstance(selected, str) and selected:
         state.selected_thread_id = selected
-        state.thread_log_offset = 0
+        state.thread_log_offset = _hud_default_thread_log_offset(selected) if screen == "thread" else 0
+        _hud_clear_close_confirmation(state)
         state.screen = screen
 
 
@@ -3945,6 +4157,24 @@ def _apply_hud_key(
         return False
     if key == "quit":
         return True
+    if state.close_confirmation_thread_id is not None:
+        if key == "close":
+            target_thread_id = state.close_confirmation_thread_id
+            _hud_clear_close_confirmation(state)
+            if _close_hud_thread(target_thread_id, config):
+                if state.screen == "threads":
+                    remaining = _list_hud_threads(config)
+                    state.thread_index = _clamp_index(state.thread_index, len(remaining))
+                else:
+                    state.selected_thread_id = None
+                    state.screen = "threads"
+                    remaining = _list_hud_threads(config)
+                    state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            return False
+        if key == "back":
+            _hud_clear_close_confirmation(state)
+            return False
+        _hud_clear_close_confirmation(state)
 
     if state.screen == "menu":
         items = _hud_menu_items()
@@ -3982,37 +4212,35 @@ def _apply_hud_key(
             state.thread_index = _clamp_index(state.thread_index, len(threads))
             selected = threads[state.thread_index].get("thread_id")
             if isinstance(selected, str) and selected:
-                _close_hud_thread(selected, config)
-                remaining = _list_hud_threads(config)
-                state.thread_index = _clamp_index(state.thread_index, len(remaining))
+                state.close_confirmation_thread_id = selected
         return False
 
     if state.screen == "thread":
         if key == "threads":
+            _hud_clear_close_confirmation(state)
             state.screen = "threads"
             return False
         if key == "back":
+            _hud_clear_close_confirmation(state)
             state.screen = "threads"
             return False
         if key == "validation":
+            _hud_clear_close_confirmation(state)
             state.screen = "validation"
             state.thread_log_offset = 0
             return False
         if key == "live":
+            _hud_clear_close_confirmation(state)
             state.screen = "live"
             state.thread_log_offset = 0
             return False
         if key == "close" and state.selected_thread_id is not None:
-            _close_hud_thread(state.selected_thread_id, config)
-            state.selected_thread_id = None
-            state.screen = "threads"
-            remaining = _list_hud_threads(config)
-            state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            state.close_confirmation_thread_id = state.selected_thread_id
             return False
         if state.selected_thread_id is not None:
-            body_lines = _render_hud_thread_detail_body_lines(state.selected_thread_id, 10)
-            window_size = _hud_thread_view_window_size()
-            max_offset = max(0, len(body_lines) - window_size)
+            activity_lines = _render_hud_thread_detail_activity_lines(state.selected_thread_id, 10)
+            window_size = _hud_recent_activity_window_size()
+            max_offset = max(0, len(activity_lines) - window_size)
             if key == "up":
                 state.thread_log_offset = max(0, state.thread_log_offset - 1)
             elif key == "down":
@@ -4029,24 +4257,24 @@ def _apply_hud_key(
 
     if state.screen == "validation":
         if key == "threads":
+            _hud_clear_close_confirmation(state)
             state.screen = "threads"
             return False
         if key in {"back", "detail"}:
+            _hud_clear_close_confirmation(state)
             state.screen = "thread"
-            state.thread_log_offset = 0
+            if state.selected_thread_id is not None:
+                state.thread_log_offset = _hud_default_thread_log_offset(state.selected_thread_id)
             return False
         if key == "validation":
             return False
         if key == "live":
+            _hud_clear_close_confirmation(state)
             state.screen = "live"
             state.thread_log_offset = 0
             return False
         if key == "close" and state.selected_thread_id is not None:
-            _close_hud_thread(state.selected_thread_id, config)
-            state.selected_thread_id = None
-            state.screen = "threads"
-            remaining = _list_hud_threads(config)
-            state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            state.close_confirmation_thread_id = state.selected_thread_id
             return False
         if state.selected_thread_id is not None:
             body_lines = _render_hud_validation_focus_body_lines(state.selected_thread_id, 10)
@@ -4068,21 +4296,22 @@ def _apply_hud_key(
 
     if state.screen == "live":
         if key == "threads":
+            _hud_clear_close_confirmation(state)
             state.screen = "threads"
             return False
         if key in {"back", "detail"}:
+            _hud_clear_close_confirmation(state)
             state.screen = "thread"
+            if state.selected_thread_id is not None:
+                state.thread_log_offset = _hud_default_thread_log_offset(state.selected_thread_id)
             return False
         if key == "validation":
+            _hud_clear_close_confirmation(state)
             state.screen = "validation"
             state.thread_log_offset = 0
             return False
         if key == "close" and state.selected_thread_id is not None:
-            _close_hud_thread(state.selected_thread_id, config)
-            state.selected_thread_id = None
-            state.screen = "threads"
-            remaining = _list_hud_threads(config)
-            state.thread_index = _clamp_index(state.thread_index, len(remaining))
+            state.close_confirmation_thread_id = state.selected_thread_id
             return False
         if state.selected_thread_id is not None:
             config = _get_config()
