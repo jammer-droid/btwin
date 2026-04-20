@@ -89,6 +89,7 @@ from btwin_core.workflow_constraints import (
     validate_direct_message_targets,
     validate_thread_close,
 )
+from btwin_cli.api_threads import dispatch_next_work
 from btwin_cli.provider_init import (
     available_provider_names,
     build_provider_config,
@@ -4764,6 +4765,48 @@ def _attached_api_call_or_exit(path: str, data: dict) -> dict:
         raise typer.Exit(1)
 
 
+def _attached_api_post_best_effort(path: str, data: dict | None = None) -> dict[str, object]:
+    try:
+        response = _api_post(path, data or {})
+    except Exception as exc:
+        error_message = exc.__class__.__name__
+        if getattr(exc, "args", None):
+            error_message = str(exc)
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "dispatch_request_failed",
+            "error": error_message,
+            "target_agents": [],
+            "message_id": None,
+        }
+
+    if not isinstance(response, dict):
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "dispatch_request_failed",
+            "error": f"unexpected dispatch response type: {type(response).__name__}",
+            "target_agents": [],
+            "message_id": None,
+        }
+
+    try:
+        return dict(response)
+    except Exception as exc:
+        error_message = exc.__class__.__name__
+        if getattr(exc, "args", None):
+            error_message = str(exc)
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "dispatch_request_failed",
+            "error": error_message,
+            "target_agents": [],
+            "message_id": None,
+        }
+
+
 def _attached_api_put_or_exit(path: str, data: dict) -> dict:
     import httpx
 
@@ -7183,6 +7226,28 @@ def protocol_apply_next(
             "context_core": context_core.model_dump(),
             "thread": closed_or_updated,
         }
+        if context_core.next_expected_role and context_core.next_expected_action:
+            if _use_attached_api(config):
+                dispatch_result = _attached_api_post_best_effort(
+                    f"/api/threads/{resolved_thread_id}/dispatch-next",
+                )
+            else:
+                dispatch_result = dispatch_next_work(
+                    thread_store=_get_thread_store(),
+                    protocol_store=_get_protocol_store(),
+                    phase_cycle_store=_get_phase_cycle_store(config),
+                    thread_id=resolved_thread_id,
+                    agent_store=_get_agent_store(),
+                )
+        else:
+            dispatch_result = {
+                "dispatched": False,
+                "skipped": True,
+                "reason": "missing_next_expected_role_or_action",
+                "target_agents": [],
+                "message_id": None,
+            }
+        result_payload["dispatch"] = dispatch_result
         cycle_summary = _cycle_report_summary(
             current_phase=plan.current_phase,
             next_phase=plan.next_phase,

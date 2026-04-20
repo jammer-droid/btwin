@@ -36,6 +36,7 @@ def test_attached_helper_smoke_script_runs_end_to_end(tmp_path):
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert "Attached helper smoke passed" in result.stdout
+    assert "apply-next dispatch: dispatched=True target=alice" in result.stdout
     assert "protocol apply-next cycle 1: review" in result.stdout
     assert "protocol apply-next cycle 2: review" in result.stdout
     assert "phase-cycle api visible: True" in result.stdout
@@ -55,6 +56,6 @@ def test_attached_helper_smoke_script_runs_end_to_end(tmp_path):
     assert "hud agent session visible: True" in result.stdout
     assert "runtime clear: False" in result.stdout
     assert "mailbox reports after clear: 2" in result.stdout
-    assert "agent inbox: pending=0 diagnostics=True" in result.stdout
+    assert "agent inbox: pending=2 diagnostics=True" in result.stdout
     assert not fake_btwin_log.exists()
     assert smoke_root.exists()

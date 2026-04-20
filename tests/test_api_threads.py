@@ -89,6 +89,73 @@ class _FakeAgentRunner:
         }
 
 
+class _FakeRoleAgentStore:
+    def __init__(self, agents: dict[str, dict[str, object]]):
+        self._agents = agents
+
+    def get_agent(self, name: str):
+        agent = self._agents.get(name)
+        if agent is None:
+            return None
+        return {"name": name, **agent}
+
+
+def _save_review_retry_dispatch_protocol(protocol_store: ProtocolStore) -> None:
+    protocol_store.save_protocol(
+        Protocol(
+            name="review-retry",
+            description="Repeat the same review phase until accepted",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                        {"role": "implementer", "action": "revise", "alias": "Revise"},
+                    ],
+                    outcome_policy="review-outcomes",
+                )
+            ],
+            outcomes=["retry", "accept"],
+            outcome_policies=[
+                {
+                    "name": "review-outcomes",
+                    "emitters": ["reviewer", "user"],
+                    "actions": ["decide"],
+                    "outcomes": ["retry", "accept"],
+                }
+            ],
+        )
+    )
+
+
+def _save_phase_drift_dispatch_protocol(protocol_store: ProtocolStore) -> None:
+    protocol_store.save_protocol(
+        Protocol(
+            name="phase-drift",
+            description="Phase drift guard",
+            phases=[
+                ProtocolPhase(
+                    name="review",
+                    actions=["contribute"],
+                    template=[ProtocolSection(section="completed", required=True)],
+                    procedure=[
+                        {"role": "reviewer", "action": "review", "alias": "Review"},
+                    ],
+                ),
+                ProtocolPhase(
+                    name="decision",
+                    actions=["decide"],
+                    procedure=[
+                        {"role": "decider", "action": "decide", "alias": "Decision"},
+                    ],
+                ),
+            ],
+        )
+    )
+
+
 def test_threads_router_exposes_agent_inbox_and_agent_status(tmp_path):
     thread_store = ThreadStore(tmp_path / "threads")
     protocol_store = ProtocolStore(tmp_path / "protocols")
@@ -435,6 +502,324 @@ def test_attached_api_allows_direct_message_to_thread_participant_when_target_is
     payload = response.json()
     assert payload["delivery_mode"] == "direct"
     assert payload["target_agents"] == ["alice"]
+
+
+def test_dispatch_next_endpoint_persists_role_matched_message_and_publishes_event(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    event_queue = event_bus.subscribe()
+    agent_store = _FakeRoleAgentStore(
+        {
+            "alice": {"role": "reviewer"},
+            "bob": {"role": "implementer"},
+        }
+    )
+
+    _save_review_retry_dispatch_protocol(protocol_store)
+    thread = thread_store.create_thread(
+        topic="Attached API dispatch",
+        protocol="review-retry",
+        participants=["alice", "bob"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_index": 0,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(
+        create_threads_router(
+            thread_store,
+            protocol_store,
+            event_bus,
+            agent_store=agent_store,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/dispatch-next",
+        json={"contextCore": {"next_expected_role": "implementer"}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dispatched"] is True
+    assert payload["skipped"] is False
+    assert payload["target_agents"] == ["alice"]
+    inbox = thread_store.list_inbox(thread["thread_id"], "alice")
+    assert inbox is not None
+    assert len(inbox) == 1
+    assert inbox[0]["msg_type"] == "dispatch"
+    assert "Required result" in inbox[0]["_content"]
+    event = event_queue.get_nowait()
+    assert event.type == "message_sent"
+    assert event.metadata["delivery_mode"] == "direct"
+    assert event.metadata["target_agents"] == ["alice"]
+
+
+def test_dispatch_next_endpoint_skips_when_no_participant_matches_role(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    event_queue = event_bus.subscribe()
+    agent_store = _FakeRoleAgentStore(
+        {
+            "alice": {"role": "implementer"},
+            "bob": {"role": "observer"},
+        }
+    )
+
+    _save_review_retry_dispatch_protocol(protocol_store)
+    thread = thread_store.create_thread(
+        topic="Attached API dispatch",
+        protocol="review-retry",
+        participants=["alice", "bob"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_index": 0,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(
+        create_threads_router(
+            thread_store,
+            protocol_store,
+            event_bus,
+            agent_store=agent_store,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/dispatch-next",
+        json={"contextCore": {"next_expected_role": "implementer"}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dispatched"] is False
+    assert payload["skipped"] is True
+    assert payload["reason"] == "no_matching_role_participant"
+    assert payload["target_agents"] == []
+    assert thread_store.list_inbox(thread["thread_id"], "alice") == []
+    assert event_queue.empty()
+
+
+def test_dispatch_next_endpoint_derives_state_instead_of_trusting_client_context(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    agent_store = _FakeRoleAgentStore(
+        {
+            "alice": {"role": "reviewer"},
+            "bob": {"role": "implementer"},
+        }
+    )
+    _save_review_retry_dispatch_protocol(protocol_store)
+    thread = thread_store.create_thread(
+        topic="Attached API dispatch",
+        protocol="review-retry",
+        participants=["alice", "bob"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_index": 0,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(
+        create_threads_router(
+            thread_store,
+            protocol_store,
+            event_bus,
+            agent_store=agent_store,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/dispatch-next",
+        json={
+            "contextCore": {
+                "next_expected_role": "implementer",
+                "next_expected_action": "ignore this synthetic request",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dispatched"] is True
+    assert payload["target_agents"] == ["alice"]
+    inbox = thread_store.list_inbox(thread["thread_id"], "alice")
+    assert inbox is not None
+    assert len(inbox) == 1
+    assert inbox[0]["msg_type"] == "dispatch"
+    assert "Role: reviewer" in inbox[0]["_content"]
+
+
+def test_dispatch_next_endpoint_skips_when_thread_phase_and_cycle_phase_drift(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    event_queue = event_bus.subscribe()
+    agent_store = _FakeRoleAgentStore(
+        {
+            "alice": {"role": "reviewer"},
+            "bob": {"role": "decider"},
+        }
+    )
+    _save_phase_drift_dispatch_protocol(protocol_store)
+    thread = thread_store.create_thread(
+        topic="Attached API dispatch",
+        protocol="phase-drift",
+        participants=["alice", "bob"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="decision",
+            procedure_steps=["decide"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_index": 0,
+                "current_step_label": "decision",
+                "last_gate_outcome": "accept",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(
+        create_threads_router(
+            thread_store,
+            protocol_store,
+            event_bus,
+            agent_store=agent_store,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/dispatch-next",
+        json={"contextCore": {"next_expected_role": "decider", "next_expected_action": "decide"}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dispatched"] is False
+    assert payload["skipped"] is True
+    assert payload["reason"] == "dispatch_phase_mismatch"
+    assert payload["target_agents"] == []
+    assert thread_store.list_inbox(thread["thread_id"], "alice") == []
+    assert thread_store.list_inbox(thread["thread_id"], "bob") == []
+    assert event_queue.empty()
+
+
+def test_dispatch_next_endpoint_skips_when_thread_phase_and_cycle_state_mismatch(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    agent_store = _FakeRoleAgentStore(
+        {
+            "alice": {"role": "reviewer"},
+            "bob": {"role": "implementer"},
+        }
+    )
+    _save_review_retry_dispatch_protocol(protocol_store)
+    thread = thread_store.create_thread(
+        topic="Attached API dispatch",
+        protocol="review-retry",
+        participants=["alice", "bob"],
+        initial_phase="review",
+    )
+    thread_store.advance_phase(thread["thread_id"], next_phase="decision")
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review", "revise"],
+        ).model_copy(
+            update={
+                "cycle_index": 2,
+                "current_step_index": 0,
+                "current_step_label": "review",
+                "last_gate_outcome": "retry",
+            }
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(
+        create_threads_router(
+            thread_store,
+            protocol_store,
+            event_bus,
+            agent_store=agent_store,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/threads/{thread['thread_id']}/dispatch-next",
+        json={"contextCore": {"next_expected_role": "reviewer"}},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dispatched"] is False
+    assert payload["skipped"] is True
+    assert payload["reason"] == "dispatch_phase_mismatch"
+    assert payload["target_agents"] == []
+    assert thread_store.list_inbox(thread["thread_id"], "alice") == []
 
 
 def test_attached_api_rejects_direct_message_when_current_phase_disallows_chat(tmp_path):

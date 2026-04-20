@@ -238,6 +238,233 @@ def _build_phase_cycle_visual(
     return build_phase_cycle_visual_payload(protocol=protocol, phase=phase, state=state)
 
 
+def _thread_participant_names(thread: dict[str, object]) -> list[str]:
+    participant_names: list[str] = []
+    participants = thread.get("participants", [])
+    if not isinstance(participants, list):
+        return participant_names
+    for participant in participants:
+        if isinstance(participant, dict):
+            name = participant.get("name")
+            if isinstance(name, str) and name:
+                participant_names.append(name)
+        elif isinstance(participant, str) and participant:
+            participant_names.append(participant)
+    return participant_names
+
+
+def _resolve_dispatch_targets(
+    *,
+    thread: dict[str, object],
+    agent_store: Any | None,
+    role: str,
+) -> list[str]:
+    if agent_store is None:
+        return []
+
+    targets: list[str] = []
+    for participant_name in _thread_participant_names(thread):
+        agent = agent_store.get_agent(participant_name)
+        if not isinstance(agent, dict):
+            continue
+        if str(agent.get("role") or "") == role:
+            targets.append(participant_name)
+    return targets
+
+
+def _build_dispatch_content(
+    *,
+    thread: dict[str, object],
+    context_core: ContextCore,
+    targets: list[str],
+) -> tuple[str, str]:
+    phase_name = str(thread.get("current_phase") or context_core.current_step_label or "<phase>")
+    role = context_core.next_expected_role or "<role>"
+    action = context_core.next_expected_action or "<action>"
+    tldr = f"dispatch {phase_name} -> {role}"
+
+    lines = [
+        "# Dispatch",
+        "",
+        f"Phase: {phase_name}",
+        f"Cycle: {context_core.current_cycle_index or 1}",
+        f"Role: {role}",
+        f"Action: {action}",
+        f"Required result: {context_core.required_result}",
+        f"Thread goal: {context_core.thread_goal}",
+        f"Phase purpose: {context_core.phase_purpose}",
+    ]
+    if context_core.last_cycle_outcome is not None:
+        lines.append(f"Last cycle outcome: {context_core.last_cycle_outcome}")
+    if context_core.outcome_policy is not None:
+        lines.append(f"Outcome policy: {context_core.outcome_policy}")
+    if context_core.policy_outcomes:
+        lines.append(f"Policy outcomes: {', '.join(context_core.policy_outcomes)}")
+    if context_core.outcome_emitters:
+        lines.append(f"Outcome emitters: {', '.join(context_core.outcome_emitters)}")
+    if targets:
+        lines.append(f"Target agents: {', '.join(targets)}")
+    return "\n".join(lines), tldr
+
+
+def _load_dispatch_context(
+    *,
+    thread_store: ThreadStore,
+    protocol_store: ProtocolStore,
+    phase_cycle_store: PhaseCycleStore,
+    thread_id: str,
+) -> tuple[tuple[dict[str, object], Protocol, ProtocolPhase, PhaseCycleState, ContextCore] | None, str | None]:
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        return None, "thread_not_found"
+
+    protocol_name = thread.get("protocol")
+    if not isinstance(protocol_name, str) or not protocol_name.strip():
+        return None, "protocol_unavailable"
+    protocol = protocol_store.get_protocol(protocol_name)
+    if protocol is None:
+        return None, "protocol_not_found"
+
+    state = phase_cycle_store.read(thread_id)
+    if state is None:
+        return None, "phase_cycle_unavailable"
+
+    state_phase_name = state.phase_name
+    current_phase_name = thread.get("current_phase")
+    if (
+        isinstance(current_phase_name, str)
+        and current_phase_name.strip()
+        and isinstance(state_phase_name, str)
+        and state_phase_name.strip()
+        and state_phase_name != current_phase_name
+    ):
+        return None, "dispatch_phase_mismatch"
+
+    phase_name = state_phase_name or current_phase_name
+    if not isinstance(phase_name, str) or not phase_name.strip():
+        return None, "phase_definition_unavailable"
+    phase = next((item for item in protocol.phases if item.name == phase_name), None)
+    if phase is None:
+        return None, "phase_definition_not_found"
+
+    context_core = _build_phase_cycle_context_core(
+        thread=thread,
+        protocol=protocol,
+        phase=phase,
+        state=state,
+    )
+    return (thread, protocol, phase, state, context_core), None
+
+
+def dispatch_next_work(
+    *,
+    thread_store: ThreadStore,
+    protocol_store: ProtocolStore,
+    phase_cycle_store: PhaseCycleStore,
+    thread_id: str,
+    agent_store: Any | None,
+    event_bus: EventBus | None = None,
+) -> dict[str, object]:
+    loaded, load_error = _load_dispatch_context(
+        thread_store=thread_store,
+        protocol_store=protocol_store,
+        phase_cycle_store=phase_cycle_store,
+        thread_id=thread_id,
+    )
+    if loaded is None:
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": load_error or "dispatch_state_unavailable",
+            "target_agents": [],
+            "message_id": None,
+        }
+
+    thread, _protocol, _phase, state, context_core = loaded
+    role = (context_core.next_expected_role or "").strip()
+    action = (context_core.next_expected_action or "").strip()
+    if not role or not action:
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "missing_next_expected_role_or_action",
+            "target_agents": [],
+            "message_id": None,
+        }
+
+    target_agents = _resolve_dispatch_targets(thread=thread, agent_store=agent_store, role=role)
+    if not target_agents:
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "no_matching_role_participant",
+            "target_agents": [],
+            "message_id": None,
+        }
+
+    content, tldr = _build_dispatch_content(thread=thread, context_core=context_core, targets=target_agents)
+    message = thread_store.send_message(
+        thread_id=thread_id,
+        from_agent="btwin",
+        content=content,
+        tldr=tldr,
+        msg_type="dispatch",
+        delivery_mode="direct",
+        target_agents=target_agents,
+        routing_source="btwin.protocol.apply_next",
+        routing_reason=f"role_match:{role}",
+        message_phase=str(thread.get("current_phase") or state.phase_name or context_core.current_step_label or ""),
+    )
+    if message is None:
+        return {
+            "dispatched": False,
+            "skipped": True,
+            "reason": "thread_not_active",
+            "target_agents": target_agents,
+            "message_id": None,
+        }
+
+    if event_bus is not None:
+        event_bus.publish(
+            SSEEvent(
+                type="message_sent",
+                resource_id=thread_id,
+                metadata={
+                    "message_id": message["message_id"],
+                    "from_agent": "btwin",
+                    "client_message_id": None,
+                    "tldr": tldr,
+                    "msg_type": "dispatch",
+                    "content": content,
+                    "delivery_mode": "direct",
+                    "target_agents": target_agents,
+                    "chain_depth": 0,
+                    "dispatch": True,
+                },
+            )
+        )
+
+    return {
+        "dispatched": True,
+        "skipped": False,
+        "reason": None,
+        "target_agents": target_agents,
+        "message_id": message["message_id"],
+        "delivery_mode": "direct",
+        "msg_type": "dispatch",
+        "from_agent": "btwin",
+        "content": content,
+        "tldr": tldr,
+        "next_expected_role": role,
+        "next_expected_action": action,
+        "required_result": context_core.required_result,
+        "phase": thread.get("current_phase"),
+        "cycle_index": context_core.current_cycle_index,
+        "outcome_policy": context_core.outcome_policy,
+        "policy_outcomes": list(context_core.policy_outcomes),
+    }
+
+
 class ThreadCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     topic: str
@@ -653,6 +880,20 @@ def create_threads_router(
             )
         )
         return updated
+
+    @router.post("/api/threads/{thread_id}/dispatch-next")
+    async def dispatch_next(thread_id: str):
+        if agent_store is None:
+            raise HTTPException(status_code=503, detail="Agent store not configured")
+        dispatch = dispatch_next_work(
+            thread_store=thread_store,
+            protocol_store=protocol_store,
+            phase_cycle_store=phase_cycle_store,
+            thread_id=thread_id,
+            agent_store=agent_store,
+            event_bus=event_bus,
+        )
+        return dispatch
 
     @router.get("/api/threads/{thread_id}/status")
     def thread_status(thread_id: str, agent: str | None = None):

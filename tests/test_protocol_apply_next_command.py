@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 import btwin_cli.main as main
 from btwin_cli.main import app
+from btwin_core.agent_store import AgentStore
 from btwin_core.config import BTwinConfig, RuntimeConfig
 from btwin_core.protocol_store import (
     Protocol,
@@ -55,6 +56,17 @@ def _save_protocol(project_root: Path, protocol: Protocol) -> ProtocolStore:
     store = ProtocolStore(project_root / ".btwin" / "protocols")
     store.save_protocol(protocol)
     return store
+
+
+def _register_agent_roles(data_dir: Path, roles: dict[str, str]) -> None:
+    store = AgentStore(data_dir)
+    for name, role in roles.items():
+        store.register(
+            name=name,
+            model="codex",
+            capabilities=["codex"],
+            role=role,
+        )
 
 
 def _context_protocol() -> Protocol:
@@ -380,6 +392,7 @@ def test_protocol_apply_next_updates_phase_cycle_state_on_retry(tmp_path, monkey
     )
 
     RuntimeBindingStore(project_root / ".btwin").bind(thread["thread_id"], "alice")
+    _register_agent_roles(data_dir, {"alice": "reviewer"})
 
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
     monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
@@ -414,6 +427,62 @@ def test_protocol_apply_next_updates_phase_cycle_state_on_retry(tmp_path, monkey
     assert payload["context_core"]["next_expected_action"] == "Review the current implementation state."
     assert payload["context_core"]["current_step_alias"] == "review"
     assert payload["context_core"]["current_step_role"] == "reviewer"
+    assert payload["dispatch"]["dispatched"] is True
+    assert payload["dispatch"]["skipped"] is False
+    assert payload["dispatch"]["target_agents"] == ["alice"]
+    assert payload["dispatch"]["next_expected_role"] == "reviewer"
+    assert payload["dispatch"]["next_expected_action"] == "Review the current implementation state."
+    inbox = thread_store.list_inbox(thread["thread_id"], "alice")
+    assert inbox is not None
+    assert len(inbox) == 1
+    assert inbox[0]["from"] == "btwin"
+    assert inbox[0]["msg_type"] == "dispatch"
+    assert "Phase: review" in inbox[0]["_content"]
+
+
+def test_protocol_apply_next_skips_dispatch_when_no_role_matches(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+    thread_store, thread = _seed_agentless_thread(
+        project_root,
+        "review-retry",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    _save_protocol(project_root, _review_retry_protocol())
+    thread_store.submit_contribution(
+        thread["thread_id"],
+        "alice",
+        "review",
+        content="## completed\nNeeds another pass.\n",
+        tldr="review retry",
+    )
+
+    RuntimeBindingStore(project_root / ".btwin").bind(thread["thread_id"], "alice")
+    _register_agent_roles(data_dir, {"alice": "implementer", "bob": "observer"})
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "apply-next",
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["applied"] is True
+    assert payload["dispatch"]["dispatched"] is False
+    assert payload["dispatch"]["skipped"] is True
+    assert payload["dispatch"]["reason"] == "no_matching_role_participant"
+    assert payload["dispatch"]["target_agents"] == []
+    assert thread_store.list_inbox(thread["thread_id"], "alice") == []
 
 
 def test_protocol_next_exposes_compiled_outcome_policy_hints(tmp_path, monkeypatch):
@@ -652,22 +721,31 @@ def test_protocol_apply_next_attached_advances_via_api(monkeypatch):
     def fake_get(path: str, params: dict | None = None):
         calls.append((path, params))
         if path == "/api/threads/thread-1":
-            return {"thread_id": "thread-1", "protocol": "transition-next", "current_phase": "context"}
-        if path == "/api/protocols/transition-next":
-            return _transition_protocol().model_dump(by_alias=True)
+            return {"thread_id": "thread-1", "protocol": "review-retry", "current_phase": "review"}
+        if path == "/api/protocols/review-retry":
+            return _review_retry_protocol().model_dump(by_alias=True)
         if path == "/api/threads/thread-1/contributions":
-            assert params == {"phase": "context"}
-            return [{"agent": "alice", "_content": "## background\nContext ready.\n"}]
+            assert params == {"phase": "review"}
+            return [{"agent": "alice", "_content": "## completed\nNeeds another pass.\n"}]
         raise AssertionError(path)
 
-    def fake_post(path: str, data: dict):
+    def fake_api_post(path: str, data: dict):
         calls.append((path, data))
-        assert path == "/api/threads/thread-1/advance-phase"
-        assert data == {"nextPhase": "followup"}
-        return {"thread_id": "thread-1", "status": "active", "current_phase": "followup"}
+        if path == "/api/threads/thread-1/advance-phase":
+            assert data == {"nextPhase": "review"}
+            return {"thread_id": "thread-1", "status": "active", "current_phase": "review"}
+        if path == "/api/threads/thread-1/dispatch-next":
+            return {
+                "dispatched": True,
+                "skipped": False,
+                "reason": None,
+                "target_agents": ["alice"],
+                "message_id": "msg-123",
+            }
+        raise AssertionError(path)
 
     monkeypatch.setattr(main, "_attached_api_get_or_exit", fake_get)
-    monkeypatch.setattr(main, "_attached_api_call_or_exit", fake_post)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
 
     result = runner.invoke(
         app,
@@ -677,7 +755,7 @@ def test_protocol_apply_next_attached_advances_via_api(monkeypatch):
             "--thread",
             "thread-1",
             "--outcome",
-            "yes",
+            "retry",
             "--json",
         ],
     )
@@ -685,9 +763,169 @@ def test_protocol_apply_next_attached_advances_via_api(monkeypatch):
     assert result.exit_code == 0, result.output
     payload = _parse_json_output(result.output)
     assert payload["applied"] is True
-    assert payload["next_phase"] == "followup"
-    assert payload["thread"]["current_phase"] == "followup"
+    assert payload["next_phase"] == "review"
+    assert payload["thread"]["current_phase"] == "review"
+    assert payload["dispatch"]["dispatched"] is True
+    assert payload["dispatch"]["target_agents"] == ["alice"]
     assert calls[0][0] == "/api/threads/thread-1"
-    assert calls[1][0] == "/api/protocols/transition-next"
+    assert calls[1][0] == "/api/protocols/review-retry"
     assert calls[2][0] == "/api/threads/thread-1/contributions"
     assert calls[3][0] == "/api/threads/thread-1/advance-phase"
+    assert calls[4][0] == "/api/threads/thread-1/dispatch-next"
+
+
+def test_protocol_apply_next_attached_keeps_success_when_dispatch_request_fails(monkeypatch):
+    project_root = Path("/tmp/project-attached")
+    data_dir = Path("/tmp/data-attached")
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    calls: list[tuple[str, dict | None]] = []
+
+    def fake_get(path: str, params: dict | None = None):
+        calls.append((path, params))
+        if path == "/api/threads/thread-1":
+            return {"thread_id": "thread-1", "protocol": "review-retry", "current_phase": "review"}
+        if path == "/api/protocols/review-retry":
+            return _review_retry_protocol().model_dump(by_alias=True)
+        if path == "/api/threads/thread-1/contributions":
+            assert params == {"phase": "review"}
+            return [{"agent": "alice", "_content": "## completed\nNeeds another pass.\n"}]
+        raise AssertionError(path)
+
+    def fake_api_post(path: str, data: dict):
+        calls.append((path, data))
+        if path == "/api/threads/thread-1/advance-phase":
+            assert data == {"nextPhase": "review"}
+            return {"thread_id": "thread-1", "status": "active", "current_phase": "review"}
+        if path == "/api/threads/thread-1/dispatch-next":
+            raise ValueError("malformed JSON")
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_attached_api_get_or_exit", fake_get)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "apply-next",
+            "--thread",
+            "thread-1",
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["applied"] is True
+    assert payload["dispatch"]["dispatched"] is False
+    assert payload["dispatch"]["skipped"] is True
+    assert payload["dispatch"]["reason"] == "dispatch_request_failed"
+    assert payload["thread"]["current_phase"] == "review"
+
+
+def test_protocol_apply_next_attached_keeps_success_when_dispatch_response_is_not_dict(monkeypatch):
+    project_root = Path("/tmp/project-attached")
+    data_dir = Path("/tmp/data-attached")
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    calls: list[tuple[str, dict | None]] = []
+
+    def fake_get(path: str, params: dict | None = None):
+        calls.append((path, params))
+        if path == "/api/threads/thread-1":
+            return {"thread_id": "thread-1", "protocol": "review-retry", "current_phase": "review"}
+        if path == "/api/protocols/review-retry":
+            return _review_retry_protocol().model_dump(by_alias=True)
+        if path == "/api/threads/thread-1/contributions":
+            assert params == {"phase": "review"}
+            return [{"agent": "alice", "_content": "## completed\nNeeds another pass.\n"}]
+        raise AssertionError(path)
+
+    def fake_api_post(path: str, data: dict):
+        calls.append((path, data))
+        if path == "/api/threads/thread-1/advance-phase":
+            assert data == {"nextPhase": "review"}
+            return {"thread_id": "thread-1", "status": "active", "current_phase": "review"}
+        if path == "/api/threads/thread-1/dispatch-next":
+            return ["not", "a", "dict"]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_attached_api_get_or_exit", fake_get)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "apply-next",
+            "--thread",
+            "thread-1",
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["applied"] is True
+    assert payload["dispatch"]["dispatched"] is False
+    assert payload["dispatch"]["skipped"] is True
+    assert payload["dispatch"]["reason"] == "dispatch_request_failed"
+    assert "unexpected dispatch response type" in payload["dispatch"]["error"]
+    assert payload["thread"]["current_phase"] == "review"
+
+
+def test_protocol_apply_next_attached_keeps_success_when_dispatch_response_is_not_a_dict(monkeypatch):
+    project_root = Path("/tmp/project-attached")
+    data_dir = Path("/tmp/data-attached")
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    def fake_get(path: str, params: dict | None = None):
+        if path == "/api/threads/thread-1":
+            return {"thread_id": "thread-1", "protocol": "review-retry", "current_phase": "review"}
+        if path == "/api/protocols/review-retry":
+            return _review_retry_protocol().model_dump(by_alias=True)
+        if path == "/api/threads/thread-1/contributions":
+            assert params == {"phase": "review"}
+            return [{"agent": "alice", "_content": "## completed\nNeeds another pass.\n"}]
+        raise AssertionError(path)
+
+    def fake_api_post(path: str, data: dict):
+        if path == "/api/threads/thread-1/advance-phase":
+            assert data == {"nextPhase": "review"}
+            return {"thread_id": "thread-1", "status": "active", "current_phase": "review"}
+        if path == "/api/threads/thread-1/dispatch-next":
+            return ["unexpected", "dispatch", "payload"]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "_attached_api_get_or_exit", fake_get)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
+
+    result = runner.invoke(
+        app,
+        [
+            "protocol",
+            "apply-next",
+            "--thread",
+            "thread-1",
+            "--outcome",
+            "retry",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["applied"] is True
+    assert payload["dispatch"]["dispatched"] is False
+    assert payload["dispatch"]["skipped"] is True
+    assert payload["dispatch"]["reason"] == "dispatch_request_failed"
+    assert payload["dispatch"]["error"] == "unexpected dispatch response type: list"
+    assert payload["thread"]["current_phase"] == "review"
