@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import httpx
 from typer.testing import CliRunner
 
 import btwin_cli.main as main
@@ -102,7 +103,7 @@ def test_delegate_commands_use_attached_api_when_attached(tmp_path, monkeypatch)
 
     calls: list[tuple[str, object]] = []
 
-    def fake_attached_call(path: str, data: dict) -> dict:
+    def fake_api_post(path: str, data: dict) -> dict:
         calls.append((path, data))
         return {
             "thread_id": "thread-1",
@@ -126,7 +127,7 @@ def test_delegate_commands_use_attached_api_when_attached(tmp_path, monkeypatch)
             "expected_output": "review contribution",
         }
 
-    monkeypatch.setattr(main, "_attached_api_call_or_exit", fake_attached_call)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
     monkeypatch.setattr(main, "_attached_api_get_or_exit", fake_attached_get)
 
     start_result = runner.invoke(app, ["delegate", "start", "--thread", "thread-1", "--json"])
@@ -141,3 +142,43 @@ def test_delegate_commands_use_attached_api_when_attached(tmp_path, monkeypatch)
         ("/api/threads/thread-1/delegate/start", {}),
         ("/api/threads/thread-1/delegate/status", None),
     ]
+
+
+def test_delegate_start_attached_json_preserves_blocked_payload(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    data_dir = tmp_path / ".btwin"
+
+    monkeypatch.setattr(main, "_project_root", lambda: project_root)
+    monkeypatch.setattr(main, "_get_config", lambda: _attached_config(data_dir))
+
+    request = httpx.Request("POST", "http://test/api/threads/thread-1/delegate/start")
+    response = httpx.Response(
+        409,
+        request=request,
+        json={
+            "detail": {
+                "status": "blocked",
+                "reason_blocked": "dispatch_failed",
+                "target_role": "reviewer",
+                "resolved_agent": "alice",
+            }
+        },
+    )
+
+    def fail_attached_call(path: str, data: dict) -> dict:
+        raise AssertionError(f"unexpected attached helper call: {path} {data}")
+
+    def fake_api_post(path: str, data: dict) -> dict:
+        raise httpx.HTTPStatusError("conflict", request=request, response=response)
+
+    monkeypatch.setattr(main, "_attached_api_call_or_exit", fail_attached_call)
+    monkeypatch.setattr(main, "_api_post", fake_api_post)
+
+    result = runner.invoke(app, ["delegate", "start", "--thread", "thread-1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_json_output(result.output)
+    assert payload["status"] == "blocked"
+    assert payload["reason_blocked"] == "dispatch_failed"
+    assert payload["target_role"] == "reviewer"
+    assert payload["resolved_agent"] == "alice"

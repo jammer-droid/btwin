@@ -7963,6 +7963,26 @@ def delegate_start(
     """Start delegation for one thread."""
     config = _get_config()
     if _use_attached_api(config):
+        if as_json:
+            import httpx
+
+            try:
+                payload = _api_post(f"/api/threads/{thread_id}/delegate/start", {})
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    try:
+                        error_payload = exc.response.json()
+                    except Exception:
+                        error_payload = None
+                    if isinstance(error_payload, dict):
+                        payload_detail = error_payload.get("detail")
+                        if isinstance(payload_detail, dict):
+                            _emit_payload(payload_detail, as_json=True)
+                            return
+                _render_attached_http_status_error(exc)
+                raise typer.Exit(_attached_http_status_exit_code(exc))
+            _emit_payload(payload, as_json=True)
+            return
         payload = _attached_api_call_or_exit(f"/api/threads/{thread_id}/delegate/start", {})
     else:
         payload = _delegate_start_local(thread_id, config)
