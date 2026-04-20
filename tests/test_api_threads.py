@@ -253,6 +253,116 @@ def test_delegate_status_returns_blocked_reason_when_target_role_missing(tmp_pat
     assert status_response.json()["reason_blocked"] == "missing_target_role"
 
 
+def test_delegate_start_uses_phase_cycle_fallback_when_thread_phase_missing(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-review",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Fallback delegate thread",
+        protocol="delegate-review",
+        participants=["alice"],
+        initial_phase=None,
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["target_role"] == "reviewer"
+    assert payload["resolved_agent"] == "alice"
+    assert client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"}).json()["pending_count"] == 1
+
+
+def test_delegate_start_reports_dispatch_failure_without_false_success(tmp_path, monkeypatch):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-review",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Dispatch failure delegate thread",
+        protocol="delegate-review",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    def _fail_send_message(*args, **kwargs):
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(thread_store, "send_message", _fail_send_message)
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["status"] == "blocked"
+    assert detail["reason_blocked"] == "dispatch_failed"
+    assert client.get(f"/api/threads/{thread['thread_id']}/delegate/status").json()["reason_blocked"] == "dispatch_failed"
+    assert client.get(f"/api/threads/{thread['thread_id']}/inbox", params={"agent": "alice"}).json()["pending_count"] == 0
+
+
 def test_delegate_start_rejects_closed_thread(tmp_path):
     thread_store = ThreadStore(tmp_path / "threads")
     protocol_store = ProtocolStore(tmp_path / "protocols")
