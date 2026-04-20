@@ -138,6 +138,7 @@ import yaml
 from tests.protocol_scenario_matrix import scenario_protocol_definition
 
 protocol = scenario_protocol_definition("retry_same_phase")
+protocol["phases"][0]["actions"] = ["contribute", "review"]
 
 for env_var in ("BTWIN_ATTACHED_SMOKE_DATA_PROTOCOLS_DIR", "BTWIN_ATTACHED_SMOKE_PROJECT_PROTOCOLS_DIR"):
     path = Path(os.environ[env_var]) / "review-loop.yaml"
@@ -232,6 +233,56 @@ CLOSE_NEXT_JSON="$(run_btwin protocol next --thread "${CLOSE_THREAD_ID}" --outco
 CLOSE_APPLY_JSON="$(run_btwin protocol apply-next --thread "${CLOSE_THREAD_ID}" --outcome close --json)"
 CLOSE_THREAD_WATCH_JSON="$(run_btwin thread watch "${CLOSE_THREAD_ID}" --limit 10 --json)"
 
+DELEGATE_THREAD_JSON="$(run_btwin thread create --topic "Attached delegate flow smoke" --protocol review-loop --participant alice --json)"
+DELEGATE_THREAD_ID="$(JSON_PAYLOAD="${DELEGATE_THREAD_JSON}" run_python -c 'import json, os; print(json.loads(os.environ["JSON_PAYLOAD"])["thread_id"])')"
+run_btwin live attach --thread "${DELEGATE_THREAD_ID}" --agent alice --json >/dev/null
+wait_for_attached_runtime "${DELEGATE_THREAD_ID}"
+DELEGATE_START_JSON="$(run_btwin delegate start --thread "${DELEGATE_THREAD_ID}" --json)"
+DELEGATE_START_INBOX_JSON="$(run_btwin thread inbox --thread "${DELEGATE_THREAD_ID}" --agent alice --json)"
+DELEGATE_START_MESSAGE_ID="$(JSON_PAYLOAD="${DELEGATE_START_INBOX_JSON}" run_python -c 'import json, os; data=json.loads(os.environ["JSON_PAYLOAD"]); print(data["messages"][0]["message_id"] if data["messages"] else "")')"
+if [[ -n "${DELEGATE_START_MESSAGE_ID}" ]]; then
+  BTWIN_ATTACHED_SMOKE_THREAD_ID="${DELEGATE_THREAD_ID}" \
+  BTWIN_ATTACHED_SMOKE_MESSAGE_ID="${DELEGATE_START_MESSAGE_ID}" \
+  run_python - <<'PY'
+import os
+from pathlib import Path
+
+from btwin_core.thread_store import ThreadStore
+
+store = ThreadStore(Path(os.environ["BTWIN_DATA_DIR"]) / "threads")
+assert store.ack_message(
+    os.environ["BTWIN_ATTACHED_SMOKE_THREAD_ID"],
+    os.environ["BTWIN_ATTACHED_SMOKE_MESSAGE_ID"],
+    "alice",
+)
+PY
+fi
+run_btwin contribution submit --thread "${DELEGATE_THREAD_ID}" --agent alice --phase review --content $'## completed\nNeeds a human retry decision.\n' --tldr "delegate review done" --json >/dev/null
+DELEGATE_REEVALUATE_JSON="$(run_btwin delegate start --thread "${DELEGATE_THREAD_ID}" --json)"
+DELEGATE_WAIT_JSON="$(run_btwin delegate wait --thread "${DELEGATE_THREAD_ID}" --json)"
+DELEGATE_RESPOND_JSON="$(run_btwin delegate respond --thread "${DELEGATE_THREAD_ID}" --outcome retry --summary "Need one more review pass." --json)"
+DELEGATE_RESPOND_INBOX_JSON="$(run_btwin thread inbox --thread "${DELEGATE_THREAD_ID}" --agent alice --json)"
+DELEGATE_RESPOND_MESSAGE_ID="$(JSON_PAYLOAD="${DELEGATE_RESPOND_INBOX_JSON}" run_python -c 'import json, os; data=json.loads(os.environ["JSON_PAYLOAD"]); print(data["messages"][0]["message_id"] if data["messages"] else "")')"
+if [[ -n "${DELEGATE_RESPOND_MESSAGE_ID}" ]]; then
+  BTWIN_ATTACHED_SMOKE_THREAD_ID="${DELEGATE_THREAD_ID}" \
+  BTWIN_ATTACHED_SMOKE_MESSAGE_ID="${DELEGATE_RESPOND_MESSAGE_ID}" \
+  run_python - <<'PY'
+import os
+from pathlib import Path
+
+from btwin_core.thread_store import ThreadStore
+
+store = ThreadStore(Path(os.environ["BTWIN_DATA_DIR"]) / "threads")
+assert store.ack_message(
+    os.environ["BTWIN_ATTACHED_SMOKE_THREAD_ID"],
+    os.environ["BTWIN_ATTACHED_SMOKE_MESSAGE_ID"],
+    "alice",
+)
+PY
+fi
+DELEGATE_STOP_JSON="$(run_btwin delegate stop --thread "${DELEGATE_THREAD_ID}" --json)"
+DELEGATE_STATUS_JSON="$(run_btwin delegate status --thread "${DELEGATE_THREAD_ID}" --json)"
+
 CLEARED_JSON="$(run_btwin runtime clear --json)"
 CURRENT_AFTER_CLEAR_JSON="$(run_btwin runtime current --json)"
 MAILBOX_AFTER_CLEAR_JSON="$(BTWIN_ATTACHED_SMOKE_THREAD_ID="${THREAD_ID}" run_python - <<'PY'
@@ -262,6 +313,14 @@ JSON_PAYLOAD_BLOCKED_THREAD_WATCH="${BLOCKED_THREAD_WATCH_JSON}" \
 JSON_PAYLOAD_CLOSE_NEXT="${CLOSE_NEXT_JSON}" \
 JSON_PAYLOAD_CLOSE_APPLY="${CLOSE_APPLY_JSON}" \
 JSON_PAYLOAD_CLOSE_THREAD_WATCH="${CLOSE_THREAD_WATCH_JSON}" \
+JSON_PAYLOAD_DELEGATE_START="${DELEGATE_START_JSON}" \
+JSON_PAYLOAD_DELEGATE_START_INBOX="${DELEGATE_START_INBOX_JSON}" \
+JSON_PAYLOAD_DELEGATE_REEVALUATE="${DELEGATE_REEVALUATE_JSON}" \
+JSON_PAYLOAD_DELEGATE_WAIT="${DELEGATE_WAIT_JSON}" \
+JSON_PAYLOAD_DELEGATE_RESPOND="${DELEGATE_RESPOND_JSON}" \
+JSON_PAYLOAD_DELEGATE_RESPOND_INBOX="${DELEGATE_RESPOND_INBOX_JSON}" \
+JSON_PAYLOAD_DELEGATE_STOP="${DELEGATE_STOP_JSON}" \
+JSON_PAYLOAD_DELEGATE_STATUS="${DELEGATE_STATUS_JSON}" \
 JSON_PAYLOAD_CLEARED="${CLEARED_JSON}" \
 JSON_PAYLOAD_CURRENT_AFTER_CLEAR="${CURRENT_AFTER_CLEAR_JSON}" \
 JSON_PAYLOAD_MAILBOX_AFTER_CLEAR="${MAILBOX_AFTER_CLEAR_JSON}" \
@@ -305,6 +364,14 @@ blocked_watch = json.loads(os.environ["JSON_PAYLOAD_BLOCKED_THREAD_WATCH"])
 close_next = json.loads(os.environ["JSON_PAYLOAD_CLOSE_NEXT"])
 close_apply = json.loads(os.environ["JSON_PAYLOAD_CLOSE_APPLY"])
 close_watch = json.loads(os.environ["JSON_PAYLOAD_CLOSE_THREAD_WATCH"])
+delegate_start = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_START"])
+delegate_start_inbox = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_START_INBOX"])
+delegate_reevaluate = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_REEVALUATE"])
+delegate_wait = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_WAIT"])
+delegate_respond = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_RESPOND"])
+delegate_respond_inbox = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_RESPOND_INBOX"])
+delegate_stop = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_STOP"])
+delegate_status = json.loads(os.environ["JSON_PAYLOAD_DELEGATE_STATUS"])
 cleared = json.loads(os.environ["JSON_PAYLOAD_CLEARED"])
 current_after_clear = json.loads(os.environ["JSON_PAYLOAD_CURRENT_AFTER_CLEAR"])
 mailbox_after_clear = json.loads(os.environ["JSON_PAYLOAD_MAILBOX_AFTER_CLEAR"])
@@ -392,6 +459,26 @@ assert close_gate["target_phase"] == close_scenario.target_phase, close_gate
 assert close_gate["procedure_key"] == close_scenario.procedure_key, close_gate
 assert close_gate["cycle_index"] == 1, close_gate
 assert close_gate["next_cycle_index"] == 1, close_gate
+assert delegate_start["status"] == "running", delegate_start
+assert delegate_start["target_role"] == "reviewer", delegate_start
+assert delegate_start["resolved_agent"] == "alice", delegate_start
+assert delegate_start_inbox["pending_count"] == 1, delegate_start_inbox
+assert delegate_start_inbox["messages"][0]["msg_type"] == "delegation", delegate_start_inbox
+assert delegate_reevaluate["status"] == "waiting_for_human", delegate_reevaluate
+assert delegate_reevaluate["required_action"] == "record_outcome", delegate_reevaluate
+assert delegate_wait["status"] == "waiting_for_human", delegate_wait
+assert delegate_wait["resume"]["required_action"] == "record_outcome", delegate_wait
+assert "retry" in delegate_wait["resume"]["suggested_next_command"], delegate_wait
+assert delegate_respond["status"] == "running", delegate_respond
+assert delegate_respond["current_phase"] == "review", delegate_respond
+assert delegate_respond["current_cycle_index"] == 2, delegate_respond
+assert delegate_respond["loop_iteration"] == 2, delegate_respond
+assert delegate_respond_inbox["pending_count"] == 1, delegate_respond_inbox
+assert "Need one more review pass." in delegate_respond_inbox["messages"][0]["_content"], delegate_respond_inbox
+assert delegate_stop["status"] == "completed", delegate_stop
+assert delegate_stop["stop_reason"] == "stopped_by_operator", delegate_stop
+assert delegate_status["status"] == "completed", delegate_status
+assert delegate_status["stop_reason"] == "stopped_by_operator", delegate_status
 assert "Recent Activity" in hud, hud
 assert "Agent Sessions" in hud, hud
 assert "Verdict     PASS" in hud, hud
@@ -441,6 +528,10 @@ print(
     f"- thread-watch close trace: outcome={close_gate['outcome']} gate={close_gate['gate_key']} "
     f"target={close_gate['target_phase']} cycle={close_gate['cycle_index']}->{close_gate['next_cycle_index']}"
 )
+print(f"- delegate start: status={delegate_start['status']}")
+print(f"- delegate wait: status={delegate_wait['status']}")
+print(f"- delegate respond: status={delegate_respond['status']}")
+print(f"- delegate final status: status={delegate_status['status']}")
 print(
     f"- thread-watch seed trace: cycle={seed_watch_phase_cycle['state']['cycle_index']} "
     f"procedure={seed_watch_phase_cycle['visual']['procedure'][0]['key']} "

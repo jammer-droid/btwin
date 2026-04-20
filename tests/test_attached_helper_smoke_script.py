@@ -38,6 +38,10 @@ def test_attached_helper_smoke_script_runs_end_to_end(tmp_path):
     assert "Attached helper smoke passed" in result.stdout
     assert "protocol apply-next cycle 1: review" in result.stdout
     assert "protocol apply-next cycle 2: review" in result.stdout
+    assert "delegate start: status=running" in result.stdout
+    assert "delegate wait: status=waiting_for_human" in result.stdout
+    assert "delegate respond: status=running" in result.stdout
+    assert "delegate final status: status=completed" in result.stdout
     assert "phase-cycle api visible: True" in result.stdout
     assert "phase-cycle next role: reviewer" in result.stdout
     assert "phase-cycle step alias: Review" in result.stdout
