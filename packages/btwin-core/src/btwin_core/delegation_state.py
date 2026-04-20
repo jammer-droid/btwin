@@ -28,3 +28,4 @@ class DelegationState(BaseModel):
     resolved_agent: str | None = None
     required_action: str | None = None
     expected_output: str | None = None
+    reason_blocked: str | None = None

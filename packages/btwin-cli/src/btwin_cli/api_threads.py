@@ -10,6 +10,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from btwin_core.context_core import ContextCore
+from btwin_core.delegation_engine import DelegationAssignment, build_delegation_assignment
+from btwin_core.delegation_state import DelegationState
+from btwin_core.delegation_store import DelegationStore
 from btwin_core.event_bus import EventBus, SSEEvent
 from btwin_core.locale_settings import LocaleSettingsStore
 from btwin_core.phase_cycle import PhaseCycleState
@@ -216,6 +219,40 @@ def _build_phase_cycle_visual(
     return build_phase_cycle_visual_payload(protocol=protocol, phase=phase, state=state)
 
 
+def _build_delegate_role_bindings(thread: dict[str, object], phase: ProtocolPhase) -> dict[str, str]:
+    participants = thread.get("phase_participants", [])
+    if not isinstance(participants, list):
+        participants = []
+    if not phase.procedure:
+        return {}
+
+    bindings: dict[str, str] = {}
+    for step, participant in zip(phase.procedure, participants):
+        if isinstance(step.role, str) and step.role and isinstance(participant, str) and participant:
+            bindings[step.role] = participant
+    return bindings
+
+
+def _delegation_state_from_assignment(
+    *,
+    thread_id: str,
+    phase_cycle_state: PhaseCycleState,
+    assignment: DelegationAssignment,
+) -> DelegationState:
+    return DelegationState(
+        thread_id=thread_id,
+        status=assignment.status,
+        loop_iteration=phase_cycle_state.cycle_index,
+        current_phase=phase_cycle_state.phase_name,
+        current_cycle_index=phase_cycle_state.cycle_index,
+        target_role=assignment.target_role,
+        resolved_agent=assignment.resolved_agent,
+        required_action=assignment.required_action,
+        expected_output=assignment.expected_output,
+        reason_blocked=assignment.reason_blocked,
+    )
+
+
 class ThreadCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     topic: str
@@ -293,6 +330,7 @@ def create_threads_router(
     locale_settings_store = LocaleSettingsStore(thread_store.data_dir)
     system_mailbox_store = SystemMailboxStore(thread_store.data_dir)
     phase_cycle_store = PhaseCycleStore(thread_store.data_dir)
+    delegation_store = DelegationStore(thread_store.data_dir)
 
     @router.get("/api/protocols")
     def list_protocols():
@@ -546,6 +584,56 @@ def create_threads_router(
             "context_core": context_core.model_dump(),
             "visual": _build_phase_cycle_visual(protocol=protocol, phase=phase, state=state),
         }
+
+    @router.post("/api/threads/{thread_id}/delegate/start")
+    def start_delegate(thread_id: str):
+        thread = thread_store.get_thread(thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
+
+        protocol_name = thread.get("protocol")
+        protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+        if protocol is None:
+            raise HTTPException(status_code=404, detail=f"Protocol '{protocol_name}' not found")
+
+        current_phase_name = thread.get("current_phase")
+        phase = next((item for item in protocol.phases if item.name == current_phase_name), None)
+        if phase is None:
+            raise HTTPException(status_code=409, detail={"error": "phase_not_found", "current_phase": current_phase_name})
+
+        phase_cycle_state = phase_cycle_store.read(thread_id)
+        if phase_cycle_state is None:
+            phase_cycle_state = phase_cycle_store.start_cycle(
+                thread_id=thread_id,
+                phase_name=phase.name,
+                procedure_steps=[step.action for step in phase.procedure or []],
+            )
+
+        contributions = thread_store.list_contributions(thread_id, phase=phase.name)
+        assignment = build_delegation_assignment(
+            thread=thread,
+            protocol=protocol,
+            phase_cycle_state=phase_cycle_state,
+            role_bindings=_build_delegate_role_bindings(thread, phase),
+            contributions=contributions,
+        )
+        state = _delegation_state_from_assignment(
+            thread_id=thread_id,
+            phase_cycle_state=phase_cycle_state,
+            assignment=assignment,
+        )
+        existing = delegation_store.read(thread_id)
+        if existing is None or existing.model_dump() != state.model_dump():
+            delegation_store.write(state)
+            existing = state
+        return existing.model_dump(exclude_none=True)
+
+    @router.get("/api/threads/{thread_id}/delegate/status")
+    def get_delegate_status(thread_id: str):
+        state = delegation_store.read(thread_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"Delegation state for thread '{thread_id}' not found")
+        return state.model_dump(exclude_none=True)
 
     @router.post("/api/threads/{thread_id}/contributions")
     async def submit_contribution(thread_id: str, req: ContributionSubmitRequest):

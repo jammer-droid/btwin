@@ -124,6 +124,120 @@ def test_threads_router_exposes_agent_inbox_and_agent_status(tmp_path):
     assert status_response.json()["pending_message_count"] == 1
 
 
+def test_delegate_start_creates_running_delegation_state(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-review",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                        "procedure": [
+                            {"role": "reviewer", "action": "review", "alias": "Review"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Delegate thread",
+        protocol="delegate-review",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["target_role"] == "reviewer"
+    assert payload["resolved_agent"] == "alice"
+    assert payload["required_action"] == "submit_contribution"
+    assert payload["expected_output"] == "review contribution"
+    assert "reason_blocked" not in payload
+
+    second_response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+    assert second_response.status_code == 200
+    assert second_response.json() == payload
+
+    status_response = client.get(f"/api/threads/{thread['thread_id']}/delegate/status")
+    assert status_response.status_code == 200
+    assert status_response.json() == payload
+
+
+def test_delegate_status_returns_blocked_reason_when_target_role_missing(tmp_path):
+    thread_store = ThreadStore(tmp_path / "threads")
+    protocol_store = ProtocolStore(tmp_path / "protocols")
+    event_bus = EventBus()
+    protocol_store.save_protocol(
+        compile_protocol_definition(
+            {
+                "name": "delegate-review",
+                "phases": [
+                    {
+                        "name": "review",
+                        "actions": ["contribute"],
+                        "template": [{"section": "completed", "required": True}],
+                    }
+                ],
+            }
+        )
+    )
+
+    thread = thread_store.create_thread(
+        topic="Blocked delegate thread",
+        protocol="delegate-review",
+        participants=["alice"],
+        initial_phase="review",
+    )
+    PhaseCycleStore(thread_store.data_dir).write(
+        PhaseCycleState.start(
+            thread_id=thread["thread_id"],
+            phase_name="review",
+            procedure_steps=["review"],
+        )
+    )
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(create_threads_router(thread_store, protocol_store, event_bus))
+    client = TestClient(app)
+
+    response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "blocked"
+    assert payload.get("target_role") is None
+    assert payload["reason_blocked"] == "missing_target_role"
+
+    status_response = client.get(f"/api/threads/{thread['thread_id']}/delegate/status")
+    assert status_response.status_code == 200
+    assert status_response.json()["reason_blocked"] == "missing_target_role"
+
+
 def test_threads_router_exposes_system_mailbox_reports(tmp_path):
     thread_store = ThreadStore(tmp_path / "threads")
     protocol_store = ProtocolStore(tmp_path / "protocols")
