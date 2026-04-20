@@ -21,6 +21,7 @@ class DelegationState(BaseModel):
 
     thread_id: str
     status: DelegationStatus
+    updated_at: str | None = None
     loop_iteration: int = 0
     current_phase: str | None = None
     current_cycle_index: int = 0

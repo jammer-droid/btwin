@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -233,6 +234,10 @@ def _build_delegate_role_bindings(thread: dict[str, object], phase: ProtocolPhas
     return bindings
 
 
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _delegation_state_from_assignment(
     *,
     thread_id: str,
@@ -242,6 +247,7 @@ def _delegation_state_from_assignment(
     return DelegationState(
         thread_id=thread_id,
         status=assignment.status,
+        updated_at=_iso_now(),
         loop_iteration=phase_cycle_state.cycle_index,
         current_phase=phase_cycle_state.phase_name,
         current_cycle_index=phase_cycle_state.cycle_index,
@@ -622,11 +628,8 @@ def create_threads_router(
             phase_cycle_state=phase_cycle_state,
             assignment=assignment,
         )
-        existing = delegation_store.read(thread_id)
-        if existing is None or existing.model_dump() != state.model_dump():
-            delegation_store.write(state)
-            existing = state
-        return existing.model_dump(exclude_none=True)
+        delegation_store.write(state)
+        return state.model_dump(exclude_none=True)
 
     @router.get("/api/threads/{thread_id}/delegate/status")
     def get_delegate_status(thread_id: str):

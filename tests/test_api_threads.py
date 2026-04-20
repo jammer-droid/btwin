@@ -171,6 +171,7 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "running"
+    assert payload["updated_at"]
     assert payload["target_role"] == "reviewer"
     assert payload["resolved_agent"] == "alice"
     assert payload["required_action"] == "submit_contribution"
@@ -179,11 +180,17 @@ def test_delegate_start_creates_running_delegation_state(tmp_path):
 
     second_response = client.post(f"/api/threads/{thread['thread_id']}/delegate/start")
     assert second_response.status_code == 200
-    assert second_response.json() == payload
+    second_payload = second_response.json()
+    assert second_payload["updated_at"] > payload["updated_at"]
+    assert second_payload["status"] == payload["status"]
+    assert second_payload["target_role"] == payload["target_role"]
+    assert second_payload["resolved_agent"] == payload["resolved_agent"]
+    assert second_payload["required_action"] == payload["required_action"]
+    assert second_payload["expected_output"] == payload["expected_output"]
 
     status_response = client.get(f"/api/threads/{thread['thread_id']}/delegate/status")
     assert status_response.status_code == 200
-    assert status_response.json() == payload
+    assert status_response.json() == second_payload
 
 
 def test_delegate_status_returns_blocked_reason_when_target_role_missing(tmp_path):
