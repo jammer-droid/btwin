@@ -49,6 +49,9 @@ from rich.text import Text
 from btwin_core.agent_store import AgentStore, sanitize_agent_for_output
 from btwin_core.config import BTwinConfig, load_config, resolve_config_path
 from btwin_core.context_core import ContextCore
+from btwin_core.delegation_engine import DelegationAssignment, build_delegation_assignment
+from btwin_core.delegation_state import DelegationState
+from btwin_core.delegation_store import DelegationStore
 from btwin_core.handoff_archive import get_handoff_record, list_handoff_records, write_handoff_record
 from btwin_core.locale_settings import LocaleSettingsStore
 from btwin_core.phase_cycle import PhaseCycleState
@@ -112,6 +115,7 @@ live_app = typer.Typer(help="Use the attached live collaboration surface.")
 agent_app = typer.Typer(help="Manage B-TWIN agent definitions.")
 protocol_app = typer.Typer(help="Manage B-TWIN protocol definitions.")
 thread_app = typer.Typer(help="Manage B-TWIN protocol threads.")
+delegate_app = typer.Typer(help="Manage delegation start and status.")
 contribution_app = typer.Typer(help="Manage B-TWIN protocol contributions.")
 workflow_app = typer.Typer(help="Evaluate workflow contract hooks.")
 service_app = typer.Typer(help="Manage the macOS launchd service for B-TWIN API.")
@@ -129,6 +133,7 @@ app.add_typer(live_app, name="live")
 app.add_typer(agent_app, name="agent")
 app.add_typer(protocol_app, name="protocol")
 app.add_typer(thread_app, name="thread")
+app.add_typer(delegate_app, name="delegate")
 app.add_typer(contribution_app, name="contribution")
 app.add_typer(workflow_app, name="workflow")
 app.add_typer(service_app, name="service")
@@ -258,6 +263,262 @@ def _get_system_mailbox_store(config: BTwinConfig | None = None) -> SystemMailbo
 
 def _get_phase_cycle_store(config: BTwinConfig | None = None) -> PhaseCycleStore:
     return PhaseCycleStore(_shared_runtime_data_dir(config))
+
+
+def _get_delegation_store(config: BTwinConfig | None = None) -> DelegationStore:
+    return DelegationStore(_shared_runtime_data_dir(config))
+
+
+def _build_delegate_role_bindings(thread: dict[str, object], phase: ProtocolPhase) -> dict[str, str]:
+    participants = thread.get("phase_participants", [])
+    if not isinstance(participants, list):
+        participants = []
+    if not phase.procedure:
+        return {}
+
+    bindings: dict[str, str] = {}
+    for step, participant in zip(phase.procedure, participants):
+        if isinstance(step.role, str) and step.role and isinstance(participant, str) and participant:
+            bindings[step.role] = participant
+    return bindings
+
+
+def _resolve_delegate_phase(
+    *,
+    thread: dict[str, object],
+    protocol: Protocol,
+    phase_cycle_state: PhaseCycleState | None,
+) -> ProtocolPhase | None:
+    if phase_cycle_state is not None:
+        phase_name = phase_cycle_state.phase_name
+        if isinstance(phase_name, str) and phase_name:
+            phase = next((item for item in protocol.phases if item.name == phase_name), None)
+            if phase is not None:
+                return phase
+
+    thread_phase_name = thread.get("current_phase")
+    if isinstance(thread_phase_name, str) and thread_phase_name:
+        phase = next((item for item in protocol.phases if item.name == thread_phase_name), None)
+        if phase is not None:
+            return phase
+
+    return None
+
+
+def _delegation_state_from_assignment(
+    *,
+    thread_id: str,
+    phase_cycle_state: PhaseCycleState,
+    assignment: DelegationAssignment,
+) -> DelegationState:
+    return DelegationState(
+        thread_id=thread_id,
+        status=assignment.status,
+        updated_at=_iso_now(),
+        loop_iteration=phase_cycle_state.cycle_index,
+        current_phase=phase_cycle_state.phase_name,
+        current_cycle_index=phase_cycle_state.cycle_index,
+        target_role=assignment.target_role,
+        resolved_agent=assignment.resolved_agent,
+        required_action=assignment.required_action,
+        expected_output=assignment.expected_output,
+        reason_blocked=assignment.reason_blocked,
+    )
+
+
+def _delegate_dispatch_client_message_id(
+    *,
+    thread_id: str,
+    phase_cycle_state: PhaseCycleState,
+    assignment: DelegationAssignment,
+) -> str:
+    return ":".join(
+        [
+            "delegate",
+            "start",
+            thread_id,
+            str(phase_cycle_state.cycle_index),
+            phase_cycle_state.phase_name or "",
+            assignment.target_role or "",
+            assignment.resolved_agent or "",
+            assignment.required_action or "",
+        ]
+    )
+
+
+def _delegate_dispatch_content(
+    *,
+    assignment: DelegationAssignment,
+    phase_cycle_state: PhaseCycleState,
+) -> tuple[str, str]:
+    target_role = assignment.target_role or "unassigned"
+    resolved_agent = assignment.resolved_agent or "unassigned"
+    required_action = assignment.required_action or "continue"
+    expected_output = assignment.expected_output or "n/a"
+    content = (
+        "## Delegation Start\n\n"
+        f"Role: {target_role}\n\n"
+        f"Agent: @{resolved_agent}\n\n"
+        f"Phase: {phase_cycle_state.phase_name}\n\n"
+        f"Action: {required_action}\n\n"
+        f"Expected output: {expected_output}\n"
+    )
+    tldr = f"delegate {phase_cycle_state.phase_name} -> {resolved_agent}"
+    return content, tldr
+
+
+def _delegate_dispatch_exists(
+    thread_store: ThreadStore,
+    *,
+    thread_id: str,
+    client_message_id: str,
+) -> bool:
+    return any(
+        message.get("client_message_id") == client_message_id
+        for message in thread_store.list_messages(thread_id)
+    )
+
+
+def _dispatch_delegate_assignment(
+    thread_store: ThreadStore,
+    *,
+    thread: dict[str, object],
+    protocol: Protocol,
+    thread_id: str,
+    assignment: DelegationAssignment,
+    phase_cycle_state: PhaseCycleState,
+) -> tuple[bool, dict[str, object] | None]:
+    if assignment.status != "running" or not assignment.resolved_agent:
+        return False, None
+
+    validation = validate_direct_message_targets(
+        thread={**thread, "current_phase": phase_cycle_state.phase_name},
+        protocol=protocol,
+        from_agent="btwin",
+        target_agents=[assignment.resolved_agent],
+    )
+    if validation is not None:
+        return False, validation
+
+    client_message_id = _delegate_dispatch_client_message_id(
+        thread_id=thread_id,
+        phase_cycle_state=phase_cycle_state,
+        assignment=assignment,
+    )
+    if _delegate_dispatch_exists(thread_store, thread_id=thread_id, client_message_id=client_message_id):
+        return False, None
+
+    content, tldr = _delegate_dispatch_content(
+        assignment=assignment,
+        phase_cycle_state=phase_cycle_state,
+    )
+    try:
+        msg = thread_store.send_message(
+            thread_id=thread_id,
+            from_agent="btwin",
+            content=content,
+            tldr=tldr,
+            client_message_id=client_message_id,
+            msg_type="delegation",
+            delivery_mode="direct",
+            target_agents=[assignment.resolved_agent],
+            routing_source="btwin.delegate.start",
+            routing_reason="delegate_assignment",
+            message_phase=phase_cycle_state.phase_name,
+            state_affecting=False,
+        )
+    except Exception:
+        logger.warning("Delegation dispatch failed for thread %s", thread_id, exc_info=True)
+        return False, {"error": "dispatch_failed"}
+    if msg is None:
+        return False, {"error": "dispatch_failed"}
+    return True, None
+
+
+def _delegate_start_local(thread_id: str, config: BTwinConfig | None = None) -> dict[str, object]:
+    current_config = config or _get_config()
+    thread_store = _get_thread_store()
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        console.print(f"[red]Thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+    if thread.get("status") != "active":
+        console.print(f"[red]Thread not found or closed:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    protocol_name = thread.get("protocol")
+    protocol = _get_protocol_store().get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+    if protocol is None:
+        console.print(f"[red]Protocol not found for thread:[/red] {protocol_name}")
+        raise typer.Exit(4)
+
+    phase_cycle_store = _get_phase_cycle_store(current_config)
+    phase_cycle_state = phase_cycle_store.read(thread_id)
+    phase = _resolve_delegate_phase(thread=thread, protocol=protocol, phase_cycle_state=phase_cycle_state)
+    if phase is None:
+        console.print(f"[red]Phase not found for thread:[/red] {thread_id}")
+        raise typer.Exit(4)
+
+    if phase_cycle_state is None:
+        phase_cycle_state = phase_cycle_store.start_cycle(
+            thread_id=thread_id,
+            phase_name=phase.name,
+            procedure_steps=[step.action for step in phase.procedure or []],
+        )
+
+    assignment_thread = dict(thread)
+    if isinstance(phase_cycle_state.phase_name, str) and phase_cycle_state.phase_name:
+        assignment_thread["current_phase"] = phase_cycle_state.phase_name
+
+    contributions = thread_store.list_contributions(thread_id, phase=phase.name)
+    assignment = build_delegation_assignment(
+        thread=assignment_thread,
+        protocol=protocol,
+        phase_cycle_state=phase_cycle_state,
+        role_bindings=_build_delegate_role_bindings(thread, phase),
+        contributions=contributions,
+    )
+    state = _delegation_state_from_assignment(
+        thread_id=thread_id,
+        phase_cycle_state=phase_cycle_state,
+        assignment=assignment,
+    )
+
+    if assignment.status == "running":
+        dispatched, dispatch_violation = _dispatch_delegate_assignment(
+            thread_store,
+            thread=thread,
+            protocol=protocol,
+            thread_id=thread_id,
+            assignment=assignment,
+            phase_cycle_state=phase_cycle_state,
+        )
+        if dispatch_violation is not None:
+            reason = None
+            if isinstance(dispatch_violation, dict):
+                reason = dispatch_violation.get("error")
+            else:
+                reason = getattr(dispatch_violation, "error", None)
+            blocked_state = state.model_copy(
+                update={"status": "blocked", "reason_blocked": reason or "dispatch_failed"}
+            )
+            _get_delegation_store(current_config).write(blocked_state)
+            return blocked_state.model_dump(exclude_none=True)
+        if not dispatched:
+            _get_delegation_store(current_config).write(state)
+            return state.model_dump(exclude_none=True)
+
+    _get_delegation_store(current_config).write(state)
+    return state.model_dump(exclude_none=True)
+
+
+def _delegate_status_local(thread_id: str, config: BTwinConfig | None = None) -> dict[str, object]:
+    current_config = config or _get_config()
+    state = _get_delegation_store(current_config).read(thread_id)
+    if state is None:
+        console.print(f"[red]Delegation state for thread not found:[/red] {thread_id}")
+        raise typer.Exit(4)
+    return state.model_dump(exclude_none=True)
 
 
 def _append_system_mailbox_report(
@@ -7682,6 +7943,34 @@ def thread_status(
         if payload is None:
             console.print(f"[red]Thread or participant not found:[/red] {thread_id} / {agent_name}")
             raise typer.Exit(4)
+    _emit_payload(payload, as_json=as_json)
+
+
+@delegate_app.command("start")
+def delegate_start(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Start delegation for one thread."""
+    config = _get_config()
+    if _use_attached_api(config):
+        payload = _attached_api_call_or_exit(f"/api/threads/{thread_id}/delegate/start", {})
+    else:
+        payload = _delegate_start_local(thread_id, config)
+    _emit_payload(payload, as_json=as_json)
+
+
+@delegate_app.command("status")
+def delegate_status(
+    thread_id: str = typer.Option(..., "--thread", help="Thread id"),
+    as_json: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Show the latest delegation state for one thread."""
+    config = _get_config()
+    if _use_attached_api(config):
+        payload = _attached_api_get_or_exit(f"/api/threads/{thread_id}/delegate/status")
+    else:
+        payload = _delegate_status_local(thread_id, config)
     _emit_payload(payload, as_json=as_json)
 
 
