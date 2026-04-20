@@ -25,9 +25,9 @@ def _parse_json_output(output: str):
     return json.loads(output.strip())
 
 
-def _seed_delegate_thread(project_root: Path):
-    thread_store = ThreadStore(project_root / ".btwin" / "threads")
-    protocol_store = ProtocolStore(project_root / ".btwin" / "protocols")
+def _seed_delegate_thread(data_dir: Path):
+    thread_store = ThreadStore(data_dir / "threads")
+    protocol_store = ProtocolStore(data_dir / "protocols")
     protocol_store.save_protocol(
         compile_protocol_definition(
             {
@@ -56,8 +56,8 @@ def _seed_delegate_thread(project_root: Path):
 
 def test_delegate_start_outputs_running_state(tmp_path, monkeypatch):
     project_root = tmp_path / "project"
-    data_dir = tmp_path / ".btwin"
-    thread_store, thread = _seed_delegate_thread(project_root)
+    data_dir = tmp_path / "custom-runtime-data"
+    thread_store, thread = _seed_delegate_thread(data_dir)
 
     monkeypatch.setattr(main, "_project_root", lambda: project_root)
     monkeypatch.setattr(main, "_get_config", lambda: _standalone_config(data_dir))
@@ -78,6 +78,8 @@ def test_delegate_start_outputs_running_state(tmp_path, monkeypatch):
 
     inbox = thread_store.list_inbox(thread["thread_id"], "alice")
     assert len(inbox) == 1
+    assert (data_dir / "runtime" / "delegation-state.jsonl").exists()
+    assert not (project_root / ".btwin" / "runtime" / "delegation-state.jsonl").exists()
 
     status_result = runner.invoke(
         app,

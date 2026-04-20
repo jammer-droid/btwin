@@ -228,6 +228,13 @@ def _shared_runtime_data_dir(config: BTwinConfig | None = None) -> Path:
     return _project_root() / ".btwin"
 
 
+def _delegate_local_data_dir(config: BTwinConfig | None = None) -> Path:
+    current_config = config or _get_config()
+    if _use_attached_api(current_config):
+        return _shared_runtime_data_dir(current_config)
+    return _get_active_data_dir(current_config)
+
+
 def _workflow_event_log(thread_id: str) -> WorkflowEventLog:
     current_config = _get_config()
     if _use_attached_api(current_config):
@@ -266,7 +273,7 @@ def _get_phase_cycle_store(config: BTwinConfig | None = None) -> PhaseCycleStore
 
 
 def _get_delegation_store(config: BTwinConfig | None = None) -> DelegationStore:
-    return DelegationStore(_shared_runtime_data_dir(config))
+    return DelegationStore(_delegate_local_data_dir(config))
 
 
 def _build_delegate_role_bindings(thread: dict[str, object], phase: ProtocolPhase) -> dict[str, str]:
@@ -437,7 +444,8 @@ def _dispatch_delegate_assignment(
 
 def _delegate_start_local(thread_id: str, config: BTwinConfig | None = None) -> dict[str, object]:
     current_config = config or _get_config()
-    thread_store = _get_thread_store()
+    data_dir = _delegate_local_data_dir(current_config)
+    thread_store = ThreadStore(data_dir / "threads")
     thread = thread_store.get_thread(thread_id)
     if thread is None:
         console.print(f"[red]Thread not found:[/red] {thread_id}")
@@ -447,12 +455,13 @@ def _delegate_start_local(thread_id: str, config: BTwinConfig | None = None) -> 
         raise typer.Exit(4)
 
     protocol_name = thread.get("protocol")
-    protocol = _get_protocol_store().get_protocol(protocol_name) if isinstance(protocol_name, str) else None
+    protocol_store = ProtocolStore(data_dir / "protocols", fallback_dir=_bundled_protocols_dir())
+    protocol = protocol_store.get_protocol(protocol_name) if isinstance(protocol_name, str) else None
     if protocol is None:
         console.print(f"[red]Protocol not found for thread:[/red] {protocol_name}")
         raise typer.Exit(4)
 
-    phase_cycle_store = _get_phase_cycle_store(current_config)
+    phase_cycle_store = PhaseCycleStore(data_dir)
     phase_cycle_state = phase_cycle_store.read(thread_id)
     phase = _resolve_delegate_phase(thread=thread, protocol=protocol, phase_cycle_state=phase_cycle_state)
     if phase is None:
