@@ -173,6 +173,7 @@ def _setup_provider_smoke_thread(
     protocol_name: str,
     protocol_definition: dict[str, object],
     participants: tuple[str, ...] = ("alice", "user"),
+    attach: bool = True,
 ) -> dict[str, object]:
     preflight = _provider_preflight(provider_smoke_env)
     _write_protocol(provider_smoke_env, protocol_definition)
@@ -205,24 +206,26 @@ def _setup_provider_smoke_thread(
     thread = _run_btwin(provider_smoke_env, *thread_args)
     thread_id = thread["thread_id"]
 
-    _run_btwin(
-        provider_smoke_env,
-        "live",
-        "attach",
-        "--thread",
-        thread_id,
-        "--agent",
-        "alice",
-        "--json",
-    )
+    attached_status = None
+    if attach:
+        _run_btwin(
+            provider_smoke_env,
+            "live",
+            "attach",
+            "--thread",
+            thread_id,
+            "--agent",
+            "alice",
+            "--json",
+        )
 
-    attached_status = _wait_for(
-        lambda: _runtime_status(provider_smoke_env, thread_id),
-        timeout_seconds=60.0,
-        step=1.0,
-    )
-    if attached_status is None:
-        pytest.skip("Timed out waiting for attached Codex runtime session")
+        attached_status = _wait_for(
+            lambda: _runtime_status(provider_smoke_env, thread_id),
+            timeout_seconds=60.0,
+            step=1.0,
+        )
+        if attached_status is None:
+            pytest.skip("Timed out waiting for attached Codex runtime session")
 
     return {
         "thread_id": thread_id,
@@ -291,6 +294,170 @@ def _provider_review_retry_protocol_definition(name: str) -> dict[str, object]:
             }
         ],
     }
+
+
+def _provider_delegation_protocol_definition(name: str) -> dict[str, object]:
+    definition = scenario_protocol_definition("retry_same_phase")
+    definition["name"] = name
+    definition["description"] = "Provider smoke protocol for delegated review loops."
+    definition["phases"][0]["actions"] = ["contribute", "review"]
+    return definition
+
+
+def _capture_pending_messages(
+    provider_smoke_env: dict[str, str],
+    *,
+    thread_id: str,
+    agent_name: str,
+) -> dict[str, object]:
+    inbox = _run_btwin(
+        provider_smoke_env,
+        "thread",
+        "inbox",
+        "--thread",
+        thread_id,
+        "--agent",
+        agent_name,
+        "--json",
+    )
+    messages = inbox.get("messages")
+    assert isinstance(messages, list), inbox
+    return inbox
+
+
+def _run_delegation_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str, object]:
+    protocol_name = "provider-smoke-delegation-loop"
+    state = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name=protocol_name,
+        protocol_definition=_provider_delegation_protocol_definition(protocol_name),
+        participants=("alice",),
+        attach=False,
+    )
+    thread_id = str(state["thread_id"])
+
+    start = _run_btwin(provider_smoke_env, "delegate", "start", "--thread", thread_id, "--json")
+    start_inbox = _capture_pending_messages(provider_smoke_env, thread_id=thread_id, agent_name="alice")
+    start_messages = _thread_messages(provider_smoke_env, thread_id)
+
+    _run_btwin(
+        provider_smoke_env,
+        "contribution",
+        "submit",
+        "--thread",
+        thread_id,
+        "--agent",
+        "alice",
+        "--phase",
+        "review",
+        "--content",
+        "## completed\nNeeds a human retry decision.\n",
+        "--tldr",
+        "delegated review done",
+        "--json",
+    )
+
+    reevaluate = _run_btwin(provider_smoke_env, "delegate", "start", "--thread", thread_id, "--json")
+    wait = _run_btwin(provider_smoke_env, "delegate", "wait", "--thread", thread_id, "--json")
+    respond = _run_btwin(
+        provider_smoke_env,
+        "delegate",
+        "respond",
+        "--thread",
+        thread_id,
+        "--outcome",
+        "retry",
+        "--summary",
+        "Need one more review pass.",
+        "--json",
+    )
+    respond_inbox = _capture_pending_messages(provider_smoke_env, thread_id=thread_id, agent_name="alice")
+    respond_messages = _thread_messages(provider_smoke_env, thread_id)
+    status_after_retry = _run_btwin(provider_smoke_env, "delegate", "status", "--thread", thread_id, "--json")
+    stop = _run_btwin(provider_smoke_env, "delegate", "stop", "--thread", thread_id, "--json")
+    final_status = _run_btwin(provider_smoke_env, "delegate", "status", "--thread", thread_id, "--json")
+
+    blocked_protocol_name = "provider-smoke-delegation-direct-blocked"
+    _write_protocol(
+        provider_smoke_env,
+        {
+            "name": blocked_protocol_name,
+            "phases": [
+                {
+                    "name": "review",
+                    "actions": ["contribute"],
+                    "template": [{"section": "completed", "required": True}],
+                    "procedure": [
+                        {"key": "review-pass", "role": "reviewer", "action": "review", "alias": "Review"},
+                    ],
+                }
+            ],
+        },
+    )
+    blocked_thread = _run_btwin(
+        provider_smoke_env,
+        "thread",
+        "create",
+        "--topic",
+        "Provider smoke blocked delegation thread",
+        "--protocol",
+        blocked_protocol_name,
+        "--participant",
+        "alice",
+        "--json",
+    )
+    blocked = _run_btwin(
+        provider_smoke_env,
+        "delegate",
+        "start",
+        "--thread",
+        str(blocked_thread["thread_id"]),
+        "--json",
+    )
+
+    runtime_probe_protocol_name = "provider-smoke-delegation-runtime-probe"
+    runtime_probe = _setup_provider_smoke_thread(
+        provider_smoke_env,
+        protocol_name=runtime_probe_protocol_name,
+        protocol_definition={
+            "name": runtime_probe_protocol_name,
+            "phases": [
+                {
+                    "name": "discussion",
+                    "actions": ["discuss"],
+                }
+            ],
+        },
+        participants=("alice", "user"),
+    )
+    runtime_status = runtime_probe["attached_status"]
+    assert runtime_status is not None, runtime_probe
+    agent_inbox = _run_btwin(provider_smoke_env, "agent", "inbox", "alice", "--json")
+
+    payload = {
+        "manual_steps_covered": [1, 2, 3, 4, 5, 6],
+        "thread_id": thread_id,
+        "runtime_probe_thread_id": runtime_probe["thread_id"],
+        "runtime_status": runtime_status,
+        "start": start,
+        "start_inbox": start_inbox,
+        "start_messages": start_messages,
+        "reevaluate": reevaluate,
+        "wait": wait,
+        "respond": respond,
+        "respond_inbox": respond_inbox,
+        "respond_messages": respond_messages,
+        "status_after_retry": status_after_retry,
+        "stop": stop,
+        "final_status": final_status,
+        "agent_inbox": agent_inbox,
+        "blocked": blocked,
+    }
+    (_provider_run_dir(provider_smoke_env) / "delegation-manual-steps-1-6.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return payload
 
 
 def _run_scripted_provider_smoke(provider_smoke_env: dict[str, str]) -> dict[str, object]:
@@ -552,6 +719,43 @@ def test_provider_smoke_compiled_outcome_policy_hints_visible_on_next_and_apply_
     assert gate_row["outcome_emitters"] == plan["outcome_emitters"]
     assert gate_row["outcome_actions"] == plan["outcome_actions"]
     assert gate_row["policy_outcomes"] == plan["policy_outcomes"]
+
+
+def test_provider_smoke_delegation_loop_covers_manual_steps_1_to_6(provider_smoke_env) -> None:
+    result = _run_delegation_provider_smoke(provider_smoke_env)
+
+    assert result["manual_steps_covered"] == [1, 2, 3, 4, 5, 6]
+    assert result["start"]["status"] == "running"
+    assert result["start"]["target_role"] == "reviewer"
+    assert result["start"]["resolved_agent"] == "alice"
+    assert result["start"]["required_action"] == "submit_contribution"
+    assert result["start"]["expected_output"]
+    assert any(message.get("msg_type") == "delegation" for message in result["start_messages"])
+    assert result["reevaluate"]["status"] == "waiting_for_human"
+    assert result["reevaluate"]["required_action"] == "record_outcome"
+    assert result["wait"]["status"] == "waiting_for_human"
+    assert result["wait"]["resume"]["required_action"] == "record_outcome"
+    assert result["wait"]["resume"]["why_now"]
+    assert "delegate respond" in result["wait"]["resume"]["suggested_next_command"]
+    assert result["respond"]["status"] == "running"
+    assert result["respond"]["current_phase"] == "review"
+    assert result["respond"]["current_cycle_index"] == 2
+    assert result["respond"]["loop_iteration"] == 2
+    assert any(
+        message.get("msg_type") == "delegation"
+        and "Need one more review pass." in str(message.get("_content"))
+        for message in result["respond_messages"]
+    )
+    assert result["status_after_retry"]["status"] == "running"
+    assert result["stop"]["status"] == "completed"
+    assert result["stop"]["stop_reason"] == "stopped_by_operator"
+    assert result["final_status"]["status"] == "completed"
+    assert result["final_status"]["stop_reason"] == "stopped_by_operator"
+    assert result["blocked"]["status"] == "blocked"
+    assert result["blocked"]["reason_blocked"] == "direct_message_not_allowed_in_phase"
+    assert result["runtime_status"]["transport_mode"] == "live_process_transport"
+    assert result["agent_inbox"]["context"]["runtime_mode"] == "attached"
+    assert result["agent_inbox"]["attached_runtime_diagnostics"]
 
 
 def test_provider_smoke_stop_block_uses_shared_scenario_fixture(provider_smoke_env) -> None:
